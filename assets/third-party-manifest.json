@@ -1,0 +1,80 @@
+{
+  "schema": 1,
+  "entries": [
+    {
+      "name": "IBM Plex Sans",
+      "source_url": "https://github.com/IBM/plex/releases/tag/@ibm/plex-sans@1.1.0",
+      "source_archive": "ibm-plex-sans.zip",
+      "source_archive_sha256": "fb365d910566e6d199cc2c15579a7dd9a267128e18431a394ed81f1970c69200",
+      "license": "SIL Open Font License 1.1",
+      "license_text_path": "assets/fonts/OFL-IBM-Plex.txt",
+      "license_text_sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da",
+      "packaged_files": [
+        {
+          "path": "assets/fonts/IBMPlexSans-Regular.ttf",
+          "sha256": "975dcda37d80f038dcd143c22e33ca2d97a0cc5a929aace1c749153b0fe1afa5"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-Medium.ttf",
+          "sha256": "331c8639d7598b2cde62a911a71db195e30cb655cd6bdf2e324a7e984955f907"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-SemiBold.ttf",
+          "sha256": "a20caf8286023a6a7a85e40b1d2a4ae9fc3e3b1f9eda8f4c542dd4986af67bb1"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-Bold.ttf",
+          "sha256": "9e6c74a889a700d707613d24548fe4ffa6bc59559a0689d2cf9e133bdcdafb2f"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-Regular.woff2",
+          "sha256": "ba711a3085ff9f27440b6b9c4550cfc47c97bf36591d5da958b975bb3add8c1a"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-Medium.woff2",
+          "sha256": "5660f8a658f8bb50dbc005232f885eadffd2bc1c235c4f6fbb63469d1f9cde6d"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-SemiBold.woff2",
+          "sha256": "f78048030eab62e860efa39a0df79e2e5581bf122eb95b9bc42c0b8a4988d205"
+        },
+        {
+          "path": "assets/fonts/IBMPlexSans-Bold.woff2",
+          "sha256": "fa7130d854a660b39a7fc9e6e0f2dc23dba5f1346e2adea3e1fe37b6d884133d"
+        }
+      ],
+      "notice": "Copyright (c) 2018 IBM Corp. Reserved Font Name 'Plex'.",
+      "consumers": [
+        "AppFonts (Homan runtime)",
+        "docs website"
+      ],
+      "decision": "pinned",
+      "status": "packaged"
+    },
+    {
+      "name": "IBM Plex Mono",
+      "source_url": "https://github.com/IBM/plex/releases/tag/@ibm/plex-mono@2.5.0",
+      "source_archive": "ibm-plex-mono.zip",
+      "source_archive_sha256": "6d23f01257663d8cc49a0d64c22ced630b79e0e2a0ac08a0da86e9a38bbc481c",
+      "license": "SIL Open Font License 1.1",
+      "license_text_path": "assets/fonts/OFL-IBM-Plex.txt",
+      "license_text_sha256": "7e6b2818edbd8f6a01ae80641cc8f16a51080d08fb4e532be3a0b6f74adb07da",
+      "packaged_files": [
+        {
+          "path": "assets/fonts/IBMPlexMono-Regular.ttf",
+          "sha256": "7c6fbddca4b700be918f5f6183d9bd4464fa427fe435f0b480d77fe2bb8c5a43"
+        },
+        {
+          "path": "assets/fonts/IBMPlexMono-Medium.ttf",
+          "sha256": "98fbd727aae340b236955879dabed4d991aac9e8e90b3b2a67ce4a59221cc97c"
+        }
+      ],
+      "notice": "Copyright (c) 2017 IBM Corp. Reserved Font Name 'Plex'.",
+      "consumers": [
+        "AppFonts (Homan runtime)"
+      ],
+      "decision": "pinned",
+      "status": "packaged"
+    }
+  ]
+}

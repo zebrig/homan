@@ -1,0 +1,366 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<script src="./support.js"></script>
+</head>
+<body>
+<x-dc>
+<helmet>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+<style>
+  body { margin:0; background:#101013; color:#F4F2EE; font-family:'IBM Plex Sans',sans-serif; -webkit-font-smoothing:antialiased; }
+  :root { --accent:#E8A05C; --signal:#6FC493; --cap:2px; }
+  a { color:#E8A05C; text-decoration:none; }
+  a:hover { color:#F4F2EE; }
+  ::selection { background:#E8A05C; color:#101013; }
+</style>
+</helmet>
+<div style="max-width:1120px; margin:0 auto; padding:0 48px">
+
+  <!-- COVER -->
+  <section data-screen-label="Cover" style="min-height:92vh; display:flex; flex-direction:column; justify-content:space-between; padding:56px 0 72px; border-bottom:1px solid #232329">
+    <div style="display:flex; justify-content:space-between; align-items:baseline; font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; letter-spacing:0.08em">
+      <span>HOMAN — BRAND GUIDELINES</span><span>V1.0 · AUGUST 2026</span>
+    </div>
+    <div style="display:flex; flex-direction:column; align-items:flex-start; gap:40px">
+      <svg width="180" height="180" viewBox="0 0 40 40" aria-label="Homan mark">
+        <rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+        <rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+        <rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect>
+        <rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+        <rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+      </svg>
+      <div>
+        <h1 style="font-family:'IBM Plex Sans',sans-serif; font-size:96px; font-weight:700; letter-spacing:-0.03em; margin:0; line-height:1">Homan</h1>
+        <p style="font-size:22px; color:#B9B7BE; margin:20px 0 0; max-width:520px; line-height:1.5; text-wrap:pretty">Human conversations, kept at home. A local-first speech workspace for the Mac.</p>
+      </div>
+    </div>
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; letter-spacing:0.08em">01 IDEA · 02 MARK · 03 CONSTRUCTION · 04 LOCKUPS · 05 VARIANTS · 06 MISUSE · 07 COLOR · 08 TYPE · 09 WEB</div>
+  </section>
+
+  <!-- 01 IDEA -->
+  <section data-screen-label="01 Idea" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">01 — BRAND IDEA</div>
+    <h2 style="font-family:'IBM Plex Sans',sans-serif; font-size:44px; font-weight:600; letter-spacing:-0.02em; margin:0 0 24px; max-width:760px; line-height:1.15; text-wrap:pretty">Speech is intimate infrastructure. Homan keeps it at home.</h2>
+    <p style="font-size:18px; color:#B9B7BE; max-width:640px; line-height:1.6; margin:0 0 56px; text-wrap:pretty">Homan (home + human) is the next chapter of Muesli: the same promise — your words never leave your machine — carried by a mark that stands on its own. Everything the brand does should feel calm, personal, and quietly technical.</p>
+    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:20px">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:10px; padding:28px">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); margin-bottom:12px">LOCAL BY DEFAULT</div>
+        <p style="margin:0; color:#B9B7BE; font-size:15px; line-height:1.55">Everything runs on-device. The brand never borrows cloud metaphors — no arrows to servers, no sync glyphs.</p>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:10px; padding:28px">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); margin-bottom:12px">HUMAN, NOT BOT</div>
+        <p style="margin:0; color:#B9B7BE; font-size:15px; line-height:1.55">No guest joins the meeting. Voice is portrayed as conversation between people, never as a robot listening in.</p>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:10px; padding:28px">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); margin-bottom:12px">QUIET CONFIDENCE</div>
+        <p style="margin:0; color:#B9B7BE; font-size:15px; line-height:1.55">Understated surfaces, one warm accent, plain language. The product speaks softly because it has nothing to hide.</p>
+      </div>
+    </div>
+  </section>
+
+  <!-- 02 MARK -->
+  <section data-screen-label="02 Mark" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">02 — THE MARK</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:64px; align-items:center">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; display:flex; align-items:center; justify-content:center; padding:88px 0">
+        <svg width="220" height="220" viewBox="0 0 40 40">
+          <rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          <rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          <rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          <rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          <rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+        </svg>
+      </div>
+      <div>
+        <h2 style="font-family:'IBM Plex Sans',sans-serif; font-size:34px; font-weight:600; letter-spacing:-0.02em; margin:0 0 20px; line-height:1.2">Two waveforms, one letter</h2>
+        <p style="font-size:16px; color:#B9B7BE; line-height:1.65; margin:0 0 28px; text-wrap:pretty">The mark is a capital H built from two waveforms. Each stem is its own two-bar wave — one voice on each side of the conversation. A solid crossbar joins them: the home where the two waves meet.</p>
+        <div style="display:flex; flex-direction:column; gap:14px; font-size:15px">
+          <div style="display:flex; gap:14px; align-items:baseline"><span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); min-width:24px">A</span><span style="color:#B9B7BE">Left wave — the first voice: two bars, rising amplitude.</span></div>
+          <div style="display:flex; gap:14px; align-items:baseline"><span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); min-width:24px">B</span><span style="color:#B9B7BE">Right wave — the second voice, mirrored in reply.</span></div>
+          <div style="display:flex; gap:14px; align-items:baseline"><span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); min-width:24px">C</span><span style="color:#B9B7BE">Crossbar — the home; a solid beam holding the two waves together.</span></div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 03 CONSTRUCTION -->
+  <section data-screen-label="03 Construction" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">03 — CONSTRUCTION</div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:48px; display:flex; flex-direction:column; gap:28px">
+        <div style="align-self:center; position:relative; background-image:linear-gradient(#232329 1px, transparent 1px), linear-gradient(90deg, #232329 1px, transparent 1px); background-size:22px 22px; padding:22px">
+          <svg width="220" height="220" viewBox="0 0 40 40" style="display:block">
+            <rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          </svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:13px; color:#8E8C94; line-height:2">
+          unit x = bar width<br>total width = 8x · stem gap = 0.5x<br>inner stems 8x · outer 6x · crossbar 2x × 1.5x<br>corner radius = x/2 (rounded caps)
+        </div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:20px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:40px; flex:1; display:flex; flex-direction:column; justify-content:center; gap:20px">
+          <div style="align-self:center; border:1px dashed #3A3A42; padding:44px">
+            <svg width="88" height="88" viewBox="0 0 40 40">
+              <rect x="4" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect>
+              <rect x="10" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect>
+              <rect x="16" y="17" width="8" height="6" fill="#F4F2EE" style="rx:var(--cap)"></rect>
+              <rect x="26" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect>
+              <rect x="32" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect>
+            </svg>
+          </div>
+          <p style="margin:0; text-align:center; color:#B9B7BE; font-size:15px">Clear space: 2x on all sides — a quarter of the mark height. Nothing enters this zone.</p>
+        </div>
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:32px 40px">
+          <div style="display:flex; align-items:flex-end; gap:40px; margin-bottom:16px">
+            <div style="text-align:center"><svg width="16" height="16" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE"></rect></svg><div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8E8C94; margin-top:8px">16px</div></div>
+            <div style="text-align:center"><svg width="24" height="24" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect></svg><div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8E8C94; margin-top:8px">24px</div></div>
+            <div style="text-align:center"><svg width="48" height="48" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect></svg><div style="font-family:'IBM Plex Mono',monospace; font-size:11px; color:#8E8C94; margin-top:8px">48px</div></div>
+          </div>
+          <p style="margin:0; color:#B9B7BE; font-size:15px">Minimum size: 24px digital, 8&nbsp;mm print. At 16px (menu bar) drop the rounded caps — square ends stay crisp.</p>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 04 LOCKUPS -->
+  <section data-screen-label="04 Lockups" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">04 — LOCKUPS</div>
+    <div style="display:grid; grid-template-columns:3fr 2fr; gap:20px">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:72px 48px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:24px">
+        <div style="display:flex; align-items:center; gap:20px">
+          <svg width="52" height="52" viewBox="0 0 40 40">
+            <rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          </svg>
+          <span style="font-family:'IBM Plex Sans',sans-serif; font-size:46px; font-weight:600; letter-spacing:-0.02em">Homan</span>
+        </div>
+        <p style="margin:0; color:#8E8C94; font-size:14px; font-family:'IBM Plex Mono',monospace">PRIMARY · mark height = cap height of wordmark · gap = 2x</p>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:48px; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:24px">
+        <div style="display:flex; flex-direction:column; align-items:center; gap:16px">
+          <svg width="44" height="44" viewBox="0 0 40 40">
+            <rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect>
+            <rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect>
+          </svg>
+          <span style="font-family:'IBM Plex Sans',sans-serif; font-size:28px; font-weight:600; letter-spacing:-0.02em">Homan</span>
+        </div>
+        <p style="margin:0; color:#8E8C94; font-size:14px; font-family:'IBM Plex Mono',monospace; text-align:center">STACKED · centered · gap = 3x</p>
+      </div>
+    </div>
+    <p style="color:#B9B7BE; font-size:15px; margin:24px 0 0; max-width:640px; line-height:1.6">The wordmark is always set in IBM Plex Sans SemiBold, tracking −2%, sentence case. The mark may appear alone once the lockup has established the name (app icon, menu bar, favicon, social avatars).</p>
+  </section>
+
+  <!-- 05 VARIANTS -->
+  <section data-screen-label="05 Variants" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">05 — VARIANTS</div>
+    <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:20px">
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:180px; display:flex; align-items:center; justify-content:center">
+          <svg width="72" height="72" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">PRIMARY · ember on night</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:180px; display:flex; align-items:center; justify-content:center">
+          <svg width="72" height="72" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">MONO · dark surfaces</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#F4F2EE; border-radius:14px; height:180px; display:flex; align-items:center; justify-content:center">
+          <svg width="72" height="72" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#101013" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#101013" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#101013" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#101013" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#101013" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">INVERSE · light surfaces</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:180px; display:flex; align-items:center; justify-content:center">
+          <div style="width:96px; height:96px; background:#1F1F24; border:1px solid #2C2C33; border-radius:24px; display:flex; align-items:center; justify-content:center; box-shadow:0 8px 24px rgba(0,0,0,0.4)">
+            <svg width="48" height="48" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect></svg>
+          </div>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">APP ICON · macOS squircle</div>
+      </div>
+    </div>
+    <div style="display:grid; grid-template-columns:1fr 1fr; gap:20px; margin-top:20px">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:28px 32px; display:flex; align-items:center; gap:24px">
+        <div style="background:#1F1F24; border-radius:8px; padding:8px 14px; display:flex; align-items:center; gap:12px">
+          <svg width="16" height="16" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE"></rect></svg>
+          <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">14:32</span>
+        </div>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">MENU BAR · 16px template mono, square caps</span>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:28px 32px; display:flex; align-items:center; gap:24px">
+        <div style="display:flex; gap:16px; align-items:center">
+          <svg width="16" height="16" viewBox="0 0 40 40"><rect width="40" height="40" fill="#101013" rx="9"></rect><rect x="4" y="8" width="4" height="24" fill="var(--accent)"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)"></rect></svg>
+          <svg width="32" height="32" viewBox="0 0 40 40"><rect width="40" height="40" fill="#101013" rx="9"></rect><rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:2"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:2"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:2"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:2"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:2"></rect></svg>
+        </div>
+        <span style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">FAVICON · 16 / 32px on night tile</span>
+      </div>
+    </div>
+  </section>
+
+  <!-- 06 MISUSE -->
+  <section data-screen-label="06 Misuse" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">06 — MISUSE</div>
+    <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:20px">
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:150px; display:flex; align-items:center; justify-content:center">
+          <svg width="60" height="60" viewBox="0 0 40 40" style="transform:rotate(35deg)"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">✕ DON'T ROTATE</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:150px; display:flex; align-items:center; justify-content:center">
+          <svg width="100" height="52" viewBox="0 0 40 40" preserveAspectRatio="none"><rect x="4" y="8" width="4" height="24" fill="#F4F2EE"></rect><rect x="10" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="16" y="17" width="8" height="6" fill="#F4F2EE"></rect><rect x="26" y="4" width="4" height="32" fill="#F4F2EE"></rect><rect x="32" y="8" width="4" height="24" fill="#F4F2EE"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">✕ DON'T STRETCH</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:150px; display:flex; align-items:center; justify-content:center">
+          <svg width="60" height="60" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="#E86A5C" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="#E8D65C" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="#6FC493" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="#5C9BE8" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="#B45CE8" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">✕ ONE COLOR ONLY</div>
+      </div>
+      <div style="display:flex; flex-direction:column; gap:12px">
+        <div style="background:#17171B; border:1px solid #232329; border-radius:14px; height:150px; display:flex; align-items:center; justify-content:center">
+          <svg width="60" height="60" viewBox="0 0 40 40" style="filter:drop-shadow(0 0 8px #E8A05C)"><rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect></svg>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">✕ NO GLOWS OR SHADOWS</div>
+      </div>
+    </div>
+    <p style="color:#B9B7BE; font-size:15px; margin:24px 0 0; max-width:640px; line-height:1.6">Also avoid: rebuilding bar proportions, outlining the bars, animating the mark as a live waveform in static contexts, and placing it over photography without a solid night backdrop.</p>
+  </section>
+
+  <!-- 07 COLOR -->
+  <section data-screen-label="07 Color" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">07 — COLOR</div>
+    <p style="font-size:16px; color:#B9B7BE; max-width:640px; line-height:1.6; margin:0 0 40px; text-wrap:pretty">The palette carries over the app's dark UI unchanged and adds one new accent: Ember — warm light kept indoors. Signal green is reserved for live states (listening, recording).</p>
+    <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:20px; margin-bottom:20px">
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#101013"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Night</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#101013 · app background</div></div>
+      </div>
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#17171B"></div>
+        <div style="padding:16px 20px; background:#17171B; border-top:1px solid #232329"><div style="font-weight:600; margin-bottom:4px">Surface</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#17171B · cards, panels</div></div>
+      </div>
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#1F1F24"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Elevated</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#1F1F24 · popovers, pills</div></div>
+      </div>
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#F4F2EE"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Paper</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#F4F2EE · primary text</div></div>
+      </div>
+    </div>
+    <div style="display:grid; grid-template-columns:repeat(3,1fr); gap:20px; margin-bottom:40px">
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:var(--accent)"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Ember</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#E8A05C · oklch(0.76 0.11 62) · brand accent, primary actions</div></div>
+      </div>
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#6FC493"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Signal</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#6FC493 · oklch(0.76 0.11 155) · live &amp; listening states only</div></div>
+      </div>
+      <div style="border:1px solid #232329; border-radius:14px; overflow:hidden">
+        <div style="height:120px; background:#8E8C94"></div>
+        <div style="padding:16px 20px; background:#17171B"><div style="font-weight:600; margin-bottom:4px">Mist</div><div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94">#8E8C94 · secondary text, captions</div></div>
+      </div>
+    </div>
+    <div>
+      <div style="display:flex; height:44px; border-radius:8px; overflow:hidden; border:1px solid #232329">
+        <div style="flex:86; background:#101013"></div>
+        <div style="flex:8; background:#1F1F24"></div>
+        <div style="flex:4; background:var(--accent)"></div>
+        <div style="flex:2; background:#6FC493"></div>
+      </div>
+      <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; margin-top:12px">USAGE RATIO — 86% night · 8% surfaces · 4% ember · 2% signal</div>
+    </div>
+  </section>
+
+  <!-- 08 TYPE -->
+  <section data-screen-label="08 Typography" style="padding:96px 0; border-bottom:1px solid #232329">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">08 — TYPOGRAPHY</div>
+    <div style="display:flex; flex-direction:column; gap:20px">
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:40px 48px; display:grid; grid-template-columns:1fr 2fr; gap:40px; align-items:center">
+        <div>
+          <div style="font-weight:600; font-size:18px; margin-bottom:6px">IBM Plex Sans</div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; line-height:1.8">DISPLAY &amp; HEADINGS<br>SemiBold · tracking −2%<br>Google Fonts / OFL</div>
+        </div>
+        <div style="font-family:'IBM Plex Sans',sans-serif; font-size:40px; font-weight:600; letter-spacing:-0.02em; line-height:1.2">Your speech should belong to you.</div>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:40px 48px; display:grid; grid-template-columns:1fr 2fr; gap:40px; align-items:center">
+        <div>
+          <div style="font-weight:600; font-size:18px; margin-bottom:6px">IBM Plex Sans</div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; line-height:1.8">BODY &amp; UI<br>Regular / Medium<br>Same family, smaller optical role</div>
+        </div>
+        <div style="font-size:18px; color:#B9B7BE; line-height:1.6">Homan listens from the menu bar, cleans up your words, and pastes them back into the app you were already using. Nothing leaves your Mac.</div>
+      </div>
+      <div style="background:#17171B; border:1px solid #232329; border-radius:14px; padding:40px 48px; display:grid; grid-template-columns:1fr 2fr; gap:40px; align-items:center">
+        <div>
+          <div style="font-weight:600; font-size:18px; margin-bottom:6px">IBM Plex Mono</div>
+          <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; line-height:1.8">LABELS, DATA &amp; CODE<br>Regular / Medium · uppercase labels<br>Google Fonts / OFL</div>
+        </div>
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:15px; color:#B9B7BE; line-height:1.8">brew install --cask homan<br><span style="color:#8E8C94">LISTENING · 00:14 · PARAKEET V3 · ON-DEVICE</span></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- 09 WEB -->
+  <section data-screen-label="09 Web" style="padding:96px 0">
+    <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:var(--accent); letter-spacing:0.12em; margin-bottom:24px">09 — WEB DIRECTION</div>
+    <div style="border:1px solid #232329; border-radius:14px; overflow:hidden; background:#101013">
+      <div style="display:flex; align-items:center; justify-content:space-between; padding:20px 40px; border-bottom:1px solid #1F1F24">
+        <div style="display:flex; align-items:center; gap:12px">
+          <svg width="22" height="22" viewBox="0 0 40 40"><rect x="4" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="10" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="16" y="17" width="8" height="6" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="26" y="4" width="4" height="32" fill="var(--accent)" style="rx:var(--cap)"></rect><rect x="32" y="8" width="4" height="24" fill="var(--accent)" style="rx:var(--cap)"></rect></svg>
+          <span style="font-family:'IBM Plex Sans',sans-serif; font-weight:600; font-size:18px">Homan</span>
+        </div>
+        <div style="display:flex; gap:28px; font-size:14px; color:#B9B7BE">
+          <span>Dictation</span><span>Meetings</span><span>Changelog</span><span style="color:var(--accent)">Open source</span>
+        </div>
+      </div>
+      <div style="padding:88px 40px 96px; display:flex; flex-direction:column; align-items:center; text-align:center; gap:28px">
+        <div style="font-family:'IBM Plex Mono',monospace; font-size:12px; color:#6FC493; letter-spacing:0.12em; border:1px solid #26362D; border-radius:99px; padding:6px 16px">● LOCAL-FIRST SPEECH WORKSPACE</div>
+        <h2 style="font-family:'IBM Plex Sans',sans-serif; font-size:56px; font-weight:600; letter-spacing:-0.025em; margin:0; max-width:680px; line-height:1.12; text-wrap:pretty">Human conversations, kept at home.</h2>
+        <p style="font-size:18px; color:#B9B7BE; max-width:520px; line-height:1.6; margin:0; text-wrap:pretty">Speak naturally, paste clean text, and keep every transcript on your own Mac.</p>
+        <div style="display:flex; gap:14px">
+          <div style="background:var(--accent); color:#101013; font-weight:600; font-size:16px; padding:13px 26px; border-radius:9px; cursor:pointer">Download for macOS</div>
+          <div style="border:1px solid #2C2C33; color:#F4F2EE; font-weight:500; font-size:16px; padding:13px 26px; border-radius:9px; cursor:pointer">View on GitHub</div>
+        </div>
+      </div>
+    </div>
+    <p style="color:#B9B7BE; font-size:15px; margin:24px 0 0; max-width:640px; line-height:1.6">Web rules: night background everywhere, one ember action per view, Signal only on live indicators, mono uppercase for eyebrows and metadata. Photography and illustration sit inside surface-colored frames, never full-bleed behind the mark.</p>
+    <div style="display:flex; justify-content:space-between; margin-top:96px; padding-top:32px; border-top:1px solid #232329; font-family:'IBM Plex Mono',monospace; font-size:12px; color:#8E8C94; letter-spacing:0.08em">
+      <span>HOMAN BRAND GUIDELINES · V1.0</span><span>AUGUST 2026</span>
+    </div>
+  </section>
+</div>
+</x-dc>
+<script type="text/x-dc" data-dc-script data-props="{&quot;accent&quot;:{&quot;editor&quot;:&quot;color&quot;,&quot;default&quot;:&quot;#E8A05C&quot;,&quot;tsType&quot;:&quot;string&quot;,&quot;options&quot;:[&quot;#E8A05C&quot;,&quot;#6FC493&quot;,&quot;#8FA8E8&quot;,&quot;#D98CA6&quot;],&quot;section&quot;:&quot;Brand&quot;},&quot;capStyle&quot;:{&quot;editor&quot;:&quot;enum&quot;,&quot;default&quot;:&quot;rounded&quot;,&quot;options&quot;:[&quot;rounded&quot;,&quot;square&quot;],&quot;tsType&quot;:&quot;string&quot;,&quot;section&quot;:&quot;Brand&quot;}}">
+class Component extends DCLogic {
+  applyVars() {
+    const r = document.documentElement.style;
+    r.setProperty('--accent', this.props.accent ?? '#E8A05C');
+    r.setProperty('--cap', (this.props.capStyle ?? 'rounded') === 'rounded' ? '2px' : '0px');
+  }
+  componentDidMount() { this.applyVars(); }
+  componentDidUpdate() { this.applyVars(); }
+  renderVals() { return {}; }
+}
+</script>
+</body>
+</html>

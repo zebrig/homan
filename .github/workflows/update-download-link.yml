@@ -1,0 +1,51 @@
+name: Update landing page download link
+
+# Manual fallback only.
+# The canonical release flow updates docs content in scripts/release.sh after the
+# hosted GitHub Release asset has been verified.
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-link:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Update download URL in site files
+        env:
+          TAG: ${{ github.event.release.tag_name }}
+        run: |
+          # Find the .dmg asset URL from the release
+          DMG_URL=$(echo '${{ toJSON(github.event.release.assets) }}' \
+            | jq -r '.[] | select(.name | endswith(".dmg")) | .browser_download_url' \
+            | head -1)
+
+          if [ -z "$DMG_URL" ]; then
+            echo "No .dmg asset found in release $TAG, skipping"
+            exit 0
+          fi
+
+          echo "Updating download link to: $DMG_URL"
+
+          # Update index.html (both the <a> href and the JSON-LD downloadUrl)
+          sed -i "s|https://github.com/zebrig/homan/releases/download/[^\"]*\.dmg|$DMG_URL|g" docs/index.html
+
+          # Update llms.txt
+          sed -i "s|https://github.com/zebrig/homan/releases/download/.*\.dmg|$DMG_URL|g" docs/llms.txt
+
+      - name: Commit and push if changed
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add docs/index.html docs/llms.txt
+          if git diff --cached --quiet; then
+            echo "No changes to commit"
+          else
+            git commit -m "Update download link to ${{ github.event.release.tag_name }}"
+            git push
+          fi

@@ -1,0 +1,19 @@
+{
+  "source_kind": "owner-supplied",
+  "archive": {
+    "original_path": "/Users/yahor/Downloads/Rebrand Muesli to Homan.zip",
+    "original_sha256": "c2a1818a6d46d2887af09fede4bd4bcb68a64c363fa716626ec63f157064ef1e",
+    "frozen_path": "assets/brand/source/owner-supplied/Rebrand-Muesli-to-Homan.zip",
+    "frozen_sha256": "c2a1818a6d46d2887af09fede4bd4bcb68a64c363fa716626ec63f157064ef1e"
+  },
+  "members": [
+    {"name": ".thumbnail", "sha256": "f169f909fc89fab59f56a6d9f63ec5eee0240e9cab1c98a38b708580c97df75d", "size": 11000},
+    {"name": "Homan Brand Book.dc.html", "sha256": "dc88d0cdbcb53fea5c6731251c8e90d7b542015d61e10911ca6000d293bd87e5", "size": 37128},
+    {"name": "Homan Logo Options.dc.html", "sha256": "308b206746e6c1530e5b2b6f22b1622207f60f4820d63f15014bf2a65af40939", "size": 12212},
+    {"name": "Homan Type Options.dc.html", "sha256": "febbba26725d3a6d81412063bd3d7078799707b974a5105ebe7d0c1977326698", "size": 11361},
+    {"name": "support.js", "sha256": "8fe7df74405f3c55f49b7249c74ea1397e65d07dea2b1bd3b4a489bec2e28cbe", "size": 69150}
+  ],
+  "extracted_dir": "assets/brand/source/owner-supplied/extracted/",
+  "attestation": "Owner-supplied Homan brand material. License/rights attestation to be recorded by owner; no later task reads the Downloads copy.",
+  "frozen_date": "2026-08-03"
+}

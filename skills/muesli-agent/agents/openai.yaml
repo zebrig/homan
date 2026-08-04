@@ -1,0 +1,4 @@
+interface:
+  display_name: "Muesli Agent"
+  short_description: "Inspect and summarize local Muesli transcripts and notes"
+  default_prompt: "Use the local Muesli CLI to inspect meetings or dictations, analyze them with your own model, and write notes back when requested."

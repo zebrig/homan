@@ -1,0 +1,115 @@
+# init-gitignore:start
+# custom=false
+
+# Codanna
+.codanna/index
+.codanna/cache
+
+# FastEmbed cache
+.fastembed_cache.claude
+.fastembed_cache
+
+# MCP configuration
+.mcp.json
+
+# Logs
+*.log
+act.log*
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# Build output
+dist/
+.output/
+
+# Dependencies
+node_modules/
+
+# Environment variables
+.env
+.env.production
+.dev.vars*
+
+# Local database
+.wrangler/
+*.db
+*.db-shm
+*.db-wal
+
+# macOS-specific files
+.DS_Store
+
+# Repository mapping
+.repomap.tags.cache.v1
+
+# Claude Code
+.claude/settings.local.json
+.claude/watcher.*
+.claude/repo_map*
+# init-gitignore:end
+
+# Python
+.venv/
+.venv-no-torch/
+__pycache__/
+*.pyc
+.coverage
+
+# macOS
+.DS_Store
+*.profraw
+
+# Build artifacts
+.cache/
+.worktrees/
+dist-native/
+experiments/
+
+native/MuesliNative/.build/
+native/MuesliNative/.build-direct/
+native/MuesliNative/.xcodebuild/
+native/MuesliNative/LocalVQE/lib/
+build/
+dist/
+output/
+tmp/
+tmp-no-torch-test/
+tmp-install/
+
+# Audio/data files
+*.wav
+*.sqlite
+*.db
+
+# Signing/certificates & releases
+developerID_application.cer
+dist-notary/
+dist-preprod/
+dist-release/
+scripts/notarize_dmg.sh
+scripts/dev-test.sh
+
+# Legacy files (kept locally, not tracked)
+Context/
+app.py
+main.py
+setup.py
+ui/
+native/system_audio.swift
+scripts/postprocess_py2app_bundle.sh
+scripts/setup_no_torch_env.sh
+requirements-no-torch.txt
+requirements-no-torch-dev.txt
+research/
+assets/muesli_app_icon_traced*.svg
+assets/menu_mic_template.png
+context.md
+
+# IDE
+.claude/
+*.swp
+*~
+.vercel
+docs/reports/meeting-transcription-pipeline.svg

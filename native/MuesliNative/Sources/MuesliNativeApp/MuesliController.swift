@@ -1,0 +1,9959 @@
+import AppKit
+import AVFoundation
+import CloudKit
+import CoreAudio
+import Foundation
+import Sparkle
+import TelemetryDeck
+import MuesliCore
+import os
+
+private enum DictationOutputMode {
+    case paste
+    case voiceNote
+
+    var pasteMethod: String {
+        switch self {
+        case .paste:
+            return "clipboard_restore"
+        case .voiceNote:
+            return "voice_note"
+        }
+    }
+}
+
+enum DictationBackendReadiness: Equatable {
+    case preparing
+    case ready
+    case failed
+
+    var allowsDictation: Bool {
+        self == .ready
+    }
+
+    func blockingMessage(backendLabel: String) -> String? {
+        switch self {
+        case .preparing:
+            return "Warming up \(backendLabel)..."
+        case .ready:
+            return nil
+        case .failed:
+            return "\(backendLabel) unavailable"
+        }
+    }
+}
+
+enum DictionaryCorrectionPromptsToggleResult {
+    case updated
+    case needsAccessibilityPermission
+}
+
+private enum DictationAudioRouteTiming {
+    static let stabilizationDelay: TimeInterval = 1.0
+}
+
+enum InteractiveAudioSessionOwner {
+    case dictation
+    case computerUse
+}
+
+struct InteractiveAudioSessionOwnership: Equatable {
+    let dictationIsActive: Bool
+    let computerUseIsActive: Bool
+
+    func canStart(_ owner: InteractiveAudioSessionOwner) -> Bool {
+        switch owner {
+        case .dictation:
+            return !computerUseIsActive
+        case .computerUse:
+            return !dictationIsActive
+        }
+    }
+
+    func shouldIgnoreCleanup(for owner: InteractiveAudioSessionOwner) -> Bool {
+        switch owner {
+        case .dictation:
+            return !dictationIsActive && computerUseIsActive
+        case .computerUse:
+            return !computerUseIsActive && dictationIsActive
+        }
+    }
+}
+
+struct MeetingResummarizationPlan: Equatable {
+    let promptTitle: String
+    let persistedTitle: String
+}
+
+enum MeetingResummarizationPolicy {
+    static func plan(for meeting: MeetingRecord) -> MeetingResummarizationPlan {
+        let trimmed = meeting.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        let promptTitle = trimmed.isEmpty ? "Meeting" : trimmed
+        return MeetingResummarizationPlan(
+            promptTitle: promptTitle,
+            persistedTitle: meeting.title
+        )
+    }
+}
+
+enum MeetingSummaryPersistenceError: Error, LocalizedError {
+    case failedToSaveSummary(underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .failedToSaveSummary(let underlying):
+            let detail = underlying.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+            if detail.isEmpty {
+                return "The updated meeting notes could not be saved."
+            }
+            return "The updated meeting notes could not be saved. \(detail)"
+        }
+    }
+}
+
+enum MeetingTemplateSelectionError: Error, LocalizedError {
+    case templateNoLongerExists
+
+    var errorDescription: String? {
+        switch self {
+        case .templateNoLongerExists:
+            return "That template no longer exists. Choose another template and try again."
+        }
+    }
+}
+
+enum MeetingCompletionNotificationPolicy {
+    static func shouldShow(
+        hasPresentedMeetingCandidate: Bool,
+        isShowingCalendarNotification: Bool,
+        isMeetingNotificationVisible: Bool
+    ) -> Bool {
+        !hasPresentedMeetingCandidate
+            && !isShowingCalendarNotification
+            && !isMeetingNotificationVisible
+    }
+}
+
+enum MuesliBridgeDeviceRefreshPolicy {
+    static func shouldForceRefresh(
+        userInitiated: Bool,
+        bridgeActivationPending: Bool,
+        bridgeDiscoveryTriggered: Bool,
+        hasKnownCompanionDevice: Bool
+    ) -> Bool {
+        userInitiated
+            || bridgeActivationPending
+            || (bridgeDiscoveryTriggered && !hasKnownCompanionDevice)
+    }
+}
+
+struct PendingMeetingCompletionNotification {
+    let meetingID: Int64?
+    let title: String
+}
+
+enum MeetingRetranscriptionError: Error, LocalizedError {
+    case controllerUnavailable
+    case recordingUnavailable
+    case noDownloadedTranscriptionModel
+    case emptyTranscript
+    case failedToSave(underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .controllerUnavailable:
+            return "Meeting re-transcription could not continue because Homan is no longer available."
+        case .recordingUnavailable:
+            return "The saved meeting recording is no longer available on disk."
+        case .noDownloadedTranscriptionModel:
+            return "Configure the selected cloud transcription provider or download a local model before re-transcribing this meeting."
+        case .emptyTranscript:
+            return "Re-transcription finished, but no speech was detected in the saved recording."
+        case .failedToSave(let underlying):
+            return "The re-transcribed meeting could not be saved. \(underlying.localizedDescription)"
+        }
+    }
+}
+
+enum MeetingLifecycleError: Error, LocalizedError {
+    case failedToSaveRecording(underlying: Error)
+    case failedToDeleteRecording(underlying: Error)
+    case failedToDeleteMeeting(underlying: Error)
+
+    var errorDescription: String? {
+        switch self {
+        case .failedToSaveRecording(let underlying):
+            return "The meeting finished transcribing, but the recording could not be saved. \(underlying.localizedDescription)"
+        case .failedToDeleteRecording(let underlying):
+            return "The saved meeting recording could not be deleted, so the meeting was left in place. \(underlying.localizedDescription)"
+        case .failedToDeleteMeeting(let underlying):
+            return "The meeting could not be deleted. \(underlying.localizedDescription)"
+        }
+    }
+}
+
+struct CompletedMeetingPersistenceResult {
+    let meetingID: Int64
+    let recordingSaveError: MeetingLifecycleError?
+}
+
+struct MeetingRecordingSaveRequest: Sendable {
+    let tempURL: URL
+    let stagedAudio: MeetingStagedAudio?
+    let stagedRawAudio: MeetingStagedRawAudio?
+    let meetingTitle: String
+    let startedAt: Date
+    let supportDirectory: URL
+    let fileFormat: MeetingRecordingFileFormat
+}
+
+enum MeetingRecordingSavePlan {
+    case none
+    case discard(tempURL: URL)
+    case save(MeetingRecordingSaveRequest)
+    case failed(MeetingLifecycleError)
+}
+
+struct PreparedMeetingRecordingSave {
+    let path: String?
+    let sourceLayout: MeetingRecordingSourceLayout?
+    let sourceBundlePath: String?
+    let sourceBundleSchemaVersion: Int?
+    let sourceBundleState: MeetingRecordingSourceState?
+    let error: MeetingLifecycleError?
+
+    init(
+        path: String?,
+        sourceLayout: MeetingRecordingSourceLayout? = nil,
+        sourceBundlePath: String? = nil,
+        sourceBundleSchemaVersion: Int? = nil,
+        sourceBundleState: MeetingRecordingSourceState? = nil,
+        error: MeetingLifecycleError?
+    ) {
+        self.path = path
+        self.sourceLayout = sourceLayout
+        self.sourceBundlePath = sourceBundlePath
+        self.sourceBundleSchemaVersion = sourceBundleSchemaVersion
+        self.sourceBundleState = sourceBundleState
+        self.error = error
+    }
+
+    static let none = PreparedMeetingRecordingSave(path: nil, error: nil)
+}
+
+private final class DictationLatencyLogWriter: @unchecked Sendable {
+    private let queue = DispatchQueue(label: "com.muesli.dictation-latency-log")
+    private let url: URL
+    private var hasCreatedDirectory = false
+
+    init(url: URL) {
+        self.url = url
+    }
+
+    func append(_ line: String) {
+        queue.async { [self] in
+            do {
+                if !hasCreatedDirectory {
+                    try FileManager.default.createDirectory(
+                        at: url.deletingLastPathComponent(),
+                        withIntermediateDirectories: true
+                    )
+                    hasCreatedDirectory = true
+                }
+                try Self.trimIfNeeded(at: url)
+                let data = Data((line + "\n").utf8)
+                do {
+                    let handle = try FileHandle(forWritingTo: url)
+                    defer { try? handle.close() }
+                    try handle.seekToEnd()
+                    try handle.write(contentsOf: data)
+                } catch {
+                    try data.write(to: url, options: .atomic)
+                }
+            } catch {
+                fputs("[dictation-latency] failed to append log: \(error)\n", stderr)
+            }
+        }
+    }
+
+    private static func trimIfNeeded(at url: URL) throws {
+        let maxBytes: UInt64 = 2 * 1024 * 1024
+        let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
+        guard let fileSize = attributes?[.size] as? UInt64,
+              fileSize > maxBytes else { return }
+
+        let data = try Data(contentsOf: url)
+        let keepCount = min(data.count, Int(maxBytes / 2))
+        let tail = data.suffix(keepCount)
+        let newlineIndex = tail.firstIndex(of: UInt8(ascii: "\n"))
+        let trimmed = newlineIndex.map { tail[tail.index(after: $0)...] } ?? tail[...]
+        try Data(trimmed).write(to: url, options: .atomic)
+    }
+}
+
+@MainActor
+final class MuesliController: NSObject {
+    private static let maxDismissedDictionarySuggestionKeys = 200
+    private static let maxDictionarySuggestions = 50
+    private static let maxDictionarySuggestionPromptQueue = 10
+    private static let dictionarySuggestionLogger = Logger(subsystem: "com.muesli.native", category: "DictionarySuggestion")
+    private static let pendingDictionaryCorrectionAccessibilityEnableKey = "dictionaryCorrectionPrompts.pendingAccessibilityEnable"
+    private static let pendingDictionaryCorrectionAccessibilityRequestedAtKey = "dictionaryCorrectionPrompts.pendingAccessibilityRequestedAt"
+    private static let pendingDictionaryCorrectionAccessibilityRequestProcessIDKey = "dictionaryCorrectionPrompts.pendingAccessibilityRequestProcessID"
+    private static let dictionaryCorrectionAccessibilityIntentTimeout: TimeInterval = 24 * 60 * 60
+    private static let retentionCleanupInterval: TimeInterval = 60 * 60
+
+    private let runtime: RuntimePaths
+    private let configStore: ConfigStore
+    private let processingSupportDirectory: URL
+    private let dictationStore: DictationStore
+    private let meetingHookDispatcher: MeetingHookDispatching
+    private let meetingMarkdownAutoExporter: MeetingMarkdownAutoExporting
+    private let launchAtLoginCoordinator: LaunchAtLoginCoordinator
+    let transcriptionCoordinator = TranscriptionCoordinator()
+    private let hotkeyMonitor = HotkeyMonitor()
+    private let computerUseHotkeyMonitor = HotkeyMonitor()
+    private let meetingRecordingHotkeyMonitor = HotkeyMonitor()
+    private let computerUseRecorder = RouteAwareDictationRecorder()
+    private let dictationRecorder = RouteAwareDictationRecorder()
+    private let dictationCorrectionMonitor = DictationCorrectionMonitor()
+    private let dictionarySuggestionPrompt = DictionarySuggestionPromptController()
+    private var activeDictionarySuggestionPromptKey: String?
+    private var queuedDictionarySuggestionPromptKeys: [String] = []
+    private var dictionarySuggestionPromptAdvanceTask: Task<Void, Never>?
+    private let audioDuckingController: AudioDuckingManaging
+    private let dictationAudioRoutingController: DictationAudioRouting
+    private lazy var dictationAudioSessionManager = DictationAudioSessionManager(
+        recorder: dictationRecorder,
+        duckingController: audioDuckingController,
+        routingController: dictationAudioRoutingController
+    )
+    private lazy var computerUseAudioSessionManager = DictationAudioSessionManager(
+        recorder: computerUseRecorder,
+        duckingController: audioDuckingController,
+        routingController: dictationAudioRoutingController
+    )
+    private let dictationLatencyLogWriter = DictationLatencyLogWriter(
+        url: AppIdentity.supportDirectoryURL.appendingPathComponent("dictation-latency.log")
+    )
+    private lazy var diagnosticIncidentReporter = DiagnosticIncidentReporter(
+        appState: appState,
+        automaticPromptEnabled: { [weak self] in
+            self?.config.enableAutomaticDiagnosticIssuePrompts ?? false
+        },
+        onPrompt: { [weak self] _ in
+            self?.presentHistoryWindow(tab: .about)
+        }
+    )
+    private let dictationLatencyTimestampFormatter = ISO8601DateFormatter()
+    private let indicator: FloatingIndicatorController
+    private let calendarMonitor = CalendarMonitor()
+    private let meetingMonitor = MeetingMonitor()
+    private let meetingNotification = MeetingNotificationController()
+    private let meetingSourceWindowLocator = MeetingSourceWindowLocator()
+
+    private let chatGPTAuth = ChatGPTAuthManager.shared
+    private let googleCalAuth = GoogleCalendarAuthManager.shared
+    private let googleCalClient = GoogleCalendarClient()
+    private var calendarCheckTimer: Timer?
+    private var calendarMonitoringStarted = false
+    private var meetingStartingNowTimers = [String: Timer]()
+    private var notifiedUpcomingEventIDs = Set<String>()
+    private var autoRecordedCalendarEventIDs = Set<String>()
+    private var meetingFeatureMonitorsAllowed = false
+    private var meetingDetectionMonitorStarted = false
+
+    private var searchTask: Task<Void, Never>?
+    private var onboardingModelPreparationTask: Task<Void, Never>?
+    private var maraudersMapCountdown: MaraudersMapCountdownController?
+
+    private var statusBarController: StatusBarController?
+    private var historyWindowController: RecentHistoryWindowController?
+    private var preferencesWindowController: PreferencesWindowController?
+    private var onboardingWindowController: OnboardingWindowController?
+    private let featureTourStore = FeatureTourStore()
+    var updaterController: SPUStandardUpdaterController?
+    private var busyStatusGeneration = 0
+
+    let appState = AppState()
+
+    private(set) var config: AppConfig
+    private(set) var selectedBackend: BackendOption
+    private(set) var selectedMeetingTranscriptionBackend: BackendOption
+    private(set) var selectedMeetingSummaryBackend: MeetingSummaryBackendOption
+    private(set) var selectedPostProcessorBackend: TranscriptCleanupBackendOption
+    private var activeMeetingSession: MeetingSession?
+    private weak var preparingMeetingSession: MeetingSession?
+    private var activeMeetingID: Int64?
+    private var activeMeetingInputDeviceUID: String?
+    private var liveMeetingTranscriptGeneration: UUID?
+    private var activeMeetingAudioWarning: ActiveMeetingAudioWarning?
+    private var liveMeetingTitleCache: [Int64: String] = [:]
+    private var liveManualNotesCache: [Int64: String] = [:]
+    private var liveManualNotesLastPersistedAt: [Int64: Date] = [:]
+    private var liveManualNotesLastPersistedValue: [Int64: String] = [:]
+    private var liveManualNotesPersistWorkItems: [Int64: DispatchWorkItem] = [:]
+    private let liveManualNotesPersistInterval: TimeInterval = 0.75
+    private var staleLiveMeetingRecoveryFailures = Set<Int64>()
+    private var meetingRecoveryInFlightIDs = Set<Int64>()
+    private var dictationState: DictationState = .idle
+    private var dictationBackendReadiness: DictationBackendReadiness = .preparing
+    private var dictationStartedAt: Date?
+    private var dictationLatencyTraceID: UUID?
+    private var dictationLatencyTraceStartedAt: Date?
+    private var currentDictationOutputMode: DictationOutputMode = .paste
+    private var pendingDictationStopStartedAt: Date?
+    private var pendingDictationStopSessionID: UUID?
+    private var pendingReleaseSoundSessionID: UUID?
+    private var pendingPreparingIndicatorWorkItem: DispatchWorkItem?
+    private var activeComputerUseAudioSessionID: UUID?
+    private var computerUseCommandStartedAt: Date?
+    private var pendingComputerUseStopStartedAt: Date?
+    private var pendingComputerUseStopSessionID: UUID?
+    private var computerUseCommandTask: Task<Void, Never>?
+    private var computerUseCommandTaskID: UUID?
+    private var computerUseFloatingStatusWorkItem: DispatchWorkItem?
+    private var computerUseLastFloatingStatusAt = Date.distantPast
+    private var computerUseLastFloatingStatus = ""
+    private var computerUseTranscriptVisible = false
+    private let computerUseFloatingStatusMinimumDwell: TimeInterval = 0.85
+    private var _streamingDictationController: Any?  // StreamingDictationController (macOS 15+)
+    private var isNemotron35Streaming = false
+    private var nemotron35StreamingSessionID: UUID?
+    private var previousStreamText = ""
+    private var openWindowCount = 0
+    private var lastExternalApp: NSRunningApplication?
+    private var capturedDictationContext: DictationContext?
+    private var capturedDictationCorrectionTargetApp: DictationCorrectionTargetApp?
+    private var workspaceObserver: NSObjectProtocol?
+    private var dataDidChangeObserver: NSObjectProtocol?
+    private var iCloudAppActiveObserver: NSObjectProtocol?
+    private var iCloudWakeObserver: NSObjectProtocol?
+    private var isStartingMeetingRecording = false
+    private var meetingStartStatus: String?
+    private var isShowingCalendarNotification = false
+    private var presentedMeetingCandidate: MeetingCandidate?
+    private var meetingEndTimer: Timer?
+    private var retentionCleanupTimer: Timer?
+    private var activeMeetingCalendarEndDate: Date?
+    private var latestMeetingActivityCandidate: MeetingCandidate?
+    private var latestMeetingActivityCandidateObservedAt: Date?
+    private var activeMeetingAutoStop = MeetingAutoStopTracker()
+    private var activeMeetingSignalLossResponse: MeetingSignalLossResponse = .none
+    private var meetingSignalLossPromptState = MeetingSignalLossPromptState()
+    private let meetingAutoStopGracePeriod: TimeInterval = 20
+    private var meetingActivity: NSObjectProtocol?
+    private var isStoppingMeetingRecording = false
+    private var isPresentingMeetingTerminationConfirmation = false
+    private var isTerminatingAfterMeetingConfirmation = false
+    private var backgroundMeetingProcessingCount = 0
+    private var pendingMeetingCompletionNotification: PendingMeetingCompletionNotification?
+    private var contributionMilestonePromptDismissedThisLaunch = false
+    private var contributionMilestonePromptSeenIDsThisLaunch: Set<String> = []
+    private var meetingStartTask: Task<Void, Never>?
+    private var meetingStartMeetingID: Int64?
+    private var importTask: Task<Void, Never>?
+    private var importSessionID: UUID?
+    private var canceledMeetingStartIDs = Set<Int64>()
+    /// Prior transcript captured when resuming a finished meeting, keyed by meeting id.
+    /// Present only while a resume is in flight; consumed at stop to merge old + new
+    /// transcript, and cleared on success or restored-on-failure.
+    private var pendingResumePriorTranscript: [Int64: String] = [:]
+    private var iCloudSyncTask: Task<Void, Never>?
+    private var iCloudSyncGeneration = 0
+    private var iCloudSyncDebounceTask: Task<Void, Never>?
+    private var iCloudSubscriptionTask: Task<Void, Never>?
+    private var hasEnsuredICloudSubscription = false
+    private var bridgeActivationPending = false
+    private var bridgeDiscoveryPending = false
+    private var bridgeDiscoveryFollowUpPending = false
+    private var hasStarted = false
+
+    init(
+        runtime: RuntimePaths,
+        dictationStore: DictationStore? = nil,
+        configStore: ConfigStore = ConfigStore(),
+        meetingHookDispatcher: MeetingHookDispatching = MeetingHookRunner(),
+        meetingMarkdownAutoExporter: MeetingMarkdownAutoExporting = MeetingMarkdownAutoExporter(),
+        launchAtLoginManager: LaunchAtLoginManaging = SystemLaunchAtLoginManager(),
+        audioDuckingController: AudioDuckingManaging = AudioDuckingController(),
+        dictationAudioRoutingController: DictationAudioRouting = DictationAudioRouteController()
+    ) {
+        self.configStore = configStore
+        self.processingSupportDirectory = configStore.supportDirectory()
+        var loadedConfig = configStore.load()
+        let loadedBackend = BackendOption.all.first(where: {
+            $0.backend == loadedConfig.sttBackend && $0.model == loadedConfig.sttModel
+        }) ?? .whisper
+        var loadedPostProcessorBackend = TranscriptCleanupBackendOption.resolved(loadedConfig.postProcessorBackend)
+        if !loadedPostProcessorBackend.isCompatible(with: loadedBackend) {
+            loadedPostProcessorBackend = .local
+            loadedConfig.postProcessorBackend = loadedPostProcessorBackend.backend
+            loadedConfig.enablePostProcessor = false
+            configStore.save(loadedConfig)
+        }
+        self.runtime = runtime
+        self.dictationStore = dictationStore ?? DictationStore(
+            databaseURL: MuesliPaths.defaultDatabaseURL(appName: AppIdentity.supportDirectoryName)
+        )
+        self.meetingHookDispatcher = meetingHookDispatcher
+        self.meetingMarkdownAutoExporter = meetingMarkdownAutoExporter
+        self.launchAtLoginCoordinator = LaunchAtLoginCoordinator(manager: launchAtLoginManager)
+        self.audioDuckingController = audioDuckingController
+        self.dictationAudioRoutingController = dictationAudioRoutingController
+        self.dictationAudioRoutingController.selectedInputDeviceUID = loadedConfig.dictationInputDeviceUID
+        self.dictationAudioRoutingController.selectedMeetingInputDeviceUID = loadedConfig.meetingInputDeviceUID
+        self.config = loadedConfig
+        if loadedConfig.recordingColorHex != "1e1e2e" {
+            MuesliTheme.accentOverrideHex = loadedConfig.recordingColorHex
+        }
+        self.selectedBackend = loadedBackend
+        let configuredMeetingBackend = BackendOption.resolve(
+            backend: loadedConfig.meetingTranscriptionBackend,
+            model: loadedConfig.meetingTranscriptionModel
+        )
+        self.selectedMeetingTranscriptionBackend = Self.availableMeetingTranscriptionBackend(
+            config: loadedConfig,
+            dictationBackend: self.selectedBackend,
+            downloadedOptions: BackendOption.downloaded
+        ) ?? Self.fallbackMeetingTranscriptionBackend(
+            configured: configuredMeetingBackend,
+            dictationBackend: self.selectedBackend
+        )
+        self.selectedMeetingSummaryBackend = MeetingSummaryBackendOption.all.first(where: {
+            $0.backend == loadedConfig.meetingSummaryBackend
+        }) ?? .transcriptOnly
+        self.selectedPostProcessorBackend = loadedPostProcessorBackend
+        self.indicator = FloatingIndicatorController(configStore: configStore)
+        ComputerUseCursorOverlay.shared.attachIndicator(self.indicator)
+        super.init()
+        dictationAudioSessionManager.onEvent = { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleDictationAudioSessionEvent(event)
+            }
+        }
+        computerUseAudioSessionManager.onEvent = { [weak self] event in
+            Task { @MainActor [weak self] in
+                self?.handleComputerUseAudioSessionEvent(event)
+            }
+        }
+        dictationAudioRoutingController.onPreferredInputDeviceChanged = { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.syncDictationRecorderWarmup(
+                    intent: .idlePrewarm(.routeChange),
+                    delay: DictationAudioRouteTiming.stabilizationDelay
+                )
+            }
+        }
+        dictationAudioRoutingController.onMeetingPreferredInputDeviceChanged = { [weak self] deviceID in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.applyMeetingInputDevice(deviceID)
+                self.refreshActiveMeetingMicrophoneState()
+            }
+        }
+        Task {
+            try? await transcriptionCoordinator.configureHomanWhisper(
+                endpointString: loadedConfig.homanWhisperEndpoint,
+                apiKey: loadedConfig.homanWhisperAPIKey
+            )
+        }
+    }
+
+    func start() {
+        hasStarted = true
+        do {
+            try dictationStore.migrateIfNeeded()
+        } catch {
+            fputs("[muesli-native] startup error: \(error)\n", stderr)
+        }
+        let databaseMaintenanceStartedAt = Date()
+        do {
+            try dictationStore.performStartupMaintenance()
+            let elapsed = Date().timeIntervalSince(databaseMaintenanceStartedAt)
+            fputs(
+                "[muesli-native] startup database maintenance completed in \(String(format: "%.3f", elapsed))s\n",
+                stderr
+            )
+        } catch {
+            fputs("[muesli-native] startup database maintenance error: \(error)\n", stderr)
+        }
+        recoverStaleLiveMeetings()
+        normalizeMeetingTranscriptionSelectionForAvailability()
+        SoundController.prewarmLifecycleSounds()
+
+        // Clean up phantom aggregate devices left by a previous crash
+        CoreAudioSystemRecorder.cleanupStaleDevices()
+
+        syncLaunchAtLoginConfigWithSystem()
+        reconcilePendingDictionaryCorrectionAccessibilityEnable()
+
+        // Clean up leftover audio temp files from previous sessions.
+        cleanupTemporaryDirectory(
+            named: "muesli-system-audio",
+            logDescription: "leftover temp audio files"
+        )
+        cleanupTemporaryDirectory(
+            named: "muesli-meeting-recordings",
+            logDescription: "leftover temp meeting recording files"
+        )
+        cleanupHistoricalMeetingWaveformCacheFilesIfNeeded()
+        initializeRetentionPolicies()
+        performRetentionCleanup()
+        retentionCleanupTimer?.invalidate()
+        retentionCleanupTimer = Timer.scheduledTimer(
+            withTimeInterval: Self.retentionCleanupInterval,
+            repeats: true
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.performRetentionCleanup()
+            }
+        }
+
+        hotkeyMonitor.onArm = { [weak self] in self?.handleArm() }
+        hotkeyMonitor.onPrepare = { [weak self] in self?.handlePrepare() }
+        hotkeyMonitor.onStart = { [weak self] in self?.handleStart() }
+        hotkeyMonitor.onStop = { [weak self] in self?.handleStop() }
+        hotkeyMonitor.onCancel = { [weak self] in self?.handleCancel() }
+        hotkeyMonitor.onToggleStart = { [weak self] in self?.handleToggleStart() }
+        hotkeyMonitor.onToggleStop = { [weak self] in self?.handleToggleStop() }
+        hotkeyMonitor.doubleTapEnabled = config.enableDoubleTapDictation
+        configureHotkeyMonitorTiming()
+        computerUseHotkeyMonitor.onPrepare = { [weak self] in self?.handleComputerUsePrepare() }
+        computerUseHotkeyMonitor.onStart = { [weak self] in self?.handleComputerUseStart() }
+        computerUseHotkeyMonitor.onStop = { [weak self] in self?.handleComputerUseStop() }
+        computerUseHotkeyMonitor.onCancel = { [weak self] in self?.handleComputerUseCancel() }
+        computerUseHotkeyMonitor.onToggleStart = { [weak self] in self?.handleComputerUseToggleStart() }
+        computerUseHotkeyMonitor.onToggleStop = { [weak self] in self?.handleComputerUseToggleStop() }
+        computerUseHotkeyMonitor.doubleTapEnabled = config.enableDoubleTapDictation
+
+        meetingRecordingHotkeyMonitor.onStart = { [weak self] in
+            DispatchQueue.main.async { self?.toggleMeetingRecording() }
+        }
+        meetingRecordingHotkeyMonitor.onToggleStart = { [weak self] in
+            DispatchQueue.main.async { self?.toggleMeetingRecording() }
+        }
+        meetingRecordingHotkeyMonitor.onToggleStop = { [weak self] in
+            DispatchQueue.main.async { self?.toggleMeetingRecording() }
+        }
+        meetingRecordingHotkeyMonitor.onCancel = { [weak self] in
+            DispatchQueue.main.async { self?.stopMeetingRecording() }
+        }
+
+        let canRunMainApp = config.hasCompletedOnboarding
+            && hasRequiredStartupPermissions(for: config.resolvedOnboardingUseCase)
+        meetingFeatureMonitorsAllowed = canRunMainApp
+
+        // Defer permission-triggering monitors until after onboarding
+        if canRunMainApp && config.resolvedOnboardingUseCase.includesPushToTalk {
+            hotkeyMonitor.configure(config.dictationHotkey)
+            hotkeyMonitor.start()
+            startComputerUseHotkeyMonitorIfNeeded()
+        }
+        if canRunMainApp {
+            startMeetingRecordingHotkeyMonitorIfNeeded()
+        }
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.startup))
+        indicator.onStopMeeting = { [weak self] in self?.stopMeetingRecording() }
+        indicator.onDiscardMeeting = { [weak self] in self?.discardMeetingWithConfirmation() }
+        indicator.onToggleMeetingPause = { [weak self] in self?.toggleMeetingRecordingPause() }
+        indicator.onOpenMeetingNotes = { [weak self] in self?.openActiveMeetingNotes() }
+        indicator.onStopToggleDictation = { [weak self] in
+            guard let self else { return }
+            if self.hotkeyMonitor.isToggleRecording {
+                self.hotkeyMonitor.stopToggleMode()
+            } else if self.computerUseHotkeyMonitor.isToggleRecording {
+                self.computerUseHotkeyMonitor.stopToggleMode()
+            } else if self.computerUseCommandStartedAt != nil {
+                self.handleComputerUseStop()
+            } else {
+                self.handleStop()
+            }
+        }
+        indicator.onCancelToggleDictation = { [weak self] in
+            guard let self else { return }
+            if self.computerUseHotkeyMonitor.isToggleRecording || self.computerUseCommandStartedAt != nil {
+                self.handleComputerUseCancel()
+                self.computerUseHotkeyMonitor.cancelToggleMode()
+            } else {
+                self.handleCancel()
+                self.hotkeyMonitor.cancelToggleMode()
+            }
+            self.indicator.isToggleDictation = false
+        }
+        indicator.onPositionSaved = { [weak self] center in
+            self?.updateConfig {
+                $0.indicatorAnchor = .custom
+                $0.indicatorOrigin = CGPointCodable(x: center.x, y: center.y)
+            }
+        }
+        indicator.onRequestStartMeetingRecording = { [weak self] in
+            self?.confirmStartMeetingRecordingFromFloatingBar()
+        }
+        indicator.onRequestStopMeetingRecording = { [weak self] in
+            self?.confirmStopMeetingRecordingFromFloatingBar()
+        }
+        indicator.onEnableLiveCaptions = { [weak self] in
+            self?.enableLiveCaptionsFromFloatingBar()
+        }
+        indicator.onDisableLiveCaptions = { [weak self] in
+            guard let self, let meetingID = self.activeMeetingID else { return }
+            self.stopActiveMeetingLive(meetingID: meetingID)
+        }
+        workspaceObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didActivateApplicationNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] notification in
+            guard
+                let app = notification.userInfo?[NSWorkspace.applicationUserInfoKey] as? NSRunningApplication,
+                app != NSRunningApplication.current
+            else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.lastExternalApp = app
+            }
+        }
+        dataDidChangeObserver = DistributedNotificationCenter.default().addObserver(
+            forName: MuesliNotifications.dataDidChange,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.historyWindowController?.reload()
+                self.syncAppState()
+            }
+        }
+        installICloudPersistentSyncObservers()
+
+        statusBarController = StatusBarController(controller: self, runtime: runtime)
+        indicator.statusMenu = statusBarController?.statusMenu
+        preferencesWindowController = PreferencesWindowController(controller: self)
+        historyWindowController = RecentHistoryWindowController(store: dictationStore, controller: self)
+        applyDashboardWindowPresencePolicy()
+        let latestFeatureTour = FeatureTourCatalog.latest(
+            includeCloudCleanup: chatGPTAuth.isAuthenticated
+        )
+        let automaticFeatureTour = featureTourStore.automaticTour(
+            currentVersion: AppIdentity.marketingVersion,
+            hasCompletedOnboarding: config.hasCompletedOnboarding,
+            canPresent: canRunMainApp,
+            tour: latestFeatureTour
+        )
+        refreshUI()
+        if config.iCloudSyncEnabled {
+            if MuesliICloudSyncEngine.hasRequiredEntitlement {
+                enableICloudPersistentSync()
+                scheduleICloudSync(delay: 0.5, userInitiated: false)
+            } else {
+                disableICloudSyncForUnavailableEntitlement()
+            }
+        }
+
+        meetingMonitor.calendarEventProvider = { [weak self] in
+            self?.currentOrNearbyCachedCalendarEvent()
+        }
+        meetingMonitor.detectionEnabledProvider = { [weak self] in
+            guard let self else { return false }
+            return self.config.showMeetingDetectionNotification
+                || self.activeMeetingAutoStop.isArmed
+        }
+        meetingMonitor.mutedDetectionBundleIDsProvider = { [weak self] in
+            Set(self?.config.mutedMeetingDetectionAppBundleIDs ?? [])
+        }
+        meetingMonitor.isRecordingProvider = { [weak self] in
+            guard let self else { return false }
+            return self.isMeetingRecording()
+        }
+        meetingMonitor.isStartingRecordingProvider = { [weak self] in
+            self?.isStartingMeetingRecording ?? false
+        }
+        meetingMonitor.isCalendarNotificationVisibleProvider = { [weak self] in
+            self?.isShowingCalendarNotification ?? false
+        }
+        meetingMonitor.promptVisibilityProvider = { [weak self] in
+            guard let self else {
+                return MeetingPromptVisibility(isVisible: false, currentPromptID: nil, shownAt: nil)
+            }
+            return MeetingPromptVisibility(
+                isVisible: self.meetingNotification.isVisible,
+                currentPromptID: self.meetingNotification.currentPromptID,
+                shownAt: self.meetingNotification.shownAt
+            )
+        }
+        meetingMonitor.onActivityCandidateChanged = { [weak self] candidate in
+            self?.handleMeetingActivityCandidate(candidate)
+        }
+        meetingMonitor.onPromptCandidateChanged = { [weak self] candidate in
+            guard let self else { return }
+            if let candidate {
+                self.presentMeetingDetection(candidate)
+            } else {
+                self.dismissPresentedMeetingDetection()
+            }
+        }
+
+        // Calendar monitor populates the "Coming Up" section even when
+        // meeting detection is turned off for meeting use cases. Also keep it
+        // running for existing users who enabled meeting feature settings before
+        // onboarding use cases existed.
+        syncCalendarMonitor()
+
+        // Defer permission-triggering monitors until after onboarding
+        if canRunMainApp && shouldRunMeetingFeatureMonitors {
+            startMeetingFeatureMonitors(includeMaraudersMap: true)
+        }
+
+        if canRunMainApp {
+            Task { [weak self] in
+                guard let self else { return }
+                let includesMeetings = self.config.resolvedOnboardingUseCase.includesMeetings
+                let ppOption = self.runtimePostProcessorOption()
+                if #available(macOS 15, *) {
+                    await self.configureTranscriptCleanupForRuntime(option: ppOption)
+                    await self.transcriptionCoordinator.setNemotron35PromptId(
+                        self.config.resolvedNemotron35Language.promptId
+                    )
+                }
+                let dictationBackend = self.selectedBackend
+                guard await self.prepareDictationBackend(dictationBackend) else { return }
+                await self.preloadOptionalTranscriptionResources(
+                    for: dictationBackend,
+                    enablePostProcessor: self.canRunTranscriptCleanup(option: ppOption),
+                    includeMeetingHelpers: includesMeetings
+                )
+                await MainActor.run {
+                    self.refreshUI()
+                }
+            }
+        }
+
+        if !canRunMainApp {
+            if let progress = OnboardingProgress.load() {
+                showOnboarding(resumeFrom: progress)
+            } else if config.hasCompletedOnboarding {
+                showOnboarding(resumeFrom: onboardingProgressForPermissionRepair())
+            } else {
+                showOnboarding()
+            }
+        } else if config.openDashboardOnLaunch {
+            openHistoryWindow()
+        }
+
+        if canRunMainApp {
+            PostInstallChecker.check()
+            if let automaticFeatureTour {
+                DispatchQueue.main.async { [weak self] in
+                    guard let self,
+                          self.offerFeatureTour(automaticFeatureTour) else { return }
+                    self.featureTourStore.markOffered(automaticFeatureTour)
+                }
+            }
+        }
+    }
+
+    func shutdown() {
+        if let workspaceObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
+            self.workspaceObserver = nil
+        }
+        if let dataDidChangeObserver {
+            DistributedNotificationCenter.default().removeObserver(dataDidChangeObserver)
+            self.dataDidChangeObserver = nil
+        }
+        if let iCloudAppActiveObserver {
+            NotificationCenter.default.removeObserver(iCloudAppActiveObserver)
+            self.iCloudAppActiveObserver = nil
+        }
+        if let iCloudWakeObserver {
+            NSWorkspace.shared.notificationCenter.removeObserver(iCloudWakeObserver)
+            self.iCloudWakeObserver = nil
+        }
+        cancelActiveICloudSyncTask()
+        iCloudSyncDebounceTask?.cancel()
+        iCloudSyncDebounceTask = nil
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = nil
+        retentionCleanupTimer?.invalidate()
+        retentionCleanupTimer = nil
+        hotkeyMonitor.stop()
+        computerUseHotkeyMonitor.stop()
+        meetingRecordingHotkeyMonitor.stop()
+        computerUseCommandTask?.cancel()
+        computerUseCommandTask = nil
+        computerUseCommandTaskID = nil
+        activeComputerUseAudioSessionID = nil
+        pendingComputerUseStopSessionID = nil
+        pendingComputerUseStopStartedAt = nil
+        calendarMonitor.stop()
+        calendarCheckTimer?.invalidate()
+        calendarCheckTimer = nil
+        calendarMonitoringStarted = false
+        meetingStartingNowTimers.values.forEach { $0.invalidate() }
+        meetingStartingNowTimers.removeAll()
+        notifiedUpcomingEventIDs.removeAll()
+        autoRecordedCalendarEventIDs.removeAll()
+        meetingFeatureMonitorsAllowed = false
+        disarmMeetingAutoStop()
+        meetingMonitor.stop()
+        meetingDetectionMonitorStarted = false
+        dismissPresentedMeetingDetection()
+        meetingNotification.close()
+        dictationCorrectionMonitor.cancel()
+        activeMeetingSession?.discard()
+        activeMeetingSession = nil
+        if let activeMeetingID {
+            resolveLiveMeetingAfterStopFailure(id: activeMeetingID)
+            self.activeMeetingID = nil
+        }
+        resetActiveMeetingMicrophoneSelection()
+        activeMeetingAudioWarning = nil
+        endMeetingActivity()
+        dictationAudioSessionManager.cancel(reason: "shutdown")
+        computerUseAudioSessionManager.cancel(reason: "shutdown")
+        Task {
+            await transcriptionCoordinator.shutdown()
+        }
+        indicator.close()
+        CoreAudioSystemRecorder.cleanupStaleDevices()
+    }
+
+    func recentDictations() -> [DictationRecord] {
+        (try? dictationStore.recentDictations(limit: 10)) ?? []
+    }
+
+    func recentMeetings() -> [MeetingRecord] {
+        (try? dictationStore.recentMeetings(limit: 10)) ?? []
+    }
+
+    func meeting(id: Int64) -> MeetingRecord? {
+        if let row = appState.meetingRows.first(where: { $0.id == id }) {
+            return row
+        }
+        return try? dictationStore.meeting(id: id)
+    }
+
+    func dictationStats() -> DictationStats {
+        (try? dictationStore.dictationStats()) ?? DictationStats(
+            totalWords: 0,
+            totalSessions: 0,
+            averageWordsPerSession: 0,
+            averageWPM: 0,
+            currentStreakDays: 0,
+            longestStreakDays: 0
+        )
+    }
+
+    func meetingStats() -> MeetingStats {
+        (try? dictationStore.meetingStats()) ?? MeetingStats(totalWords: 0, totalMeetings: 0, averageWPM: 0)
+    }
+
+    func openInsights(section: InsightsSection) {
+        appState.insightsInitialSection = section
+        appState.selectedTab = .insights
+    }
+
+    func showModels(category: ModelsCategory) {
+        if appState.isSearchActive {
+            clearSearch()
+        }
+        appState.selectedModelsCategory = category
+        appState.selectedTab = .models
+    }
+
+    @objc func showWhatsNew() {
+        let tour = FeatureTourCatalog.latest(includeCloudCleanup: chatGPTAuth.isAuthenticated)
+        guard beginFeatureTour(tour, source: "manual") else { return }
+        featureTourStore.markOffered(tour)
+    }
+
+    @discardableResult
+    private func offerFeatureTour(_ tour: FeatureTour) -> Bool {
+        guard !tour.steps.isEmpty,
+              appState.pendingFeatureTourInvitation == nil,
+              appState.activeFeatureTour == nil,
+              ensureBasicDictationPermissionsBeforeDashboard() else { return false }
+
+        appState.pendingFeatureTourInvitation = tour
+        presentHistoryWindow()
+        TelemetryDeck.signal("feature_walkthrough.invitation_shown", parameters: [
+            "version": tour.version,
+            "step_count": "\(tour.steps.count)",
+            "includes_cloud_cleanup": "\(tour.steps.contains { $0.target == .cloudCleanupSetting })",
+        ])
+        // The normal startup preload task continues while this invitation and
+        // the walkthrough are on screen, so no second backend load is started.
+        return true
+    }
+
+    func acceptFeatureTourInvitation() {
+        guard let tour = appState.pendingFeatureTourInvitation else { return }
+        appState.pendingFeatureTourInvitation = nil
+        TelemetryDeck.signal("feature_walkthrough.decision", parameters: [
+            "version": tour.version,
+            "decision": "accepted",
+            "step_count": "\(tour.steps.count)",
+        ])
+        beginFeatureTour(tour, source: "automatic")
+    }
+
+    func skipFeatureTourInvitation() {
+        guard let tour = appState.pendingFeatureTourInvitation else { return }
+        appState.pendingFeatureTourInvitation = nil
+        TelemetryDeck.signal("feature_walkthrough.decision", parameters: [
+            "version": tour.version,
+            "decision": "skipped",
+            "step_count": "\(tour.steps.count)",
+        ])
+    }
+
+    @discardableResult
+    private func beginFeatureTour(_ tour: FeatureTour, source: String) -> Bool {
+        guard !tour.steps.isEmpty,
+              ensureBasicDictationPermissionsBeforeDashboard() else { return false }
+
+        appState.pendingFeatureTourInvitation = nil
+        appState.activeFeatureTour = tour
+        appState.featureTourStepIndex = 0
+        navigateToFeatureTourStep(tour.steps[0])
+        presentHistoryWindow()
+        TelemetryDeck.signal("feature_walkthrough.started", parameters: [
+            "version": tour.version,
+            "source": source,
+            "step_count": "\(tour.steps.count)",
+        ])
+        return true
+    }
+
+    func showPreviousFeatureTourStep() {
+        guard let tour = appState.activeFeatureTour else { return }
+        let index = max(0, appState.featureTourStepIndex - 1)
+        showFeatureTourStep(index, in: tour)
+    }
+
+    func showNextFeatureTourStep() {
+        guard let tour = appState.activeFeatureTour else { return }
+        let nextIndex = appState.featureTourStepIndex + 1
+        guard tour.steps.indices.contains(nextIndex) else {
+            completeFeatureTour()
+            return
+        }
+        showFeatureTourStep(nextIndex, in: tour)
+    }
+
+    func dismissFeatureTour() {
+        if let tour = appState.activeFeatureTour,
+           tour.steps.indices.contains(appState.featureTourStepIndex) {
+            TelemetryDeck.signal("feature_walkthrough.dismissed", parameters: [
+                "version": tour.version,
+                "step": tour.steps[appState.featureTourStepIndex].id,
+                "step_index": "\(appState.featureTourStepIndex + 1)",
+            ])
+        }
+        appState.activeFeatureTour = nil
+        appState.featureTourStepIndex = 0
+    }
+
+    private func completeFeatureTour() {
+        if let tour = appState.activeFeatureTour {
+            TelemetryDeck.signal("feature_walkthrough.completed", parameters: [
+                "version": tour.version,
+                "step_count": "\(tour.steps.count)",
+            ])
+        }
+        appState.activeFeatureTour = nil
+        appState.featureTourStepIndex = 0
+        appState.selectedTab = .dictations
+    }
+
+    private func showFeatureTourStep(_ index: Int, in tour: FeatureTour) {
+        guard tour.steps.indices.contains(index) else { return }
+        appState.featureTourStepIndex = index
+        navigateToFeatureTourStep(tour.steps[index])
+    }
+
+    private func navigateToFeatureTourStep(_ step: FeatureTourStep) {
+        if appState.isSearchActive {
+            clearSearch()
+        }
+        switch step.target {
+        case .insightsEntry:
+            appState.selectedTab = .dictations
+        case .dictionarySuggestions:
+            appState.selectedTab = .dictionary
+        case .meetingsSidebar:
+            appState.selectedTab = .meetings
+            appState.meetingsNavigationState = .browser
+            appState.selectedMeetingID = nil
+            appState.selectedMeetingRecord = nil
+        case .liveCaptionsSetting:
+            appState.selectedSettingsPane = .meetings
+            appState.selectedTab = .settings
+        case .cloudCleanupSetting:
+            appState.selectedSettingsPane = .dictation
+            appState.selectedTab = .settings
+        case .streamingModels, .experimentalModels:
+            if let category = step.target.modelsCategory {
+                showModels(category: category)
+            }
+        }
+    }
+
+    func closeInsights() {
+        appState.selectedTab = .dictations
+    }
+
+    func insightsSnapshot(range: InsightsRange) async throws -> InsightsSnapshot {
+        let databaseURL = dictationStore.resolvedDatabaseURL
+        return try await Task.detached(priority: .utility) {
+            try Task.checkCancellation()
+            return try DictationStore(databaseURL: databaseURL).insightsSnapshot(range: range)
+        }.value
+    }
+
+    func truncate(_ text: String, limit: Int) -> String {
+        let compact = text.split(whereSeparator: \.isWhitespace).joined(separator: " ")
+        guard compact.count > limit else { return compact }
+        return String(compact.prefix(limit - 3)).trimmingCharacters(in: .whitespacesAndNewlines) + "..."
+    }
+
+    func refreshIndicatorVisibility() {
+        if config.showFloatingIndicator {
+            indicator.ensureVisible(config: config)
+        } else {
+            indicator.closeIfIdle()
+        }
+        indicator.refreshMeetingTranscriptPreference(config: config)
+    }
+
+    func refreshUI() {
+        statusBarController?.setStatus("Idle")
+        statusBarController?.refresh()
+        historyWindowController?.updateBackendLabel()
+        historyWindowController?.reload()
+        preferencesWindowController?.refresh()
+        refreshIndicatorVisibility()
+        syncAppState()
+    }
+
+    private func refreshICloudBridgeDeviceState() {
+        appState.iCloudBridgeRemoteDeviceName = MuesliBridgeDeviceIdentity.remoteDeviceDisplayName
+        appState.iCloudBridgeRemoteDevicePlatform = MuesliBridgeDeviceIdentity.remoteDevicePlatform
+    }
+
+    func syncAppState() {
+        let rows = (try? dictationStore.recentDictations(
+            limit: appState.dictationPageSize,
+            offset: 0,
+            fromDate: appState.dictationFromDate,
+            toDate: appState.dictationToDate,
+            origin: appState.dictationOriginFilter
+        )) ?? []
+        appState.dictationRows = rows
+        appState.hasMoreDictations = rows.count >= appState.dictationPageSize
+        appState.meetingRows = (try? dictationStore.recentMeetings(
+            limit: 200,
+            folderID: appState.selectedFolderID,
+            origin: appState.meetingOriginFilter
+        )) ?? []
+        let counts = (try? dictationStore.meetingCounts(origin: appState.meetingOriginFilter))
+            ?? (total: 0, byFolder: [:], directByFolder: [:])
+        appState.totalMeetingCount = counts.total
+        appState.meetingCountsByFolder = counts.byFolder
+        appState.directMeetingCountsByFolder = counts.directByFolder
+        if let selectedMeetingID = appState.selectedMeetingID {
+            appState.selectedMeetingRecord = appState.meetingRows.first(where: { $0.id == selectedMeetingID })
+                ?? meeting(id: selectedMeetingID)
+        } else {
+            appState.selectedMeetingRecord = nil
+        }
+        let allFolders = (try? dictationStore.listFolders()) ?? []
+        if config.folderOrder.isEmpty && !allFolders.isEmpty {
+            updateConfig { $0.folderOrder = allFolders.map(\.id) }
+        }
+        let order = config.folderOrder
+        // Sort folders into a depth-first tree order so children appear beneath parents.
+        appState.folders = Self.treeOrderedFolders(allFolders, order: order)
+        appState.dictationStats = dictationStats()
+        appState.meetingStats = meetingStats()
+        refreshContributionMilestonePrompt(
+            totalWords: appState.dictationStats.totalWords,
+            totalMeetings: appState.meetingStats.totalMeetings
+        )
+        appState.selectedBackend = selectedBackend
+        appState.selectedMeetingTranscriptionBackend = selectedMeetingTranscriptionBackend
+        appState.selectedMeetingSummaryBackend = selectedMeetingSummaryBackend
+        appState.selectedPostProcessorBackend = selectedPostProcessorBackend
+        appState.activePostProcessor = PostProcessorOption.resolve(id: config.activePostProcessorId)
+        appState.config = config
+        appState.isMeetingRecording = isMeetingRecording()
+        appState.isMeetingRecordingPaused = isMeetingRecordingPaused()
+        appState.isMeetingStarting = isStartingMeetingRecording
+        appState.meetingStartStatus = meetingStartStatus
+        appState.activeMeetingAudioWarning = activeMeetingAudioWarning
+        refreshActiveMeetingMicrophoneState()
+        indicator.setMeetingRecordingPaused(appState.isMeetingRecordingPaused, config: config)
+        appState.isChatGPTAuthenticated = chatGPTAuth.isAuthenticated
+        appState.isGoogleCalendarAvailable = googleCalAuth.isAvailable
+        appState.isGoogleCalendarVerified = googleCalAuth.isVerified
+        appState.isGoogleCalendarAuthenticated = googleCalAuth.isAuthenticated
+        refreshICloudBridgeDeviceState()
+        refreshICloudBridgeStateForConfig()
+        // Keep appState in sync with persisted hidden event IDs
+        let persisted = Set(config.hiddenCalendarEventIDs)
+        if appState.hiddenCalendarEventIDs != persisted {
+            appState.hiddenCalendarEventIDs = persisted
+        }
+    }
+
+    func recoverStaleLiveMeetings() {
+        guard !isMeetingRecording(),
+              !isStartingMeetingRecording else { return }
+        let meetings: [MeetingRecord]
+        do {
+            meetings = try dictationStore.staleLiveMeetings()
+        } catch {
+            fputs("[muesli-native] failed to load stale live meetings: \(error)\n", stderr)
+            return
+        }
+
+        let stagedSessions = MeetingProcessingCapture.recoverableSessions(
+            supportDirectory: processingSupportDirectory
+        ).filter { staged in
+            guard let record = meeting(id: staged.manifest.meetingID) else {
+                return true
+            }
+            if record.status == .completed {
+                MeetingProcessingCapture.discard(staged)
+                return false
+            }
+            return true
+        }
+        let stagedByMeeting = Dictionary(grouping: stagedSessions, by: { $0.manifest.meetingID })
+        var automaticRecoveryMeetingIDs: [Int64] = []
+
+        for meeting in meetings {
+            if let sessions = stagedByMeeting[meeting.id], !sessions.isEmpty {
+                updateMeetingStatusAndScheduleSync(id: meeting.id, status: .failed)
+                if sessions.contains(where: { $0.manifest.state != .failed }) {
+                    automaticRecoveryMeetingIDs.append(meeting.id)
+                }
+                continue
+            }
+            do {
+                let recovered = try dictationStore.recoverLiveMeetingFromTranscriptCheckpoints(id: meeting.id)
+                if recovered {
+                    scheduleICloudSyncAfterLocalChange()
+                } else {
+                    try updateMeetingStatusAndScheduleSyncThrowing(id: meeting.id, status: .failed)
+                }
+                staleLiveMeetingRecoveryFailures.remove(meeting.id)
+            } catch {
+                staleLiveMeetingRecoveryFailures.insert(meeting.id)
+                fputs("[muesli-native] failed to recover stale meeting \(meeting.id): \(error)\n", stderr)
+            }
+        }
+
+        if !meetings.isEmpty {
+            syncAppState()
+        }
+        for meetingID in automaticRecoveryMeetingIDs {
+            retryMeetingFinalProcessing(meetingID: meetingID, presentErrors: false)
+        }
+    }
+
+    func performSearch(query: String) {
+        searchTask?.cancel()
+        let trimmed = query.trimmingCharacters(in: .whitespacesAndNewlines)
+        appState.searchQuery = trimmed
+        guard !trimmed.isEmpty else {
+            appState.searchResultDictations = []
+            appState.searchResultMeetings = []
+            return
+        }
+        let store = self.dictationStore
+        searchTask = Task { [weak self] in
+            try? await Task.sleep(for: .milliseconds(250))
+            guard !Task.isCancelled else { return }
+            let (dictations, meetings) = await Task.detached(priority: .userInitiated) {
+                let d = (try? store.searchDictations(query: trimmed)) ?? []
+                let m = (try? store.searchMeetings(query: trimmed)) ?? []
+                return (d, m)
+            }.value
+            guard !Task.isCancelled, let self else { return }
+            self.appState.searchResultDictations = dictations
+            self.appState.searchResultMeetings = meetings
+        }
+    }
+
+    func clearSearch() {
+        searchTask?.cancel()
+        appState.searchQuery = ""
+        appState.searchResultDictations = []
+        appState.searchResultMeetings = []
+    }
+
+    private static func availableMeetingTranscriptionBackend(
+        config: AppConfig,
+        dictationBackend: BackendOption,
+        downloadedOptions: [BackendOption] = BackendOption.downloaded
+    ) -> BackendOption? {
+        var meetingOptions = downloadedOptions.filter(\.supportsMeetingTranscription)
+        if !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            meetingOptions.append(.homanWhisper)
+        }
+        let fallback = dictationBackend.supportsMeetingTranscription ? dictationBackend : nil
+        return BackendOption.resolveDownloaded(
+            backend: config.meetingTranscriptionBackend,
+            model: config.meetingTranscriptionModel,
+            fallback: fallback,
+            downloadedOptions: meetingOptions
+        )
+    }
+
+    private static func fallbackMeetingTranscriptionBackend(
+        configured: BackendOption?,
+        dictationBackend: BackendOption
+    ) -> BackendOption {
+        if let configured, configured.supportsMeetingTranscription {
+            return configured
+        }
+        if dictationBackend.supportsMeetingTranscription {
+            return dictationBackend
+        }
+        return BackendOption.all.first(where: \.supportsMeetingTranscription) ?? .whisper
+    }
+
+    @discardableResult
+    private func normalizeMeetingTranscriptionSelectionForAvailability(
+        downloadedOptions: [BackendOption] = BackendOption.downloaded
+    ) -> BackendOption? {
+        let dictationBackend = BackendOption.resolve(
+            backend: config.sttBackend,
+            model: config.sttModel
+        ) ?? selectedBackend
+        guard let resolved = Self.availableMeetingTranscriptionBackend(
+            config: config,
+            dictationBackend: dictationBackend,
+            downloadedOptions: downloadedOptions
+        ) else {
+            selectedMeetingTranscriptionBackend = Self.fallbackMeetingTranscriptionBackend(
+                configured: BackendOption.resolve(
+                    backend: config.meetingTranscriptionBackend,
+                    model: config.meetingTranscriptionModel
+                ),
+                dictationBackend: dictationBackend
+            )
+            appState.selectedMeetingTranscriptionBackend = selectedMeetingTranscriptionBackend
+            appState.config = config
+            return nil
+        }
+
+        selectedMeetingTranscriptionBackend = resolved
+        if config.meetingTranscriptionBackend != resolved.backend ||
+            config.meetingTranscriptionModel != resolved.model {
+            config.meetingTranscriptionBackend = resolved.backend
+            config.meetingTranscriptionModel = resolved.model
+            configStore.save(config)
+            fputs("[muesli-native] meeting transcription model unavailable; switched to \(resolved.label)\n", stderr)
+        }
+        appState.selectedMeetingTranscriptionBackend = resolved
+        appState.config = config
+        return resolved
+    }
+
+    @discardableResult
+    func refreshMeetingTranscriptionSelectionForAvailability() -> BackendOption? {
+        normalizeMeetingTranscriptionSelectionForAvailability()
+    }
+
+    func updateConfig(_ mutate: (inout AppConfig) -> Void) {
+        let wasICloudSyncEnabled = config.iCloudSyncEnabled
+        let previousMeetingInputDeviceUID = config.meetingInputDeviceUID
+        let previousHotkeyTriggerThresholdMS = config.hotkeyTriggerThresholdMS
+        let previousComputerUseHotkeyTriggerThresholdMS = config.computerUseHotkeyTriggerThresholdMS
+        let previousMeetingRecordingHotkeyTriggerThresholdMS = config.meetingRecordingHotkeyTriggerThresholdMS
+        let previousEnableDictionaryCorrectionPrompts = config.enableDictionaryCorrectionPrompts
+        mutate(&config)
+        config.synchronizeLegacyMeetingLiveSettings()
+        if previousEnableDictionaryCorrectionPrompts, !config.enableDictionaryCorrectionPrompts {
+            dictationCorrectionMonitor.cancel()
+            queuedDictionarySuggestionPromptKeys.removeAll()
+            dictionarySuggestionPromptAdvanceTask?.cancel()
+            dictionarySuggestionPromptAdvanceTask = nil
+            activeDictionarySuggestionPromptKey = nil
+            dictionarySuggestionPrompt.dismissWithoutNotification()
+        }
+        config.hotkeyTriggerThresholdMS = HotkeyTriggerTiming.clampedMilliseconds(config.hotkeyTriggerThresholdMS)
+        config.computerUseHotkeyTriggerThresholdMS = HotkeyTriggerTiming.clampedMilliseconds(config.computerUseHotkeyTriggerThresholdMS)
+        config.meetingRecordingHotkeyTriggerThresholdMS = HotkeyTriggerTiming.clampedMilliseconds(config.meetingRecordingHotkeyTriggerThresholdMS)
+        let hotkeyTriggerThresholdChanged = config.hotkeyTriggerThresholdMS != previousHotkeyTriggerThresholdMS
+            || config.computerUseHotkeyTriggerThresholdMS != previousComputerUseHotkeyTriggerThresholdMS
+            || config.meetingRecordingHotkeyTriggerThresholdMS != previousMeetingRecordingHotkeyTriggerThresholdMS
+        MuesliTheme.accentOverrideHex = config.recordingColorHex == "1e1e2e" ? nil : config.recordingColorHex
+        selectedBackend = BackendOption.all.first(where: {
+            $0.backend == config.sttBackend && $0.model == config.sttModel
+        }) ?? .whisper
+        let configuredPostProcessorBackend = TranscriptCleanupBackendOption.resolved(config.postProcessorBackend)
+        if !configuredPostProcessorBackend.isCompatible(with: selectedBackend) {
+            config.postProcessorBackend = TranscriptCleanupBackendOption.local.backend
+            config.enablePostProcessor = false
+        }
+        let configuredMeetingTranscriptionBackend = BackendOption.resolve(
+            backend: config.meetingTranscriptionBackend,
+            model: config.meetingTranscriptionModel
+        )
+        selectedMeetingTranscriptionBackend = Self.availableMeetingTranscriptionBackend(
+            config: config,
+            dictationBackend: selectedBackend
+        ) ?? Self.fallbackMeetingTranscriptionBackend(
+            configured: configuredMeetingTranscriptionBackend,
+            dictationBackend: selectedBackend
+        )
+        if config.meetingTranscriptionBackend != selectedMeetingTranscriptionBackend.backend ||
+            config.meetingTranscriptionModel != selectedMeetingTranscriptionBackend.model {
+            config.meetingTranscriptionBackend = selectedMeetingTranscriptionBackend.backend
+            config.meetingTranscriptionModel = selectedMeetingTranscriptionBackend.model
+        }
+        configStore.save(config)
+        let homanWhisperEndpoint = config.homanWhisperEndpoint
+        let homanWhisperAPIKey = config.homanWhisperAPIKey
+        Task {
+            try? await transcriptionCoordinator.configureHomanWhisper(
+                endpointString: homanWhisperEndpoint,
+                apiKey: homanWhisperAPIKey
+            )
+        }
+        selectedMeetingSummaryBackend = MeetingSummaryBackendOption.all.first(where: {
+            $0.backend == config.meetingSummaryBackend
+        }) ?? .transcriptOnly
+        selectedPostProcessorBackend = TranscriptCleanupBackendOption.resolved(config.postProcessorBackend)
+        applyConfigRuntimeSideEffects(
+            wasICloudSyncEnabled: wasICloudSyncEnabled,
+            hotkeyTriggerThresholdChanged: hotkeyTriggerThresholdChanged
+        )
+        if previousMeetingInputDeviceUID != config.meetingInputDeviceUID {
+            if activeMeetingID != nil || preparingMeetingSession != nil {
+                activeMeetingInputDeviceUID = config.meetingInputDeviceUID
+            }
+            dictationAudioRoutingController.selectedMeetingInputDeviceUID = config.meetingInputDeviceUID
+            refreshActiveMeetingMicrophoneState()
+        }
+    }
+
+    func setMeetingRecordingRetentionDays(_ days: Int) {
+        let clampedDays = min(max(days, 1), AppConfig.maximumMeetingRecordingRetentionDays)
+        updateConfig { $0.meetingRecordingRetentionDays = clampedDays }
+        do {
+            try dictationStore.rescheduleUnprotectedMeetingRecordings(
+                retentionInterval: TimeInterval(clampedDays) * 24 * 60 * 60
+            )
+        } catch {
+            fputs("[muesli-native] failed to reschedule meeting recordings: \(error)\n", stderr)
+        }
+        performRetentionCleanup()
+    }
+
+    func setMeetingTranscriptRetentionDays(_ days: Int) {
+        let clampedDays = min(max(days, 0), AppConfig.maximumMeetingTranscriptRetentionDays)
+        updateConfig { $0.meetingTranscriptRetentionDays = clampedDays }
+        performRetentionCleanup()
+    }
+
+    func setDictationRetentionHours(_ hours: Int?) {
+        let clampedHours = hours.map {
+            min(max($0, 0), AppConfig.maximumDictationRetentionHours)
+        }
+        updateConfig { $0.dictationRetentionHours = clampedHours }
+        performRetentionCleanup()
+    }
+
+    private func applyConfigRuntimeSideEffects(wasICloudSyncEnabled: Bool, hotkeyTriggerThresholdChanged: Bool) {
+        statusBarController?.refresh()
+        statusBarController?.refreshIcon()
+        indicator.refreshIcon()
+        hotkeyMonitor.doubleTapEnabled = config.enableDoubleTapDictation
+        computerUseHotkeyMonitor.doubleTapEnabled = config.enableDoubleTapDictation
+        if hotkeyTriggerThresholdChanged {
+            configureHotkeyMonitorTiming()
+        }
+        dictationAudioRoutingController.selectedInputDeviceUID = config.dictationInputDeviceUID
+        historyWindowController?.updateBackendLabel()
+        refreshIndicatorVisibility()
+        appState.selectedBackend = selectedBackend
+        appState.selectedMeetingTranscriptionBackend = selectedMeetingTranscriptionBackend
+        appState.selectedMeetingSummaryBackend = selectedMeetingSummaryBackend
+        appState.selectedPostProcessorBackend = selectedPostProcessorBackend
+        appState.config = config
+        appState.isChatGPTAuthenticated = chatGPTAuth.isAuthenticated
+        applyDashboardWindowPresencePolicy()
+        syncCalendarMonitor()
+        syncMeetingDetectionMonitor()
+        updateMeetingNotificationVisibility()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.configChange))
+        if !wasICloudSyncEnabled && config.iCloudSyncEnabled {
+            enableICloudPersistentSync()
+            scheduleICloudSync(delay: 0.2, userInitiated: false)
+        } else if wasICloudSyncEnabled && !config.iCloudSyncEnabled {
+            disableICloudSyncRuntimeState()
+        }
+    }
+
+    private func clearLiveMeetingPartialTails() {
+        appState.liveMeetingPartialYou = ""
+        appState.liveMeetingPartialOthers = ""
+        indicator.updateMeetingTranscript(
+            transcript: appState.liveMeetingTranscript,
+            partialYou: "",
+            partialOthers: ""
+        )
+    }
+
+    private func clearLiveMeetingTranscript(ownerID: Int64? = nil, generation: UUID? = nil) {
+        if let ownerID, appState.liveMeetingTranscriptOwnerID != ownerID { return }
+        if let generation, liveMeetingTranscriptGeneration != generation { return }
+        appState.liveMeetingTranscript = ""
+        appState.liveMeetingPartialYou = ""
+        appState.liveMeetingPartialOthers = ""
+        appState.liveMeetingTranscriptOwnerID = nil
+        appState.meetingLiveState = .off(selection: config.resolvedMeetingLiveASRModelID)
+        liveMeetingTranscriptGeneration = nil
+        indicator.updateMeetingTranscript(transcript: "", partialYou: "", partialOthers: "")
+    }
+
+    private func isCurrentLiveMeetingTranscriptSession(ownerID: Int64, generation: UUID) -> Bool {
+        appState.liveMeetingTranscriptOwnerID == ownerID
+            && liveMeetingTranscriptGeneration == generation
+    }
+
+    private func refreshContributionMilestonePrompt(totalWords: Int, totalMeetings: Int) {
+        let resolvedNextWordMilestone = ContributionMilestonePolicy.resolvedNextMilestone(
+            storedNextMilestone: config.contributionPromptNextWordCount,
+            total: totalWords,
+            intervalKind: .dictationWords,
+            githubStarClicked: config.contributionGitHubStarClicked,
+            buyMeCoffeeClicked: config.contributionBuyMeCoffeeClicked,
+            tweetClicked: config.contributionTweetClicked,
+            linkedInClicked: config.contributionLinkedInClicked
+        )
+        let resolvedNextMeetingMilestone = ContributionMilestonePolicy.resolvedNextMilestone(
+            storedNextMilestone: config.contributionPromptNextMeetingCount,
+            total: totalMeetings,
+            intervalKind: .meetings,
+            githubStarClicked: config.contributionGitHubStarClicked,
+            buyMeCoffeeClicked: config.contributionBuyMeCoffeeClicked
+        )
+
+        if config.contributionPromptNextWordCount != resolvedNextWordMilestone ||
+            config.contributionPromptNextMeetingCount != resolvedNextMeetingMilestone {
+            config.contributionPromptNextWordCount = resolvedNextWordMilestone
+            config.contributionPromptNextMeetingCount = resolvedNextMeetingMilestone
+            configStore.save(config)
+        }
+
+        appState.config = config
+        appState.contributionMilestonePrompt = ContributionMilestonePolicy.prompt(
+            kind: .dictationWords,
+            total: totalWords,
+            nextMilestone: resolvedNextWordMilestone,
+            githubStarClicked: config.contributionGitHubStarClicked,
+            buyMeCoffeeClicked: config.contributionBuyMeCoffeeClicked,
+            tweetClicked: config.contributionTweetClicked,
+            linkedInClicked: config.contributionLinkedInClicked,
+            dismissedThisLaunch: contributionMilestonePromptDismissedThisLaunch
+        ) ?? ContributionMilestonePolicy.prompt(
+            kind: .meetings,
+            total: totalMeetings,
+            nextMilestone: resolvedNextMeetingMilestone,
+            githubStarClicked: config.contributionGitHubStarClicked,
+            buyMeCoffeeClicked: config.contributionBuyMeCoffeeClicked,
+            dismissedThisLaunch: contributionMilestonePromptDismissedThisLaunch
+        )
+    }
+
+    func recordContributionMilestonePromptSeen() {
+        guard let prompt = appState.contributionMilestonePrompt,
+              contributionMilestonePromptSeenIDsThisLaunch.insert(prompt.id).inserted else { return }
+        TelemetryDeck.signal("contribution_prompt_seen", parameters: [
+            "kind": prompt.kind.rawValue,
+            "count": "\(prompt.count)",
+            "github_star_clicked": "\(config.contributionGitHubStarClicked)",
+            "buy_me_coffee_clicked": "\(config.contributionBuyMeCoffeeClicked)",
+            "tweet_clicked": "\(config.contributionTweetClicked)",
+            "linkedin_clicked": "\(config.contributionLinkedInClicked)",
+        ])
+    }
+
+    func dismissContributionMilestonePrompt() {
+        guard let prompt = appState.contributionMilestonePrompt else { return }
+        contributionMilestonePromptDismissedThisLaunch = true
+        appState.contributionMilestonePrompt = nil
+        let nextMilestone = ContributionMilestonePolicy.nextMilestone(
+            after: prompt.kind == .dictationWords ? appState.dictationStats.totalWords : appState.meetingStats.totalMeetings,
+            kind: prompt.kind
+        )
+        switch prompt.kind {
+        case .dictationWords:
+            config.contributionPromptNextWordCount = nextMilestone
+        case .meetings:
+            config.contributionPromptNextMeetingCount = nextMilestone
+        }
+        configStore.save(config)
+        appState.config = config
+        TelemetryDeck.signal("contribution_prompt_dismissed", parameters: [
+            "kind": prompt.kind.rawValue,
+            "count": "\(prompt.count)",
+        ])
+    }
+
+    func openContributionMilestoneAction(_ action: ContributionMilestoneAction) {
+        guard let prompt = appState.contributionMilestonePrompt else { return }
+        if action == .tweetAboutHoman || action == .postOnLinkedIn {
+            openContributionSocialAction(action, wordCount: prompt.count)
+        } else if let supportURL = action.supportURL {
+            NSWorkspace.shared.open(supportURL)
+        }
+        // CTA clicks intentionally dismiss for this launch; any remaining CTA can reappear next launch.
+        contributionMilestonePromptDismissedThisLaunch = true
+        TelemetryDeck.signal("contribution_prompt_action_clicked", parameters: [
+            "action": action.rawValue,
+            "kind": prompt.kind.rawValue,
+            "count": "\(prompt.count)",
+        ])
+
+        updateConfig { config in
+            switch action {
+            case .githubStar:
+                config.contributionGitHubStarClicked = true
+            case .buyMeCoffee:
+                config.contributionBuyMeCoffeeClicked = true
+            case .tweetAboutHoman:
+                config.contributionTweetClicked = true
+            case .postOnLinkedIn:
+                config.contributionLinkedInClicked = true
+            }
+            if config.contributionGitHubStarClicked && config.contributionBuyMeCoffeeClicked {
+                config.contributionPromptNextMeetingCount = nil
+            }
+            if config.contributionGitHubStarClicked && config.contributionBuyMeCoffeeClicked &&
+                config.contributionTweetClicked && config.contributionLinkedInClicked {
+                config.contributionPromptNextWordCount = nil
+            }
+        }
+        refreshContributionMilestonePrompt(
+            totalWords: appState.dictationStats.totalWords,
+            totalMeetings: appState.meetingStats.totalMeetings
+        )
+    }
+
+    func openContributionSidebarShare(_ action: ContributionMilestoneAction) {
+        guard let wordCount = ContributionSocialShare.completedWordMilestone(
+            totalWords: appState.dictationStats.totalWords
+        ) else { return }
+        openContributionSocialAction(action, wordCount: wordCount)
+        updateConfig { config in
+            switch action {
+            case .tweetAboutHoman:
+                config.contributionTweetClicked = true
+            case .postOnLinkedIn:
+                config.contributionLinkedInClicked = true
+            case .githubStar, .buyMeCoffee:
+                break
+            }
+            if config.contributionGitHubStarClicked && config.contributionBuyMeCoffeeClicked &&
+                config.contributionTweetClicked && config.contributionLinkedInClicked {
+                config.contributionPromptNextWordCount = nil
+            }
+        }
+        refreshContributionMilestonePrompt(
+            totalWords: appState.dictationStats.totalWords,
+            totalMeetings: appState.meetingStats.totalMeetings
+        )
+        TelemetryDeck.signal("contribution_sidebar_share_clicked", parameters: [
+            "action": action.rawValue,
+            "count": "\(wordCount)",
+        ])
+    }
+
+    private func openContributionSocialAction(_ action: ContributionMilestoneAction, wordCount: Int) {
+        switch action {
+        case .tweetAboutHoman:
+            NSWorkspace.shared.open(ContributionSocialShare.tweetURL(wordCount: wordCount))
+        case .postOnLinkedIn:
+            let message = ContributionSocialShare.message(wordCount: wordCount)
+            NSPasteboard.general.clearContents()
+            NSPasteboard.general.setString(message, forType: .string)
+            NSWorkspace.shared.open(ContributionSocialShare.linkedInURL(wordCount: wordCount))
+        case .githubStar, .buyMeCoffee:
+            assertionFailure("Support contribution actions should open through supportURL.")
+        }
+    }
+
+    func performICloudSync() {
+        startICloudSync(userInitiated: true)
+    }
+
+    func setICloudSyncEnabledFromSettings(_ enabled: Bool) {
+        if enabled {
+            guard MuesliICloudSyncEngine.hasRequiredEntitlement else {
+                disableICloudSyncForUnavailableEntitlement()
+                return
+            }
+            enableIPhoneBridgeSync()
+        } else if config.iCloudSyncEnabled {
+            updateConfig { $0.iCloudSyncEnabled = false }
+        } else {
+            disableICloudSyncRuntimeState()
+        }
+    }
+
+    func enableIPhoneBridgeSync() {
+        guard MuesliICloudSyncEngine.hasRequiredEntitlement else {
+            disableICloudSyncForUnavailableEntitlement()
+            return
+        }
+        if config.iCloudSyncEnabled {
+            performICloudSync()
+            return
+        }
+
+        bridgeActivationPending = true
+        appState.isICloudBridgeActivationPending = true
+        appState.iCloudSyncStatus = "Checking iCloud..."
+        appState.iCloudBridgeState = .checkingICloud
+        appState.iCloudBridgeMessage = nil
+        TelemetryDeck.signal("bridge_enable_started", parameters: ["platform": "macos"])
+
+        iCloudSyncGeneration += 1
+        let generation = iCloudSyncGeneration
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = Task { [weak self] in
+            do {
+                try await MuesliICloudSyncEngine().ensureTextRecordSubscription()
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSubscriptionTask = nil
+                    self.hasEnsuredICloudSubscription = true
+                    self.appState.iCloudSyncStatus = "Setting up private iCloud sync..."
+                    self.appState.iCloudBridgeState = .syncing
+                    self.appState.iCloudBridgeMessage = nil
+                    self.updateConfig { $0.iCloudSyncEnabled = true }
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSubscriptionTask = nil
+                    self.bridgeActivationPending = false
+                    self.appState.isICloudBridgeActivationPending = false
+                    self.refreshICloudBridgeStateForConfig()
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSubscriptionTask = nil
+                    self.bridgeActivationPending = false
+                    self.appState.isICloudBridgeActivationPending = false
+                    let message = error.localizedDescription
+                    self.appState.iCloudSyncStatus = "Sync needs iCloud: \(message)"
+                    if MuesliICloudSyncEngine.isICloudAccountAvailabilityError(error) {
+                        self.appState.iCloudBridgeState = .needsICloud
+                    } else {
+                        self.appState.iCloudBridgeState = .error
+                    }
+                    self.appState.iCloudBridgeMessage = message
+                    TelemetryDeck.signal(
+                        "bridge_enable_failed",
+                        parameters: ["platform": "macos", "reason": String(describing: type(of: error))]
+                    )
+                }
+            }
+        }
+    }
+
+    func handleICloudRemoteNotification(userInfo: [AnyHashable: Any]) {
+        guard config.iCloudSyncEnabled,
+              MuesliICloudSyncEngine.isTextRecordSubscriptionNotification(userInfo) else {
+            return
+        }
+        scheduleICloudSync(delay: 0.2, userInitiated: false)
+    }
+
+    private func installICloudPersistentSyncObservers() {
+        guard iCloudAppActiveObserver == nil else { return }
+        iCloudAppActiveObserver = NotificationCenter.default.addObserver(
+            forName: NSApplication.didBecomeActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleICloudSync(
+                    delay: 0.5,
+                    userInitiated: false,
+                    bridgeDiscoveryTriggered: true
+                )
+            }
+        }
+        iCloudWakeObserver = NSWorkspace.shared.notificationCenter.addObserver(
+            forName: NSWorkspace.didWakeNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.scheduleICloudSync(
+                    delay: 0.5,
+                    userInitiated: false,
+                    bridgeDiscoveryTriggered: true
+                )
+            }
+        }
+    }
+
+    private func enableICloudPersistentSync() {
+        guard config.iCloudSyncEnabled else { return }
+        ensureICloudSubscription()
+    }
+
+    private func ensureICloudSubscription() {
+        guard !hasEnsuredICloudSubscription,
+              iCloudSubscriptionTask == nil else {
+            return
+        }
+        iCloudSubscriptionTask = Task { [weak self] in
+            do {
+                try await MuesliICloudSyncEngine().ensureTextRecordSubscription()
+                await MainActor.run {
+                    self?.hasEnsuredICloudSubscription = true
+                    self?.iCloudSubscriptionTask = nil
+                }
+            } catch {
+                fputs("[muesli-native] failed to ensure iCloud sync subscription: \(error)\n", stderr)
+                await MainActor.run {
+                    self?.iCloudSubscriptionTask = nil
+                }
+            }
+        }
+    }
+
+    private func scheduleICloudSyncAfterLocalChange() {
+        guard Thread.isMainThread else {
+            DispatchQueue.main.async { [weak self] in
+                self?.scheduleICloudSyncAfterLocalChange()
+            }
+            return
+        }
+        scheduleICloudSync(delay: 2.0, userInitiated: false)
+    }
+
+    private func scheduleICloudSync(
+        delay: TimeInterval,
+        userInitiated: Bool,
+        bridgeDiscoveryTriggered: Bool = false
+    ) {
+        guard config.iCloudSyncEnabled else { return }
+        guard MuesliICloudSyncEngine.hasRequiredEntitlement else {
+            disableICloudSyncForUnavailableEntitlement()
+            return
+        }
+        enableICloudPersistentSync()
+        if bridgeDiscoveryTriggered {
+            bridgeDiscoveryPending = true
+        }
+        iCloudSyncDebounceTask?.cancel()
+        let milliseconds = max(Int(delay * 1_000), 0)
+        iCloudSyncDebounceTask = Task { [weak self] in
+            if milliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(milliseconds))
+            }
+            guard !Task.isCancelled else { return }
+            await MainActor.run {
+                self?.iCloudSyncDebounceTask = nil
+                self?.startICloudSync(userInitiated: userInitiated)
+            }
+        }
+    }
+
+    private func startICloudSync(userInitiated: Bool) {
+        guard config.iCloudSyncEnabled else {
+            if userInitiated {
+                appState.iCloudSyncStatus = "Turn on iCloud sync first."
+            }
+            appState.iCloudBridgeState = .notConfigured
+            appState.iCloudBridgeMessage = nil
+            return
+        }
+        guard MuesliICloudSyncEngine.hasRequiredEntitlement else {
+            disableICloudSyncForUnavailableEntitlement()
+            return
+        }
+        guard iCloudSyncTask == nil else {
+            appState.isICloudSyncInProgress = true
+            appState.iCloudBridgeState = .syncing
+            appState.iCloudBridgeMessage = nil
+            if userInitiated {
+                appState.iCloudSyncStatus = "Sync already in progress."
+            }
+            if bridgeDiscoveryPending {
+                bridgeDiscoveryFollowUpPending = true
+            }
+            return
+        }
+        if userInitiated {
+            iCloudSyncDebounceTask?.cancel()
+            iCloudSyncDebounceTask = nil
+        }
+        enableICloudPersistentSync()
+        appState.isICloudSyncInProgress = true
+        appState.iCloudSyncStatus = "Syncing with private iCloud..."
+        appState.iCloudBridgeState = .syncing
+        appState.iCloudBridgeMessage = nil
+        let store = dictationStore
+        iCloudSyncGeneration += 1
+        let generation = iCloudSyncGeneration
+        let bridgeActivationPendingAtStart = bridgeActivationPending
+        let bridgeDiscoveryTriggeredAtStart = bridgeDiscoveryPending
+        bridgeDiscoveryPending = false
+        let hasKnownCompanionDeviceAtStart = MuesliBridgeDeviceIdentity.hasCompanionRemoteDevice()
+        iCloudSyncTask = Task { [weak self] in
+            do {
+                let forceBridgeDeviceRefresh = MuesliBridgeDeviceRefreshPolicy.shouldForceRefresh(
+                    userInitiated: userInitiated,
+                    bridgeActivationPending: bridgeActivationPendingAtStart,
+                    bridgeDiscoveryTriggered: bridgeDiscoveryTriggeredAtStart,
+                    hasKnownCompanionDevice: hasKnownCompanionDeviceAtStart
+                )
+                let result = try await MuesliICloudSyncEngine().sync(
+                    store: store,
+                    forceBridgeDeviceRefresh: forceBridgeDeviceRefresh
+                )
+                do {
+                    _ = try store.purgeSoftDeletedTextRecords()
+                } catch {
+                    fputs("[muesli-native] failed to purge old iCloud tombstones: \(error)\n", stderr)
+                }
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSyncTask = nil
+                    self.appState.isICloudSyncInProgress = false
+                    let summary = self.formatICloudSyncSummary(result)
+                    self.refreshICloudBridgeDeviceState()
+                    let remoteDeviceName = MuesliBridgeDeviceIdentity.remoteDeviceDisplayName ?? "iPhone"
+                    self.appState.iCloudSyncStatus = result.downloaded.total > 0
+                        ? "Synced with \(remoteDeviceName)."
+                        : "All text is up to date."
+                    self.appState.iCloudBridgeState = .active
+                    self.appState.iCloudBridgeMessage = nil
+                    self.appState.iCloudLastSyncSummary = summary
+                    self.appState.iCloudLastSyncedAt = result.syncedAt
+                    if result.downloaded.total > 0 {
+                        TelemetryDeck.signal(
+                            "bridge_remote_records_seen",
+                            parameters: ["platform": "macos", "count": "\(result.downloaded.total)"]
+                        )
+                    }
+                    if self.bridgeActivationPending {
+                        self.bridgeActivationPending = false
+                        self.appState.isICloudBridgeActivationPending = false
+                        TelemetryDeck.signal("bridge_enable_completed", parameters: ["platform": "macos"])
+                    }
+                    if result.syncZoneWasRecreated {
+                        self.resetICloudSubscriptionState()
+                        self.ensureICloudSubscription()
+                    }
+                    self.refreshUI()
+                    let shouldRunBridgeDiscoveryFollowUp = self.bridgeDiscoveryFollowUpPending
+                    self.bridgeDiscoveryFollowUpPending = false
+                    if result.hasPendingUploads || shouldRunBridgeDiscoveryFollowUp {
+                        self.scheduleICloudSync(
+                            delay: 0.2,
+                            userInitiated: false,
+                            bridgeDiscoveryTriggered: shouldRunBridgeDiscoveryFollowUp
+                        )
+                    }
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSyncTask = nil
+                    self.appState.isICloudSyncInProgress = false
+                    self.bridgeDiscoveryFollowUpPending = false
+                    if self.bridgeActivationPending {
+                        self.bridgeActivationPending = false
+                        self.appState.isICloudBridgeActivationPending = false
+                    }
+                    self.refreshICloudBridgeStateForConfig()
+                }
+            } catch {
+                await MainActor.run {
+                    guard let self, self.iCloudSyncGeneration == generation else { return }
+                    self.iCloudSyncTask = nil
+                    self.appState.isICloudSyncInProgress = false
+                    self.bridgeDiscoveryFollowUpPending = false
+                    let message = error.localizedDescription
+                    self.appState.iCloudSyncStatus = "Sync failed: \(message)"
+                    if MuesliICloudSyncEngine.isICloudAccountAvailabilityError(error) {
+                        self.appState.iCloudBridgeState = .needsICloud
+                    } else {
+                        self.appState.iCloudBridgeState = .error
+                    }
+                    self.appState.iCloudBridgeMessage = message
+                    if self.bridgeActivationPending {
+                        self.bridgeActivationPending = false
+                        self.appState.isICloudBridgeActivationPending = false
+                        TelemetryDeck.signal(
+                            "bridge_enable_failed",
+                            parameters: ["platform": "macos", "reason": String(describing: type(of: error))]
+                        )
+                    }
+                }
+            }
+        }
+    }
+
+    private func cancelActiveICloudSyncTask() {
+        iCloudSyncGeneration += 1
+        iCloudSyncTask?.cancel()
+        iCloudSyncTask = nil
+        appState.isICloudSyncInProgress = false
+        resetBridgeDiscoveryRuntimeState()
+        refreshICloudBridgeStateForConfig()
+    }
+
+    private func disableICloudSyncRuntimeState() {
+        cancelActiveICloudSyncTask()
+        iCloudSyncDebounceTask?.cancel()
+        iCloudSyncDebounceTask = nil
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = nil
+        resetICloudSubscriptionState()
+        resetBridgeDiscoveryRuntimeState()
+        appState.iCloudSyncStatus = "iCloud sync is off."
+        appState.iCloudBridgeState = .notConfigured
+        appState.iCloudBridgeMessage = nil
+    }
+
+    private func disableICloudSyncForUnavailableEntitlement() {
+        cancelActiveICloudSyncTask()
+        iCloudSyncDebounceTask?.cancel()
+        iCloudSyncDebounceTask = nil
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = nil
+        resetICloudSubscriptionState()
+        resetBridgeDiscoveryRuntimeState()
+        appState.iCloudSyncStatus = "iCloud sync is unavailable in this local-only build."
+        appState.iCloudBridgeState = .notConfigured
+        appState.iCloudBridgeMessage = nil
+    }
+
+    private func resetBridgeDiscoveryRuntimeState() {
+        bridgeActivationPending = false
+        bridgeDiscoveryPending = false
+        bridgeDiscoveryFollowUpPending = false
+        appState.isICloudBridgeActivationPending = false
+    }
+
+    private func resetICloudSubscriptionState() {
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = nil
+        hasEnsuredICloudSubscription = false
+    }
+
+    private func refreshICloudBridgeStateForConfig() {
+        if appState.isICloudBridgeActivationPending {
+            appState.iCloudBridgeState = .checkingICloud
+            return
+        }
+        if appState.isICloudSyncInProgress {
+            appState.iCloudBridgeState = .syncing
+            return
+        }
+        if !config.iCloudSyncEnabled {
+            appState.iCloudBridgeState = .notConfigured
+            appState.iCloudBridgeMessage = nil
+            return
+        }
+        if !MuesliICloudSyncEngine.hasRequiredEntitlement {
+            appState.iCloudBridgeState = .notConfigured
+            appState.iCloudBridgeMessage = nil
+            return
+        }
+        switch appState.iCloudBridgeState {
+        case .needsICloud, .error:
+            return
+        case .notConfigured, .checkingICloud, .syncing, .active:
+            appState.iCloudBridgeState = .active
+            appState.iCloudBridgeMessage = nil
+        }
+    }
+
+    private func formatICloudSyncSummary(_ result: ICloudSyncResult) -> String {
+        "\(formatICloudSyncCounts(result.uploaded)) up, \(formatICloudSyncCounts(result.downloaded)) down"
+    }
+
+    private func formatICloudSyncCounts(_ counts: ICloudSyncKindCounts) -> String {
+        guard counts.total > 0 else { return "0" }
+        var parts: [String] = []
+        if counts.dictations > 0 {
+            parts.append("\(counts.dictations) \(counts.dictations == 1 ? "dictation" : "dictations")")
+        }
+        if counts.meetings > 0 {
+            parts.append("\(counts.meetings) \(counts.meetings == 1 ? "meeting" : "meetings")")
+        }
+        return "\(counts.total) (\(parts.joined(separator: ", ")))"
+    }
+
+    func availableDictationInputDevices() -> [AudioInputDeviceInfo] {
+        dictationAudioRoutingController.availableInputDevices()
+    }
+
+    func selectDictationInputDeviceUID(_ uid: String?) {
+        updateConfig { $0.dictationInputDeviceUID = uid }
+    }
+
+    func selectMeetingInputDeviceUID(_ uid: String?) {
+        updateConfig { $0.meetingInputDeviceUID = uid }
+    }
+
+    func selectActiveMeetingInputDeviceUID(_ uid: String?) {
+        guard activeMeetingID != nil || preparingMeetingSession != nil else { return }
+        activeMeetingInputDeviceUID = uid
+        dictationAudioRoutingController.selectedMeetingInputDeviceUID = uid
+        refreshActiveMeetingMicrophoneState()
+    }
+
+    func activeMeetingMicrophonePower() -> Float {
+        activeMeetingSession?.currentPower()
+            ?? preparingMeetingSession?.currentPower()
+            ?? -160
+    }
+
+    func activeMeetingMicrophoneRouteTransition() -> MeetingMicRouteTransitionSnapshot? {
+        guard let snapshot = activeMeetingSession?.microphoneRouteTransitionSnapshot()
+                ?? preparingMeetingSession?.microphoneRouteTransitionSnapshot() else {
+            return nil
+        }
+        let devices = dictationAudioRoutingController.cachedAvailableInputDevices()
+        func resolvedName(_ existing: String?, deviceID: AudioObjectID?) -> String? {
+            existing ?? deviceID.flatMap { id in
+                devices.first(where: { $0.deviceID == id })?.name
+            }
+        }
+        return MeetingMicRouteTransitionSnapshot(
+            phase: snapshot.phase,
+            activeDeviceID: snapshot.activeDeviceID,
+            activeDeviceName: resolvedName(
+                snapshot.activeDeviceName,
+                deviceID: snapshot.activeDeviceID
+            ),
+            desiredDeviceID: snapshot.desiredDeviceID,
+            desiredDeviceName: resolvedName(
+                snapshot.desiredDeviceName,
+                deviceID: snapshot.desiredDeviceID
+            ),
+            attempt: snapshot.attempt
+        )
+    }
+
+    private func applyMeetingInputDevice(_ deviceID: AudioObjectID?) {
+        preparingMeetingSession?.setPreferredMicrophoneInputDeviceID(deviceID)
+        if activeMeetingSession !== preparingMeetingSession {
+            activeMeetingSession?.setPreferredMicrophoneInputDeviceID(deviceID)
+        }
+    }
+
+    private func refreshActiveMeetingMicrophoneState() {
+        guard let meetingID = activeMeetingID else {
+            appState.activeMeetingMicrophone = nil
+            return
+        }
+        let route = dictationAudioRoutingController.meetingInputRouteSnapshot()
+        let devices = dictationAudioRoutingController.cachedAvailableInputDevices()
+        let selectedUID = activeMeetingInputDeviceUID
+        let selectedDevice = selectedUID.flatMap { uid in
+            devices.first { $0.uid == uid }
+        }
+        let followsSystemDefault = selectedUID == nil
+        appState.activeMeetingMicrophone = ActiveMeetingMicrophoneState(
+            meetingID: meetingID,
+            selectionUID: selectedUID,
+            activeDeviceName: followsSystemDefault
+                ? (route.defaultInputDeviceName ?? "System Default")
+                : (selectedDevice?.name ?? "Selected microphone unavailable"),
+            automaticDeviceName: route.defaultInputDeviceName,
+            selectionAvailable: selectedUID == nil || route.selectedInputDeviceResolved,
+            availableDevices: devices
+        )
+    }
+
+    private func resetActiveMeetingMicrophoneSelection() {
+        activeMeetingInputDeviceUID = nil
+        dictationAudioRoutingController.selectedMeetingInputDeviceUID =
+            config.meetingInputDeviceUID
+        appState.activeMeetingMicrophone = nil
+    }
+
+    func updateUpcomingMeetingsWindow(dayCount: Int) {
+        let resolvedDayCount = UpcomingMeetingsWindow.resolve(dayCount: dayCount).dayCount
+        guard config.upcomingMeetingsDayCount != resolvedDayCount else { return }
+
+        updateConfig { $0.upcomingMeetingsDayCount = resolvedDayCount }
+        Task {
+            let refreshed = await refreshUpcomingCalendarEvents()
+            guard refreshed else { return }
+            checkUpcomingCalendarNotifications()
+            meetingMonitor.refreshState(trigger: .calendarChanged)
+        }
+    }
+
+    func setLaunchAtLogin(_ enabled: Bool) {
+        let result = launchAtLoginCoordinator.setEnabled(enabled, config: config)
+        if let error = result.error {
+            fputs("[launch-at-login] failed to set enabled=\(enabled): \(error)\n", stderr)
+        }
+        appState.launchAtLoginRegistrationState = result.registrationState
+        updateConfig { $0.launchAtLogin = result.config.launchAtLogin }
+        if enabled, result.registrationState == .requiresApproval {
+            launchAtLoginCoordinator.openSystemSettingsLoginItems()
+        }
+    }
+
+    func openLaunchAtLoginSettings() {
+        launchAtLoginCoordinator.openSystemSettingsLoginItems()
+    }
+
+    func refreshLaunchAtLoginState() {
+        let result = launchAtLoginCoordinator.refreshStatus(config: config)
+        appState.launchAtLoginRegistrationState = result.registrationState
+        let refreshed = result.config
+        guard refreshed.launchAtLogin != config.launchAtLogin else { return }
+        updateConfig { $0.launchAtLogin = refreshed.launchAtLogin }
+    }
+
+    private func syncLaunchAtLoginConfigWithSystem() {
+        let result = launchAtLoginCoordinator.reconcileOnStartup(config: config)
+        if let error = result.error {
+            fputs("[launch-at-login] failed to apply saved launch-at-login setting: \(error)\n", stderr)
+        }
+        appState.launchAtLoginRegistrationState = result.registrationState
+        let reconciled = result.config
+        guard reconciled.launchAtLogin != config.launchAtLogin else { return }
+        updateConfig { $0.launchAtLogin = reconciled.launchAtLogin }
+    }
+
+    func selectBackend(_ option: BackendOption) {
+        let replacesGemmaCleanup = !selectedPostProcessorBackend.isCompatible(with: option)
+        let hasLocalCleanupModel = PostProcessorOption.runtimeOption(id: config.activePostProcessorId) != nil
+        updateConfig {
+            $0.sttBackend = option.backend
+            $0.sttModel = option.model
+            if replacesGemmaCleanup {
+                $0.postProcessorBackend = TranscriptCleanupBackendOption.local.backend
+                if !hasLocalCleanupModel {
+                    $0.enablePostProcessor = false
+                }
+            }
+        }
+        dictationBackendReadiness = .preparing
+        Task { [weak self] in
+            guard let self else { return }
+            // Push the selected Nemotron 3.5 language before preload so the loaded
+            // transcriber is conditioned on the right prompt_id.
+            await self.transcriptionCoordinator.setNemotron35PromptId(self.config.resolvedNemotron35Language.promptId)
+            let needsWarmup = option.backend == "whisper"
+            if needsWarmup {
+                await MainActor.run {
+                    self.indicator.showLoading("Warming up...")
+                }
+            }
+            let ppOption = self.runtimePostProcessorOption()
+            await self.configureTranscriptCleanupForRuntime(option: ppOption)
+            let prepared = await self.prepareDictationBackend(option)
+            if prepared {
+                await self.preloadOptionalTranscriptionResources(
+                    for: option,
+                    enablePostProcessor: self.canRunTranscriptCleanup(option: ppOption),
+                    includeMeetingHelpers: self.config.resolvedOnboardingUseCase.includesMeetings
+                )
+            }
+            await MainActor.run {
+                if needsWarmup {
+                    self.indicator.hideLoading()
+                }
+                self.statusBarController?.refresh()
+                self.historyWindowController?.updateBackendLabel()
+            }
+        }
+    }
+
+    private func prepareDictationBackend(_ backend: BackendOption) async -> Bool {
+        do {
+            try await transcriptionCoordinator.preloadRequired(
+                backend: backend,
+                enablePostProcessor: false,
+                includeMeetingHelpers: false
+            )
+            guard selectedBackend == backend else { return false }
+            dictationBackendReadiness = .ready
+            indicator.hideLoading()
+            return true
+        } catch {
+            fputs("[muesli-native] dictation backend preparation failed for \(backend.backend)/\(backend.model): \(error)\n", stderr)
+            guard selectedBackend == backend else { return false }
+            indicator.hideLoading()
+            dictationBackendReadiness = .failed
+            return false
+        }
+    }
+
+    private func preloadOptionalTranscriptionResources(
+        for backend: BackendOption,
+        enablePostProcessor: Bool,
+        includeMeetingHelpers: Bool
+    ) async {
+        await transcriptionCoordinator.preloadPostProcessorIfNeeded(
+            enabled: enablePostProcessor,
+            transcriptionBackend: backend
+        )
+        if includeMeetingHelpers {
+            await transcriptionCoordinator.preloadMeetingHelpers()
+        }
+    }
+
+    /// Update the Nemotron 3.5 dictation language and push the prompt_id to the runtime.
+    func setNemotron35Language(_ language: Nemotron35Language) async {
+        updateConfig { $0.nemotron35Language = language.rawValue }
+        await transcriptionCoordinator.setNemotron35PromptId(language.promptId)
+    }
+
+    func selectMeetingTranscriptionBackend(_ option: BackendOption, requireDownloaded: Bool = true) {
+        guard option.supportsMeetingTranscription else {
+            presentErrorAlert(
+                title: "Meeting model unavailable",
+                message: "\(option.label) is optimized for dictation and cannot be used for meeting transcription."
+            )
+            normalizeMeetingTranscriptionSelectionForAvailability()
+            return
+        }
+        let isReady = option.capabilitiesExecutionLocation == .cloud
+            ? !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            : option.isDownloaded
+        guard !requireDownloaded || isReady else {
+            presentErrorAlert(
+                title: "Meeting model unavailable",
+                message: option.capabilitiesExecutionLocation == .cloud
+                    ? "Configure the Homan Whisper API key before using \(option.label)."
+                    : "Download \(option.label) before using it for meeting transcription."
+            )
+            normalizeMeetingTranscriptionSelectionForAvailability()
+            return
+        }
+        if !requireDownloaded {
+            let wasICloudSyncEnabled = config.iCloudSyncEnabled
+            config.meetingTranscriptionBackend = option.backend
+            config.meetingTranscriptionModel = option.model
+            configStore.save(config)
+            selectedMeetingTranscriptionBackend = option
+            appState.selectedMeetingTranscriptionBackend = option
+            appState.config = config
+            applyConfigRuntimeSideEffects(
+                wasICloudSyncEnabled: wasICloudSyncEnabled,
+                hotkeyTriggerThresholdChanged: false
+            )
+            return
+        }
+        updateConfig {
+            $0.meetingTranscriptionBackend = option.backend
+            $0.meetingTranscriptionModel = option.model
+        }
+        guard !isMeetingRecording(), !isStartingMeetingRecording else {
+            return
+        }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.transcriptionCoordinator.preload(
+                backend: option,
+                enablePostProcessor: false,
+                includeMeetingHelpers: true
+            )
+            await MainActor.run {
+                self.statusBarController?.refresh()
+            }
+        }
+    }
+
+    func selectCohereLanguage(_ language: CohereTranscribeLanguage) {
+        updateConfig {
+            $0.cohereLanguage = language.rawValue
+        }
+    }
+
+    func selectIndicASRLanguage(_ language: IndicASRLanguage) {
+        updateConfig {
+            $0.indicASRLanguage = language.rawValue
+        }
+    }
+
+    var isPostProcessorReady: Bool {
+        canRunTranscriptCleanup(option: runtimePostProcessorOption())
+    }
+
+    @discardableResult
+    private func normalizePostProcessorSelectionForAvailability() -> PostProcessorOption? {
+        guard let option = runtimePostProcessorOption() else {
+            appState.activePostProcessor = PostProcessorOption.resolve(id: config.activePostProcessorId)
+            return nil
+        }
+        if config.activePostProcessorId != option.id {
+            updateConfig { $0.activePostProcessorId = option.id }
+        }
+        appState.activePostProcessor = option
+        return option
+    }
+
+    private func runtimePostProcessorOption() -> PostProcessorOption? {
+        guard selectedPostProcessorBackend == .local else { return nil }
+        return PostProcessorOption.runtimeOption(id: config.activePostProcessorId)
+    }
+
+    private func canRunTranscriptCleanup(option: PostProcessorOption?) -> Bool {
+        guard config.enablePostProcessor,
+              selectedPostProcessorBackend.isCompatible(with: selectedBackend) else { return false }
+        if selectedPostProcessorBackend == .local {
+            return option != nil
+        }
+        if selectedPostProcessorBackend == .gemma4LiteRT {
+            return Gemma4LiteRTModelStore.isAvailableLocally()
+        }
+        return TranscriptCleanupClient.hasRequiredSettings(
+            for: selectedPostProcessorBackend,
+            config: config,
+            isChatGPTAuthenticated: chatGPTAuth.isAuthenticated
+        )
+    }
+
+    private func configureTranscriptCleanupForRuntime(option: PostProcessorOption? = nil) async {
+        await transcriptionCoordinator.configurePostProcessor(
+            backend: selectedPostProcessorBackend,
+            option: option ?? runtimePostProcessorOption(),
+            systemPrompt: config.postProcessorSystemPrompt,
+            config: config
+        )
+    }
+
+    func setPostProcessorEnabled(_ enabled: Bool) {
+        guard !enabled || selectedPostProcessorBackend.isCompatible(with: selectedBackend) else {
+            updateConfig { $0.enablePostProcessor = false }
+            return
+        }
+        if enabled, selectedPostProcessorBackend == .local {
+            guard normalizePostProcessorSelectionForAvailability() != nil else {
+                updateConfig { $0.enablePostProcessor = false }
+                showModels(category: .postProcessing)
+                return
+            }
+        }
+        if enabled, selectedPostProcessorBackend == .gemma4LiteRT,
+           !Gemma4LiteRTModelStore.isAvailableLocally() {
+            updateConfig { $0.enablePostProcessor = false }
+            showModels(category: .postProcessing)
+            return
+        }
+        updateConfig { $0.enablePostProcessor = enabled }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func preloadExperimentalTranscriptionFeatures() {
+        let ppOption = runtimePostProcessorOption()
+        let enabled = canRunTranscriptCleanup(option: ppOption)
+        Task { [weak self] in
+            guard let self else { return }
+            await self.configureTranscriptCleanupForRuntime(option: ppOption)
+            await self.transcriptionCoordinator.preloadPostProcessorIfNeeded(
+                enabled: enabled,
+                transcriptionBackend: self.selectedBackend
+            )
+        }
+    }
+
+    func selectPostProcessor(_ option: PostProcessorOption) {
+        updateConfig {
+            $0.postProcessorBackend = TranscriptCleanupBackendOption.local.backend
+            $0.activePostProcessorId = option.id
+        }
+        selectedPostProcessorBackend = .local
+        appState.selectedPostProcessorBackend = .local
+        appState.activePostProcessor = option
+        guard config.enablePostProcessor else { return }
+        Task { [weak self] in
+            guard let self else { return }
+            await self.configureTranscriptCleanupForRuntime(option: option)
+        }
+    }
+
+    func selectPostProcessorBackend(_ option: TranscriptCleanupBackendOption) {
+        guard option.isCompatible(with: selectedBackend) else {
+            presentErrorAlert(
+                title: "Cleanup model unavailable",
+                message: "Gemma 4 cannot clean up a transcription produced by the same Gemma 4 backend."
+            )
+            return
+        }
+        updateConfig { $0.postProcessorBackend = option.backend }
+        selectedPostProcessorBackend = option
+        appState.selectedPostProcessorBackend = option
+        if option == .local, config.enablePostProcessor {
+            guard normalizePostProcessorSelectionForAvailability() != nil else {
+                updateConfig { $0.enablePostProcessor = false }
+                showModels(category: .postProcessing)
+                return
+            }
+        }
+        if option == .gemma4LiteRT, config.enablePostProcessor,
+           !Gemma4LiteRTModelStore.isAvailableLocally() {
+            updateConfig { $0.enablePostProcessor = false }
+            showModels(category: .postProcessing)
+            return
+        }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func updatePostProcessorModel(_ model: String, for backend: TranscriptCleanupBackendOption) {
+        updateConfig { config in
+            switch backend.llmBackend {
+            case .some(.chatGPT):
+                config.postProcessorChatGPTModel = model
+            case .some(.openAI):
+                config.postProcessorOpenAIModel = model
+            case .some(.openRouter):
+                config.postProcessorOpenRouterModel = model
+            case .some(.ollama):
+                config.postProcessorOllamaModel = model
+            case .some(.lmStudio):
+                config.postProcessorLMStudioModel = model
+            case .some(.customLLM):
+                config.postProcessorCustomLLMModel = model
+            default:
+                break
+            }
+        }
+        guard config.enablePostProcessor else { return }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func selectTranscriptCleanupPrompt(id: String) {
+        let preset = TranscriptCleanupPrompts.resolve(id: id, custom: config.customTranscriptCleanupPrompts)
+        updateConfig {
+            $0.activeTranscriptCleanupPromptId = preset.id
+            $0.postProcessorSystemPrompt = preset.prompt
+        }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func createTranscriptCleanupPrompt(name: String, prompt: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedPrompt.isEmpty else { return }
+        let preset = CustomTranscriptCleanupPrompt(name: trimmedName, prompt: trimmedPrompt)
+        updateConfig {
+            $0.customTranscriptCleanupPrompts.append(preset)
+            $0.activeTranscriptCleanupPromptId = preset.id
+            $0.postProcessorSystemPrompt = preset.prompt
+        }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func updateTranscriptCleanupPrompt(id: String, name: String, prompt: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedPrompt.isEmpty else { return }
+        updateConfig {
+            guard let index = $0.customTranscriptCleanupPrompts.firstIndex(where: { $0.id == id }) else { return }
+            $0.customTranscriptCleanupPrompts[index].name = trimmedName
+            $0.customTranscriptCleanupPrompts[index].prompt = trimmedPrompt
+            if $0.activeTranscriptCleanupPromptId == id {
+                $0.postProcessorSystemPrompt = trimmedPrompt
+            }
+        }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func deleteTranscriptCleanupPrompt(id: String) {
+        updateConfig {
+            $0.customTranscriptCleanupPrompts.removeAll { $0.id == id }
+            if $0.activeTranscriptCleanupPromptId == id {
+                $0.activeTranscriptCleanupPromptId = TranscriptCleanupPrompts.defaultID
+                $0.postProcessorSystemPrompt = PostProcessorOption.defaultSystemPrompt
+            }
+        }
+        preloadExperimentalTranscriptionFeatures()
+    }
+
+    func selectMeetingSummaryBackend(_ option: MeetingSummaryBackendOption) {
+        updateConfig {
+            $0.meetingSummaryBackend = option.backend
+        }
+    }
+
+    func updateMeetingSummaryGenerationSettings(
+        backend: MeetingSummaryBackendOption,
+        model: String,
+        mutate: (inout SummaryGenerationSettings) -> Void
+    ) {
+        updateConfig { config in
+            var settings = config.meetingSummaryGenerationSettings(backend: backend, model: model)
+            mutate(&settings)
+            config.setMeetingSummaryGenerationSettings(settings, backend: backend, model: model)
+        }
+    }
+
+    func resetMeetingSummaryGenerationSettings(
+        backend: MeetingSummaryBackendOption,
+        model: String
+    ) {
+        updateConfig {
+            $0.setMeetingSummaryGenerationSettings(
+                SummaryGenerationSettings(),
+                backend: backend,
+                model: model
+            )
+        }
+    }
+
+    func availableMeetingRetranscriptionBackends() -> [BackendOption] {
+        var options = BackendOption.downloadedMeetingTranscription
+        if !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            options.append(.homanWhisper)
+        }
+        return Self.defaultFirstMeetingTranscriptionOptions(
+            defaultOption: selectedMeetingTranscriptionBackend,
+            downloadedOptions: options
+        )
+    }
+
+    static func defaultFirstMeetingTranscriptionOptions(
+        defaultOption: BackendOption,
+        downloadedOptions: [BackendOption]
+    ) -> [BackendOption] {
+        guard let selected = downloadedOptions.first(where: {
+            $0.backend == defaultOption.backend && $0.model == defaultOption.model
+        }) else {
+            return downloadedOptions
+        }
+        return [selected] + downloadedOptions.filter {
+            $0.backend != selected.backend || $0.model != selected.model
+        }
+    }
+
+    func meetingSummaryRunOptions() -> [MeetingSummaryBackendOption] {
+        // "Run once with" only lists real summarizers; the transcript-only
+        // option isn't something you re-summarize with.
+        let runnable = MeetingSummaryBackendOption.all.filter { $0 != .transcriptOnly }
+        let defaultOption = MeetingSummaryBackendOption.resolved(config.meetingSummaryBackend)
+        if defaultOption == .transcriptOnly {
+            return runnable
+        }
+        return [defaultOption] + runnable.filter { $0 != defaultOption }
+    }
+
+    func isMeetingSummaryBackendConfigured(_ option: MeetingSummaryBackendOption) -> Bool {
+        Self.isMeetingSummaryBackendConfigured(
+            option,
+            config: config,
+            isChatGPTAuthenticated: chatGPTAuth.isAuthenticated
+        )
+    }
+
+    static func isMeetingSummaryBackendConfigured(
+        _ option: MeetingSummaryBackendOption,
+        config: AppConfig,
+        isChatGPTAuthenticated: Bool,
+        environment: [String: String] = ProcessInfo.processInfo.environment
+    ) -> Bool {
+        switch option {
+        case .transcriptOnly:
+            return true
+        case .chatGPT:
+            return isChatGPTAuthenticated
+        case .openAI:
+            return !(environment["OPENAI_API_KEY"] ?? config.openAIAPIKey)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        case .openRouter:
+            return !(environment["OPENROUTER_API_KEY"] ?? config.openRouterAPIKey)
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .isEmpty
+        case .ollama:
+            return true
+        case .lmStudio:
+            return MeetingSummaryClient.lmStudioHasRequiredSettings(config: config)
+        case .customLLM:
+            return MeetingSummaryClient.customLLMHasRequiredSettings(config: config)
+        case .gemmaLocal:
+            // Configured once the selected Gemma 4 summary model is on disk.
+            return GemmaSummaryModel.resolve(id: config.gemmaSummaryModel).isDownloaded
+        default:
+            return false
+        }
+    }
+
+    static func configForOneTimeSummary(
+        baseConfig: AppConfig,
+        backend: MeetingSummaryBackendOption?
+    ) -> AppConfig {
+        var runConfig = baseConfig
+        if let backend {
+            runConfig.meetingSummaryBackend = backend.backend
+        }
+        return runConfig
+    }
+
+    func availableMeetingTemplates() -> [MeetingTemplateDefinition] {
+        MeetingTemplates.allDefinitions(
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        )
+    }
+
+    func builtInMeetingTemplates() -> [MeetingTemplateDefinition] {
+        MeetingTemplates.builtInDefinitions(overrides: config.builtInMeetingTemplateOverrides)
+    }
+
+    func editableBuiltInMeetingTemplates() -> [MeetingTemplateDefinition] {
+        MeetingTemplates.editableBuiltInDefinitions(overrides: config.builtInMeetingTemplateOverrides)
+    }
+
+    func isBuiltInMeetingTemplateModified(id: String) -> Bool {
+        config.builtInMeetingTemplateOverrides.contains(where: { $0.id == id })
+    }
+
+    func customMeetingTemplates() -> [CustomMeetingTemplate] {
+        config.customMeetingTemplates
+    }
+
+    func updateMeetingSummaryPrompts(system: String, user: String) {
+        guard MeetingSummaryPromptTemplates.validationIssues(system: system, user: user).isEmpty else { return }
+        updateConfig {
+            $0.meetingSummarySystemPromptOverride = MeetingSummaryPromptTemplates.normalizedOverride(
+                system,
+                defaultValue: MeetingSummaryPromptTemplates.defaultSystem
+            )
+            $0.meetingSummaryUserPromptOverride = MeetingSummaryPromptTemplates.normalizedOverride(
+                user,
+                defaultValue: MeetingSummaryPromptTemplates.defaultUser
+            )
+        }
+    }
+
+    func resetMeetingSummaryPrompts() {
+        updateConfig {
+            $0.meetingSummarySystemPromptOverride = nil
+            $0.meetingSummaryUserPromptOverride = nil
+        }
+    }
+
+    func defaultMeetingTemplate() -> MeetingTemplateSnapshot {
+        MeetingTemplates.resolveSnapshot(
+            id: config.defaultMeetingTemplateID,
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        )
+    }
+
+    func meetingTemplateSnapshot(for meeting: MeetingRecord) -> MeetingTemplateSnapshot {
+        MeetingTemplates.snapshot(
+            for: meeting,
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        )
+    }
+
+    func updateDefaultMeetingTemplate(id: String) {
+        let resolved = MeetingTemplates.resolveSnapshot(
+            id: id,
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        )
+        updateConfig {
+            $0.defaultMeetingTemplateID = resolved.id
+        }
+    }
+
+    func updateBuiltInMeetingTemplate(id: String, name: String, prompt: String, icon: String) {
+        guard ([MeetingTemplates.auto] + MeetingTemplates.builtIns).contains(where: { $0.id == id }) else { return }
+        let override = MeetingTemplates.makeBuiltInOverride(
+            id: id,
+            name: name,
+            prompt: prompt,
+            icon: icon
+        )
+        updateConfig {
+            $0.builtInMeetingTemplateOverrides.removeAll { $0.id == id }
+            if let override {
+                $0.builtInMeetingTemplateOverrides.append(override)
+            }
+        }
+    }
+
+    func resetBuiltInMeetingTemplate(id: String) {
+        updateConfig {
+            $0.builtInMeetingTemplateOverrides.removeAll { $0.id == id }
+        }
+    }
+
+    func createCustomMeetingTemplate(name: String, prompt: String, icon: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedPrompt.isEmpty else { return }
+        updateConfig {
+            $0.customMeetingTemplates.append(
+                CustomMeetingTemplate(
+                    name: trimmedName,
+                    prompt: trimmedPrompt,
+                    icon: MeetingTemplates.normalizedCustomIcon(named: icon)
+                )
+            )
+        }
+    }
+
+    func updateCustomMeetingTemplate(id: String, name: String, prompt: String, icon: String) {
+        let trimmedName = name.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedPrompt = prompt.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedName.isEmpty, !trimmedPrompt.isEmpty else { return }
+        updateConfig {
+            guard let index = $0.customMeetingTemplates.firstIndex(where: { $0.id == id }) else { return }
+            $0.customMeetingTemplates[index].name = trimmedName
+            $0.customMeetingTemplates[index].prompt = trimmedPrompt
+            $0.customMeetingTemplates[index].icon = MeetingTemplates.normalizedCustomIcon(named: icon)
+        }
+    }
+
+    func deleteCustomMeetingTemplate(id: String) {
+        updateConfig {
+            $0.customMeetingTemplates.removeAll { $0.id == id }
+            if $0.defaultMeetingTemplateID == id {
+                $0.defaultMeetingTemplateID = MeetingTemplates.autoID
+            }
+        }
+    }
+
+    /// Returns nil on success, or an error message on failure.
+    func signInWithChatGPT(selectMeetingSummaryBackend shouldSelectMeetingSummaryBackend: Bool = true) async -> String? {
+        do {
+            try await chatGPTAuth.signIn()
+            if shouldSelectMeetingSummaryBackend {
+                selectMeetingSummaryBackend(.chatGPT)
+            }
+            syncAppState()
+            preloadExperimentalTranscriptionFeatures()
+            return nil
+        } catch {
+            fputs("[muesli-native] ChatGPT sign-in failed: \(error)\n", stderr)
+            return error.localizedDescription
+        }
+    }
+
+    func signOutChatGPT() {
+        chatGPTAuth.signOut()
+        if selectedMeetingSummaryBackend == .chatGPT {
+            selectMeetingSummaryBackend(.openAI)
+        }
+        syncAppState()
+    }
+
+    // MARK: - Google Calendar
+
+    func signInWithGoogleCalendar() async -> String? {
+        do {
+            try await googleCalAuth.signIn()
+            syncAppState()
+            Task {
+                await refreshUpcomingCalendarEvents()
+                await refreshGoogleCalendarList()
+            }
+            return nil
+        } catch {
+            fputs("[muesli-native] Google Calendar sign-in failed: \(error)\n", stderr)
+            return error.localizedDescription
+        }
+    }
+
+    func signOutGoogleCalendar() {
+        invalidateGoogleCalendarAuth()
+        Task { await refreshUpcomingCalendarEvents() }
+    }
+
+    private func invalidateGoogleCalendarAuth() {
+        googleCalAuth.signOut()
+        googleCalClient.resetSync()
+        appState.availableGoogleCalendars = []
+        appState.googleCalendarListLoadState = .idle
+        syncAppState()
+    }
+
+    /// Refresh the EventKit-available calendars list. Cheap (no network), safe
+    /// to call frequently — driven by Settings panel onAppear and by the
+    /// EKEventStoreChangedNotification handler.
+    func refreshAvailableEventKitCalendars() {
+        appState.availableEventKitCalendars = calendarMonitor.availableCalendars()
+    }
+
+    /// Refresh the Google calendar list via the Calendar API. No-op when OAuth
+    /// is not available or the user is not authenticated.
+    func refreshGoogleCalendarList() async {
+        guard googleCalAuth.isAuthenticated else {
+            appState.availableGoogleCalendars = []
+            appState.googleCalendarListLoadState = .idle
+            return
+        }
+        appState.googleCalendarListLoadState = .loading
+        do {
+            let list = try await googleCalClient.fetchCalendarList()
+            appState.availableGoogleCalendars = list
+            appState.googleCalendarListLoadState = .loaded
+        } catch GoogleCalendarAuthError.notAuthenticated {
+            invalidateGoogleCalendarAuth()
+            fputs("[muesli-native] Google Calendar token invalid while loading calendar list, signed out\n", stderr)
+        } catch GoogleCalendarAuthError.refreshFailed(let message) {
+            fputs("[muesli-native] Google Calendar token refresh failed while loading calendar list: \(message)\n", stderr)
+            appState.googleCalendarListLoadState = .failed("Token refresh failed: \(message)")
+        } catch {
+            fputs("[muesli-native] Google calendarList fetch failed: \(error)\n", stderr)
+            appState.googleCalendarListLoadState = .failed(error.localizedDescription)
+        }
+    }
+
+    @discardableResult
+    func refreshUpcomingCalendarEvents() async -> Bool {
+        let refreshNow = Date()
+        let refreshStartOfDay = Calendar.current.startOfDay(for: refreshNow)
+        let disabledIDs = Set(config.disabledCalendarIDs)
+        let dayCount = UpcomingMeetingsWindow.resolve(dayCount: config.upcomingMeetingsDayCount).dayCount
+        var ekEvents = calendarMonitor.upcomingEvents(
+            daysAhead: dayCount,
+            disabledCalendarIDs: disabledIDs,
+            now: refreshNow
+        )
+        var observedEventIDs = Set(ekEvents.map(\.id))
+        var canConfirmMissingGoogleEvents = false
+
+        if googleCalAuth.isAuthenticated {
+            do {
+                let googleResult = try await googleCalClient.fetchUpcomingEvents(
+                    daysAhead: dayCount,
+                    disabledCalendarIDs: disabledIDs,
+                    now: refreshNow
+                )
+                canConfirmMissingGoogleEvents = googleResult.wasComplete
+                observedEventIDs.formUnion(googleResult.events.map(\.id))
+                ekEvents = GoogleCalendarClient.mergeEvents(eventKit: ekEvents, google: googleResult.events)
+            } catch GoogleCalendarAuthError.notAuthenticated {
+                invalidateGoogleCalendarAuth()
+                fputs("[muesli-native] Google Calendar token invalid, signed out\n", stderr)
+            } catch GoogleCalendarAuthError.refreshFailed(let message) {
+                fputs("[muesli-native] Google Calendar token refresh failed: \(message)\n", stderr)
+            } catch GoogleCalendarClientError.staleRequest {
+                return false
+            } catch {
+                fputs("[muesli-native] Google Calendar fetch failed: \(error)\n", stderr)
+            }
+        }
+
+        let currentDisabledIDs = Set(config.disabledCalendarIDs)
+        let currentDayCount = UpcomingMeetingsWindow.resolve(dayCount: config.upcomingMeetingsDayCount).dayCount
+        let currentStartOfDay = Calendar.current.startOfDay(for: Date())
+        guard dayCount == currentDayCount,
+              disabledIDs == currentDisabledIDs,
+              refreshStartOfDay == currentStartOfDay else {
+            return false
+        }
+
+        appState.upcomingCalendarEvents = ekEvents
+
+        // Prune hidden IDs only when the widest supported window still cannot see the event.
+        observedEventIDs.formUnion(ekEvents.map(\.id))
+        let sourceHints = config.hiddenCalendarEventSourceHints
+        let canConfirmMissingEventKitEvents = calendarMonitor.canConfirmMissingEvents
+        let canPruneHiddenEvents = disabledIDs.isEmpty
+        let staleIDs = UpcomingMeetingsWindow.staleHiddenEventIDs(
+            hiddenIDs: appState.hiddenCalendarEventIDs,
+            visibleEventIDs: observedEventIDs,
+            dayCount: dayCount,
+            canConfirmMissingEvents: canPruneHiddenEvents,
+            canConfirmMissingEventID: { eventID in
+                guard canPruneHiddenEvents else { return false }
+                switch sourceHints[eventID].flatMap(UnifiedCalendarEvent.CalendarSource.init(rawValue:)) {
+                case .some(.eventKit):
+                    return canConfirmMissingEventKitEvents
+                case .some(.googleCalendar):
+                    return canConfirmMissingGoogleEvents
+                case .none:
+                    return false
+                }
+            }
+        )
+        if !staleIDs.isEmpty {
+            appState.hiddenCalendarEventIDs.subtract(staleIDs)
+            updateConfig {
+                $0.hiddenCalendarEventIDs = self.appState.hiddenCalendarEventIDs.sorted()
+                $0.hiddenCalendarEventSourceHints = $0.hiddenCalendarEventSourceHints.filter {
+                    !staleIDs.contains($0.key)
+                }
+            }
+        }
+
+        statusBarController?.updateMenuBarTitle()
+        return true
+    }
+
+    func startCalendarMonitoring() {
+        // Event-driven: refresh when macOS reports calendar changes.
+        // EKEventStoreChangedNotification is delivered via NotificationCenter,
+        // which is immune to App Nap timer suspension in LSUIElement apps.
+        calendarMonitor.onCalendarChanged = { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                self.refreshAvailableEventKitCalendars()
+                let refreshed = await self.refreshUpcomingCalendarEvents()
+                guard refreshed else { return }
+                self.checkUpcomingCalendarNotifications()
+                self.meetingMonitor.refreshState(trigger: .calendarChanged)
+            }
+        }
+
+        // 60s fallback timer: polls Google Calendar API (sync token makes this
+        // efficient) and checks the notification window for time-based triggers.
+        // EKEventStoreChangedNotification handles EventKit reactively, but Google
+        // Calendar OAuth has no push mechanism — this timer is the only way to
+        // pick up new/moved events from the API. May be suspended by App Nap on
+        // macOS 26, but combined with the EventKit push path, most cases are covered.
+        calendarCheckTimer?.invalidate()
+        calendarCheckTimer = Timer.scheduledTimer(withTimeInterval: 60, repeats: true) { [weak self] _ in
+            guard let self else { return }
+            Task { @MainActor in
+                self.calendarMonitor.start()
+                self.refreshAvailableEventKitCalendars()
+                let refreshed = await self.refreshUpcomingCalendarEvents()
+                guard refreshed else { return }
+                self.checkUpcomingCalendarNotifications()
+                self.meetingMonitor.refreshState(trigger: .calendarChanged)
+            }
+        }
+
+        // Run first cycle immediately
+        Task { @MainActor in
+            self.refreshAvailableEventKitCalendars()
+            let refreshed = await self.refreshUpcomingCalendarEvents()
+            guard refreshed else { return }
+            self.checkUpcomingCalendarNotifications()
+            self.meetingMonitor.refreshState(trigger: .calendarChanged)
+        }
+    }
+
+    private func syncCalendarMonitor() {
+        let shouldRun = meetingFeatureMonitorsAllowed && shouldRunCalendarMonitor
+        if shouldRun && !calendarMonitoringStarted {
+            calendarMonitor.start()
+            startCalendarMonitoring()
+            calendarMonitoringStarted = true
+        } else if !shouldRun && calendarMonitoringStarted {
+            calendarMonitor.stop()
+            calendarCheckTimer?.invalidate()
+            calendarCheckTimer = nil
+            calendarMonitoringStarted = false
+        }
+    }
+
+    private func currentOrNearbyCachedCalendarEvent() -> CalendarEventContext? {
+        selectCurrentOrNearbyCachedCalendarEvent(from: appState.upcomingCalendarEvents)
+    }
+
+    private func startMeetingFeatureMonitors(includeMaraudersMap: Bool) {
+        if includeMaraudersMap, config.maraudersMapUnlocked {
+            startMaraudersMapMonitoring()
+        }
+        syncMeetingDetectionMonitor()
+    }
+
+    private var shouldRunMeetingFeatureMonitors: Bool {
+        config.showMeetingDetectionNotification
+            || config.showScheduledMeetingNotifications
+            || config.autoRecordMeetings
+    }
+
+    private var shouldRunCalendarMonitor: Bool {
+        config.resolvedOnboardingUseCase.includesMeetings || shouldRunMeetingFeatureMonitors
+    }
+
+    private func syncMeetingDetectionMonitor() {
+        let shouldRun = meetingFeatureMonitorsAllowed
+            && (config.showMeetingDetectionNotification || activeMeetingAutoStop.isArmed)
+        if shouldRun && !meetingDetectionMonitorStarted {
+            meetingMonitor.start()
+            meetingDetectionMonitorStarted = true
+        } else if !shouldRun && meetingDetectionMonitorStarted {
+            meetingMonitor.stop()
+            meetingDetectionMonitorStarted = false
+            dismissPresentedMeetingDetection()
+        }
+    }
+
+    /// Check all upcoming calendar events (EventKit + Google) for events entering the configured prompt window.
+    /// With a pre-start lead time, shows a notification when the event enters that window and schedules a second
+    /// "Meeting starting now" notification at event start time. With the default start-time policy, waits until
+    /// the event has started so calendar prompts do not fire before the user is expected to join.
+    /// This is the single notification path for all calendar sources.
+    /// Composite dedup key: same event rescheduled to a new time gets a fresh notification.
+    private func notificationKey(id: String, startDate: Date) -> String {
+        "\(id)|\(Int(startDate.timeIntervalSince1970))"
+    }
+
+    private func checkUpcomingCalendarNotifications() {
+        guard !isMeetingRecording(),
+              !isStartingMeetingRecording else { return }
+
+        let now = Date()
+        let leadTime = config.scheduledMeetingNotificationLeadTime.seconds
+
+        // Prune stale entries (events that started more than 1 hour ago)
+        let cutoff = now.addingTimeInterval(-3600)
+        notifiedUpcomingEventIDs = notifiedUpcomingEventIDs.filter { key in
+            guard let tsString = key.split(separator: "|").last,
+                  let ts = TimeInterval(tsString) else { return false }
+            return Date(timeIntervalSince1970: ts) > cutoff
+        }
+        autoRecordedCalendarEventIDs = autoRecordedCalendarEventIDs.filter { key in
+            guard let tsString = key.split(separator: "|").last,
+                  let ts = TimeInterval(tsString) else { return false }
+            return Date(timeIntervalSince1970: ts) > cutoff
+        }
+
+        if config.autoRecordMeetings {
+            let autoRecordCandidates = ScheduledMeetingNotificationPolicy.autoRecordCandidates(
+                from: appState.upcomingCalendarEvents,
+                now: now,
+                hiddenEventIDs: appState.hiddenCalendarEventIDs
+            )
+            for event in autoRecordCandidates {
+                let key = notificationKey(id: event.id, startDate: event.startDate)
+                guard !autoRecordedCalendarEventIDs.contains(key) else { continue }
+                autoRecordedCalendarEventIDs.insert(key)
+
+                startMeetingRecording(
+                    title: event.title,
+                    calendarOccurrence: event.resolvedCalendarOccurrence,
+                    openDocument: false,
+                    endDate: event.endDate,
+                    autoStopSource: event.meetingURL.flatMap { MeetingAutoStopSource(meetingURL: $0) },
+                    startOrigin: .calendarAutoRecord
+                )
+                return
+            }
+        }
+
+        guard config.showScheduledMeetingNotifications else { return }
+
+        let notificationCandidates = ScheduledMeetingNotificationPolicy.upcomingCandidates(
+            from: appState.upcomingCalendarEvents,
+            now: now,
+            hiddenEventIDs: appState.hiddenCalendarEventIDs,
+            leadTime: leadTime
+        )
+        for event in notificationCandidates {
+            let key = notificationKey(id: event.id, startDate: event.startDate)
+            guard !notifiedUpcomingEventIDs.contains(key) else { continue }
+
+            notifiedUpcomingEventIDs.insert(key)
+
+            let upcomingEvent = UpcomingMeetingEvent(
+                id: event.id,
+                title: event.title,
+                startDate: event.startDate,
+                calendarOccurrence: event.resolvedCalendarOccurrence,
+                meetingURL: event.meetingURL
+            )
+
+            // Show "starts in X min" notification now
+            handleUpcomingMeeting(upcomingEvent)
+
+            // Schedule a second "Meeting starting now" notification at event start time for pre-start prompts.
+            let delay = event.startDate.timeIntervalSinceNow
+            if leadTime > 0, delay > 15 { // Only if there's enough gap after the first notification auto-dismisses
+                let eventID = event.id
+                let startDate = event.startDate
+                meetingStartingNowTimers[key]?.invalidate()
+                meetingStartingNowTimers[key] = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self else { return }
+                        self.meetingStartingNowTimers.removeValue(forKey: key)
+                        guard !self.isMeetingRecording(),
+                              let event = ScheduledMeetingNotificationPolicy.startingNowCandidate(
+                                from: self.appState.upcomingCalendarEvents,
+                                eventID: eventID,
+                                startDate: startDate,
+                                hiddenEventIDs: self.appState.hiddenCalendarEventIDs
+                              ) else { return }
+                        self.showMeetingStartingNowNotification(
+                            title: event.title,
+                            calendarOccurrence: event.resolvedCalendarOccurrence,
+                            meetingURL: event.meetingURL,
+                            endDate: event.endDate
+                        )
+                    }
+                }
+            }
+
+            return // Show one notification at a time
+        }
+    }
+
+    /// Show a "Meeting starting now" notification — independent of Marauder's Map.
+    private func showMeetingStartingNowNotification(
+        title: String,
+        calendarOccurrence: CalendarOccurrenceReference?,
+        meetingURL: URL?,
+        endDate: Date?
+    ) {
+        guard ScheduledMeetingNotificationPolicy.shouldShowStartingNowPrompt(meetingURL: meetingURL),
+              config.showScheduledMeetingNotifications,
+              !isMeetingRecording(),
+              !isStartingMeetingRecording else { return }
+        isShowingCalendarNotification = true
+        let autoStopSource = meetingURL.flatMap { MeetingAutoStopSource(meetingURL: $0) }
+
+        meetingNotification.show(
+            title: "Meeting starting now",
+            subtitle: title,
+            meetingURL: meetingURL,
+            dismissAfter: 30,
+            onStartRecording: { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.startMeetingRecordingFromEntryPoint(
+                    title: title,
+                    calendarOccurrence: calendarOccurrence,
+                    endDate: endDate,
+                    autoStopSource: autoStopSource,
+                    presentation: .backgroundPill,
+                    startOrigin: .scheduledMeetingPrompt
+                )
+            },
+            onJoinAndRecord: meetingURL != nil ? { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.joinAndRecord(
+                    title: title,
+                    meetingURL: meetingURL!,
+                    endDate: endDate,
+                    calendarOccurrence: calendarOccurrence,
+                    presentation: .backgroundPill
+                )
+            } : nil,
+            onJoinOnly: meetingURL != nil ? { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.joinOnly(meetingURL: meetingURL!, endDate: endDate)
+            } : nil,
+            onDismiss: { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                let remaining = endDate.map { max($0.timeIntervalSinceNow, 120) } ?? 120
+                self.meetingMonitor.suppress(for: remaining)
+                self.meetingMonitor.refreshState()
+            },
+            onClose: { [weak self] in
+                self?.isShowingCalendarNotification = false
+                self?.showPendingMeetingCompletionNotificationIfPossible()
+            }
+        )
+    }
+
+    func addCustomWord(_ word: CustomWord) {
+        updateConfig { $0.customWords.append(word) }
+    }
+
+    func addDictionarySuggestion(_ suggestion: DictionarySuggestion) {
+        guard config.enableDictionaryCorrectionPrompts else {
+            logDictionarySuggestion("skip reason=disabled \(dictionarySuggestionLogMetadata(suggestion))")
+            return
+        }
+        let trimmedObserved = suggestion.observed.trimmingCharacters(in: .whitespacesAndNewlines)
+        let trimmedReplacement = suggestion.replacement.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmedObserved.isEmpty, !trimmedReplacement.isEmpty else {
+            logDictionarySuggestion("skip reason=empty")
+            return
+        }
+        guard trimmedObserved != trimmedReplacement else {
+            logDictionarySuggestion("skip reason=sameText")
+            return
+        }
+
+        let key = DictionarySuggestion.key(observed: trimmedObserved, replacement: trimmedReplacement)
+        let metadata = dictionarySuggestionLogMetadata(observed: trimmedObserved, replacement: trimmedReplacement)
+        guard !config.dismissedDictionarySuggestionKeys.contains(key) else {
+            logDictionarySuggestion("skip reason=dismissed \(metadata)")
+            return
+        }
+        guard !config.customWords.contains(where: {
+            DictionarySuggestion.key(observed: $0.word, replacement: $0.targetWord) == key
+        }) else {
+            logDictionarySuggestion("skip reason=customWordExists \(metadata)")
+            return
+        }
+
+        var promptSuggestion = suggestion
+        var persistenceAction = "insert"
+        updateConfig { config in
+            if let index = config.dictionarySuggestions.firstIndex(where: { $0.key == key }) {
+                var existing = config.dictionarySuggestions[index]
+                existing.occurrenceCount += 1
+                existing.lastSeenAt = DictionarySuggestion.timestamp()
+                if existing.appContext.isEmpty {
+                    existing.appContext = suggestion.appContext
+                }
+                config.dictionarySuggestions.remove(at: index)
+                config.dictionarySuggestions.insert(existing, at: 0)
+                promptSuggestion = existing
+                persistenceAction = "update"
+            } else {
+                promptSuggestion = DictionarySuggestion(
+                    observed: trimmedObserved,
+                    replacement: trimmedReplacement,
+                    appContext: suggestion.appContext
+                )
+                config.dictionarySuggestions.insert(promptSuggestion, at: 0)
+            }
+            if config.dictionarySuggestions.count > Self.maxDictionarySuggestions {
+                config.dictionarySuggestions = Array(config.dictionarySuggestions.prefix(Self.maxDictionarySuggestions))
+            }
+        }
+
+        logDictionarySuggestion("persist action=\(persistenceAction) \(metadata)")
+        enqueueDictionarySuggestionPrompt(promptSuggestion)
+    }
+
+    func acceptDictionarySuggestion(id: UUID) {
+        guard let suggestion = config.dictionarySuggestions.first(where: { $0.id == id }) else { return }
+        acceptDictionarySuggestion(suggestion)
+    }
+
+    func dismissDictionarySuggestion(id: UUID) {
+        guard let suggestion = config.dictionarySuggestions.first(where: { $0.id == id }) else { return }
+        dismissDictionarySuggestion(suggestion)
+    }
+
+    private func acceptDictionarySuggestion(_ suggestion: DictionarySuggestion) {
+        let key = suggestion.key
+        updateConfig { config in
+            if !config.customWords.contains(where: {
+                DictionarySuggestion.key(observed: $0.word, replacement: $0.targetWord) == key
+            }) {
+                config.customWords.append(suggestion.customWord)
+            }
+            config.dictionarySuggestions.removeAll { $0.key == key }
+            config.dismissedDictionarySuggestionKeys.removeAll { $0 == key }
+        }
+        logDictionarySuggestion("accept \(dictionarySuggestionLogMetadata(suggestion))")
+    }
+
+    private func dismissDictionarySuggestion(_ suggestion: DictionarySuggestion) {
+        let key = suggestion.key
+        updateConfig { config in
+            config.dictionarySuggestions.removeAll { $0.key == key }
+            if !config.dismissedDictionarySuggestionKeys.contains(key) {
+                config.dismissedDictionarySuggestionKeys.append(key)
+            }
+            if config.dismissedDictionarySuggestionKeys.count > Self.maxDismissedDictionarySuggestionKeys {
+                config.dismissedDictionarySuggestionKeys = Array(config.dismissedDictionarySuggestionKeys.suffix(Self.maxDismissedDictionarySuggestionKeys))
+            }
+        }
+        logDictionarySuggestion("ignore \(dictionarySuggestionLogMetadata(suggestion))")
+    }
+
+    private func presentDictionarySuggestionPrompt(_ suggestion: DictionarySuggestion) {
+        let key = suggestion.key
+        activeDictionarySuggestionPromptKey = key
+        logDictionarySuggestion("present \(dictionarySuggestionLogMetadata(suggestion))")
+        dictionarySuggestionPrompt.show(
+            suggestion: suggestion,
+            anchorFrame: indicator.currentFrame,
+            onAdd: { [weak self] in
+                guard let self else { return }
+                self.acceptDictionarySuggestion(suggestion)
+                self.completeDictionarySuggestionPrompt(key: key, action: "add")
+            },
+            onIgnore: { [weak self] in
+                guard let self else { return }
+                self.dismissDictionarySuggestion(suggestion)
+                self.completeDictionarySuggestionPrompt(key: key, action: "ignore")
+            },
+            onDismiss: { [weak self] in
+                self?.completeDictionarySuggestionPrompt(key: key, action: "dismiss")
+            }
+        )
+    }
+
+    private func enqueueDictionarySuggestionPrompt(_ suggestion: DictionarySuggestion) {
+        let key = suggestion.key
+        guard config.enableDictionaryCorrectionPrompts else { return }
+        guard activeDictionarySuggestionPromptKey != key else { return }
+        guard !queuedDictionarySuggestionPromptKeys.contains(key) else { return }
+        // Showing or timing out a prompt is not a final answer. Only Add or
+        // Ignore suppresses future prompts for this correction pair.
+        queuedDictionarySuggestionPromptKeys.append(key)
+        if queuedDictionarySuggestionPromptKeys.count > Self.maxDictionarySuggestionPromptQueue {
+            queuedDictionarySuggestionPromptKeys.removeFirst(queuedDictionarySuggestionPromptKeys.count - Self.maxDictionarySuggestionPromptQueue)
+        }
+        logDictionarySuggestion("queue depth=\(queuedDictionarySuggestionPromptKeys.count) \(dictionarySuggestionLogMetadata(suggestion))")
+        presentNextDictionarySuggestionPromptIfPossible()
+    }
+
+    private func completeDictionarySuggestionPrompt(key: String, action: String) {
+        guard activeDictionarySuggestionPromptKey == key else { return }
+        activeDictionarySuggestionPromptKey = nil
+        logDictionarySuggestion("complete action=\(action) queued=\(queuedDictionarySuggestionPromptKeys.count)")
+        scheduleNextDictionarySuggestionPrompt()
+    }
+
+    private func scheduleNextDictionarySuggestionPrompt() {
+        dictionarySuggestionPromptAdvanceTask?.cancel()
+        dictionarySuggestionPromptAdvanceTask = Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 150_000_000)
+            guard !Task.isCancelled else { return }
+            self?.dictionarySuggestionPromptAdvanceTask = nil
+            self?.presentNextDictionarySuggestionPromptIfPossible()
+        }
+    }
+
+    private func presentNextDictionarySuggestionPromptIfPossible() {
+        guard config.enableDictionaryCorrectionPrompts else { return }
+        guard activeDictionarySuggestionPromptKey == nil else { return }
+        // While the advance task is sleeping, it owns the next drain attempt.
+        // Newly queued suggestions remain in queuedDictionarySuggestionPromptKeys.
+        guard dictionarySuggestionPromptAdvanceTask == nil else { return }
+        guard !dictionarySuggestionPrompt.isShowing else {
+            scheduleNextDictionarySuggestionPrompt()
+            return
+        }
+
+        while !queuedDictionarySuggestionPromptKeys.isEmpty {
+            let key = queuedDictionarySuggestionPromptKeys.removeFirst()
+            guard !config.dismissedDictionarySuggestionKeys.contains(key) else { continue }
+            guard let suggestion = config.dictionarySuggestions.first(where: { $0.key == key }) else { continue }
+            let hasCustomWord = config.customWords.contains {
+                DictionarySuggestion.key(observed: $0.word, replacement: $0.targetWord) == key
+            }
+            guard !hasCustomWord else { continue }
+            presentDictionarySuggestionPrompt(suggestion)
+            return
+        }
+    }
+
+    private func dictionarySuggestionLogMetadata(_ suggestion: DictionarySuggestion) -> String {
+        dictionarySuggestionLogMetadata(observed: suggestion.observed, replacement: suggestion.replacement)
+    }
+
+    private func dictionarySuggestionLogMetadata(observed: String, replacement: String) -> String {
+        "observedChars=\(observed.count) replacementChars=\(replacement.count)"
+    }
+
+    private func logDictionarySuggestion(_ message: String) {
+        Self.dictionarySuggestionLogger.debug("\(message, privacy: .public)")
+        fputs("[dictionary-suggestion] \(message)\n", stderr)
+    }
+
+    func updateCustomWord(_ word: CustomWord) {
+        updateConfig { config in
+            guard let index = config.customWords.firstIndex(where: { $0.id == word.id }) else { return }
+            config.customWords[index] = word
+        }
+    }
+
+    func removeCustomWord(id: UUID) {
+        updateConfig { $0.customWords.removeAll { $0.id == id } }
+    }
+
+    @discardableResult
+    func setDictionaryCorrectionPromptsFromToggle(_ enabled: Bool) -> DictionaryCorrectionPromptsToggleResult {
+        guard enabled else {
+            setDictionaryCorrectionPromptsEnabled(false)
+            return .updated
+        }
+        guard AXIsProcessTrusted() else {
+            return .needsAccessibilityPermission
+        }
+        setDictionaryCorrectionPromptsEnabled(true)
+        return .updated
+    }
+
+    func setDictionaryCorrectionPromptsEnabled(_ enabled: Bool) {
+        if !enabled {
+            clearPendingDictionaryCorrectionAccessibilityEnable()
+            dictationCorrectionMonitor.cancel()
+            updateConfig { $0.enableDictionaryCorrectionPrompts = false }
+            return
+        }
+        guard AXIsProcessTrusted() else {
+            dictationCorrectionMonitor.cancel()
+            updateConfig { $0.enableDictionaryCorrectionPrompts = false }
+            return
+        }
+        updateConfig { $0.enableDictionaryCorrectionPrompts = true }
+    }
+
+    @discardableResult
+    func requestDictionaryCorrectionAccessibilityEnable() -> Bool {
+        guard !AXIsProcessTrusted() else {
+            clearPendingDictionaryCorrectionAccessibilityEnable()
+            setDictionaryCorrectionPromptsEnabled(true)
+            return true
+        }
+        markPendingDictionaryCorrectionAccessibilityEnable()
+        let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+        AXIsProcessTrustedWithOptions(options)
+        return false
+    }
+
+    func cancelDictionaryCorrectionAccessibilityEnableRequest() {
+        clearPendingDictionaryCorrectionAccessibilityEnable()
+    }
+
+    @discardableResult
+    func reconcilePendingDictionaryCorrectionAccessibilityEnable(now: Date = Date()) -> Bool {
+        guard isPendingDictionaryCorrectionAccessibilityEnable else { return false }
+        guard !isPendingDictionaryCorrectionAccessibilityEnableExpired(now: now) else {
+            clearPendingDictionaryCorrectionAccessibilityEnable()
+            return false
+        }
+        guard let isPendingFromPreviousProcess = isPendingDictionaryCorrectionAccessibilityEnableFromPreviousProcess else {
+            clearPendingDictionaryCorrectionAccessibilityEnable()
+            return false
+        }
+        guard isPendingFromPreviousProcess else { return false }
+        guard AXIsProcessTrusted() else { return false }
+        clearPendingDictionaryCorrectionAccessibilityEnable()
+        setDictionaryCorrectionPromptsEnabled(true)
+        return true
+    }
+
+    private var isPendingDictionaryCorrectionAccessibilityEnable: Bool {
+        UserDefaults.standard.bool(forKey: Self.pendingDictionaryCorrectionAccessibilityEnableKey)
+    }
+
+    private func markPendingDictionaryCorrectionAccessibilityEnable(now: Date = Date()) {
+        let defaults = UserDefaults.standard
+        defaults.set(true, forKey: Self.pendingDictionaryCorrectionAccessibilityEnableKey)
+        defaults.set(now.timeIntervalSince1970, forKey: Self.pendingDictionaryCorrectionAccessibilityRequestedAtKey)
+        defaults.set(
+            Int(ProcessInfo.processInfo.processIdentifier),
+            forKey: Self.pendingDictionaryCorrectionAccessibilityRequestProcessIDKey
+        )
+    }
+
+    private func clearPendingDictionaryCorrectionAccessibilityEnable() {
+        let defaults = UserDefaults.standard
+        defaults.removeObject(forKey: Self.pendingDictionaryCorrectionAccessibilityEnableKey)
+        defaults.removeObject(forKey: Self.pendingDictionaryCorrectionAccessibilityRequestedAtKey)
+        defaults.removeObject(forKey: Self.pendingDictionaryCorrectionAccessibilityRequestProcessIDKey)
+    }
+
+    private func isPendingDictionaryCorrectionAccessibilityEnableExpired(now: Date) -> Bool {
+        let requestedAt = UserDefaults.standard.double(forKey: Self.pendingDictionaryCorrectionAccessibilityRequestedAtKey)
+        guard requestedAt > 0 else { return true }
+        return now.timeIntervalSince1970 - requestedAt > Self.dictionaryCorrectionAccessibilityIntentTimeout
+    }
+
+    private var isPendingDictionaryCorrectionAccessibilityEnableFromPreviousProcess: Bool? {
+        let defaults = UserDefaults.standard
+        guard defaults.object(forKey: Self.pendingDictionaryCorrectionAccessibilityRequestProcessIDKey) != nil else {
+            return nil
+        }
+        return defaults.integer(forKey: Self.pendingDictionaryCorrectionAccessibilityRequestProcessIDKey)
+            != Int(ProcessInfo.processInfo.processIdentifier)
+    }
+
+    @discardableResult
+    func requestScreenContextEnable() -> Bool {
+        guard AXIsProcessTrusted() else {
+            updateConfig { $0.enableScreenContext = false }
+            let options = [kAXTrustedCheckOptionPrompt.takeUnretainedValue(): true] as CFDictionary
+            AXIsProcessTrustedWithOptions(options)
+            return false
+        }
+
+        updateConfig { $0.enableScreenContext = true }
+        return true
+    }
+
+    @discardableResult
+    func updateDictationHotkey(_ hotkey: HotkeyConfig) -> ShortcutHotkeyUpdateResult {
+        let result = ShortcutHotkeyPolicy.validateDictationHotkey(
+            hotkey,
+            computerUseHotkey: config.computerUseHotkey,
+            isComputerUseEnabled: config.enableComputerUseHotkey,
+            meetingRecordingHotkey: config.meetingRecordingHotkey,
+            isMeetingRecordingEnabled: config.enableMeetingRecordingHotkey
+        )
+        guard result.didUpdate else {
+            fputs("[hotkeys] rejected dictation hotkey because it matches computer use hotkey\n", stderr)
+            return result
+        }
+        updateConfig { $0.dictationHotkey = hotkey }
+        hotkeyMonitor.configure(hotkey)
+        configureComputerUseHotkeyMonitor()
+        return result
+    }
+
+    @discardableResult
+    func updateComputerUseHotkey(_ hotkey: HotkeyConfig) -> ShortcutHotkeyUpdateResult {
+        let result = ShortcutHotkeyPolicy.validateComputerUseHotkey(
+            hotkey,
+            dictationHotkey: config.dictationHotkey,
+            isComputerUseEnabled: config.enableComputerUseHotkey,
+            meetingRecordingHotkey: config.meetingRecordingHotkey,
+            isMeetingRecordingEnabled: config.enableMeetingRecordingHotkey
+        )
+        guard result.didUpdate else {
+            fputs("[hotkeys] rejected computer use hotkey because it matches dictation hotkey\n", stderr)
+            return result
+        }
+        updateConfig { $0.computerUseHotkey = hotkey }
+        configureComputerUseHotkeyMonitor()
+        return result
+    }
+
+    @discardableResult
+    func updateComputerUseHotkeyEnabled(_ enabled: Bool) -> ShortcutHotkeyUpdateResult {
+        if enabled {
+            let resolution = ShortcutHotkeyPolicy.resolvedComputerUseHotkeyWhenEnabling(
+                currentHotkey: config.computerUseHotkey,
+                dictationHotkey: config.dictationHotkey,
+                meetingRecordingHotkey: config.meetingRecordingHotkey,
+                isMeetingRecordingEnabled: config.enableMeetingRecordingHotkey
+            )
+            guard resolution.result.didUpdate else {
+                fputs("[hotkeys] rejected computer use enable because fallback conflicts with another shortcut\n", stderr)
+                configureComputerUseHotkeyMonitor()
+                return resolution.result
+            }
+            updateConfig { config in
+                config.computerUseHotkey = resolution.hotkey
+                config.enableComputerUseHotkey = true
+            }
+            configureComputerUseHotkeyMonitor()
+            return resolution.result
+        }
+        updateConfig { $0.enableComputerUseHotkey = enabled }
+        configureComputerUseHotkeyMonitor()
+        return .updated
+    }
+
+    @discardableResult
+    func updateMeetingRecordingHotkey(_ hotkey: HotkeyConfig) -> ShortcutHotkeyUpdateResult {
+        let result = ShortcutHotkeyPolicy.validateMeetingRecordingHotkey(
+            hotkey,
+            dictationHotkey: config.dictationHotkey,
+            computerUseHotkey: config.computerUseHotkey,
+            isComputerUseEnabled: config.enableComputerUseHotkey
+        )
+        guard result.didUpdate else {
+            fputs("[hotkeys] rejected meeting recording hotkey due to conflict\n", stderr)
+            return result
+        }
+        updateConfig { $0.meetingRecordingHotkey = hotkey }
+        meetingRecordingHotkeyMonitor.configure(hotkey)
+        return result
+    }
+
+    @discardableResult
+    func updateMeetingRecordingHotkeyEnabled(_ enabled: Bool) -> ShortcutHotkeyUpdateResult {
+        if enabled {
+            let result = ShortcutHotkeyPolicy.validateMeetingRecordingHotkey(
+                config.meetingRecordingHotkey,
+                dictationHotkey: config.dictationHotkey,
+                computerUseHotkey: config.computerUseHotkey,
+                isComputerUseEnabled: config.enableComputerUseHotkey
+            )
+            guard result.didUpdate else { return result }
+            updateConfig { $0.enableMeetingRecordingHotkey = true }
+            startMeetingRecordingHotkeyMonitorIfNeeded()
+            return result
+        } else {
+            updateConfig { $0.enableMeetingRecordingHotkey = false }
+            meetingRecordingHotkeyMonitor.stop()
+            return .updated
+        }
+    }
+
+    func resetShortcutDefaults() {
+        updateConfig { config in
+            config.dictationHotkey = .default
+            config.computerUseHotkey = .computerUseDefault
+            config.enableComputerUseHotkey = false
+            config.meetingRecordingHotkey = .meetingRecordingDefault
+            config.enableMeetingRecordingHotkey = false
+            config.hotkeyTriggerThresholdMS = HotkeyTriggerTiming.defaultThresholdMilliseconds
+            config.computerUseHotkeyTriggerThresholdMS = HotkeyTriggerTiming.defaultThresholdMilliseconds
+            config.meetingRecordingHotkeyTriggerThresholdMS = HotkeyTriggerTiming.defaultMeetingThresholdMilliseconds
+        }
+        hotkeyMonitor.configure(.default)
+        configureComputerUseHotkeyMonitor()
+        meetingRecordingHotkeyMonitor.stop()
+    }
+
+    // MARK: - Onboarding
+
+    func showOnboarding(resumeFrom progress: OnboardingProgress? = nil) {
+        let wc = OnboardingWindowController(controller: self, resumeProgress: progress)
+        self.onboardingWindowController = wc
+        // Onboarding is a regular Dock window; count it so the app switches
+        // from the accessory menu-bar policy to .regular while the wizard is up.
+        noteWindowOpened()
+        wc.show()
+    }
+
+    @MainActor
+    func bringOnboardingToFront() {
+        onboardingWindowController?.bringToFront()
+    }
+
+    @MainActor
+    func yieldOnboardingFocusToSystemSettings() {
+        onboardingWindowController?.yieldFocusToSystemSettings()
+    }
+
+    @MainActor
+    func prepareOnboardingForNativePermissionPrompt() {
+        onboardingWindowController?.prepareForNativePermissionPrompt()
+    }
+
+    @MainActor
+    func notifyOnboardingModelReady() {
+        guard onboardingWindowController != nil else { return }
+        SoundController.playModelReady(enabled: config.soundEnabled)
+        bringOnboardingToFront()
+    }
+
+    func continueModelPreparationAfterOnboarding(
+        _ backend: BackendOption,
+        onboardingUseCase: OnboardingUseCase,
+        initialProgress: Double?,
+        initialStatus: String?,
+        isPreparing: Bool
+    ) {
+        onboardingModelPreparationTask?.cancel()
+        updateModelPreparationStatus(
+            title: "Preparing \(backend.label)",
+            detail: initialStatus ?? "Preparing \(backend.label)...",
+            progress: initialProgress,
+            isPreparing: isPreparing,
+            isComplete: false
+        )
+
+        onboardingModelPreparationTask = Task { [weak self] in
+            guard let self else { return }
+            do {
+                try await self.downloadModelForOnboarding(
+                    backend,
+                    onboardingUseCase: onboardingUseCase
+                ) { progress, status in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        self.applyModelPreparationProgress(
+                            progress,
+                            status: status,
+                            backend: backend
+                        )
+                    }
+                }
+                await MainActor.run {
+                    self.onboardingModelPreparationTask = nil
+                    self.updateModelPreparationStatus(
+                        title: "\(backend.label) ready",
+                        detail: "Ready for transcription",
+                        progress: 1.0,
+                        isPreparing: false,
+                        isComplete: true
+                    )
+                    SoundController.playModelReady(enabled: self.config.soundEnabled)
+                    self.statusBarController?.refresh()
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    self.onboardingModelPreparationTask = nil
+                }
+            } catch {
+                await MainActor.run {
+                    self.onboardingModelPreparationTask = nil
+                    self.updateModelPreparationStatus(
+                        title: backend.isDownloaded ? "Model setup paused" : "Download paused",
+                        detail: self.modelPreparationFailureMessage(for: backend),
+                        progress: nil,
+                        isPreparing: false,
+                        isComplete: false
+                    )
+                }
+                fputs("[muesli-native] post-onboarding model preparation failed: \(error)\n", stderr)
+            }
+        }
+    }
+
+    func relaunchApp() {
+        let bundlePath = Bundle.main.bundleURL.path
+        // Defer to next run-loop to escape any SwiftUI animation context
+        DispatchQueue.main.async {
+            // Launch a detached process that waits for us to die, then reopens the app.
+            // Uses /bin/sh only for the sleep; the path is passed as a positional arg
+            // to avoid shell interpolation of special characters.
+            let shell = Process()
+            shell.executableURL = URL(fileURLWithPath: "/bin/sh")
+            shell.arguments = ["-c", "sleep 1; open -- \"$1\"", "--", bundlePath]
+            do {
+                try shell.run()
+            } catch {
+                fputs("[muesli-native] relaunch failed: \(error)\n", stderr)
+            }
+            // Use exit(0) instead of NSApp.terminate(nil) — terminate can be
+            // blocked by SwiftUI animation contexts or applicationShouldTerminate,
+            // leaving the old process alive with stale floating indicator and
+            // status bar icon.
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) {
+                exit(0)
+            }
+        }
+    }
+
+    // MARK: - Dictation Test Mode (onboarding)
+
+    /// When set, handleStop routes transcribed text to this callback instead of pasting.
+    /// The floating indicator and sounds are suppressed during test mode.
+    var dictationTestCallback: ((String) -> Void)?
+    var dictationTestFailureCallback: ((String) -> Void)?
+    var dictationTestRecordingStarted: (() -> Void)?
+    var dictationTestBackend: BackendOption?
+    var dictationTestCohereLanguage: CohereTranscribeLanguage?
+    private var dictationTestTask: Task<Void, Never>?
+
+    var isDictationTestMode: Bool { dictationTestCallback != nil }
+
+    func cancelTestDictation() {
+        dictationTestTask?.cancel()
+        dictationTestTask = nil
+        dictationAudioSessionManager.cancel(reason: "test-cancel")
+        setState(.idle)
+    }
+
+    func startHotkeyMonitor(keyCode: UInt16? = nil) {
+        if let keyCode {
+            hotkeyMonitor.configure(keyCode: keyCode)
+        }
+        hotkeyMonitor.start()
+        startComputerUseHotkeyMonitorIfNeeded()
+    }
+
+    func stopHotkeyMonitor() {
+        hotkeyMonitor.stop()
+        computerUseHotkeyMonitor.stop()
+        meetingRecordingHotkeyMonitor.stop()
+    }
+
+    func downloadModelForOnboarding(
+        _ backend: BackendOption,
+        onboardingUseCase: OnboardingUseCase,
+        progress: @escaping (Double, String?) -> Void
+    ) async throws {
+        let wasDownloaded = backend.isDownloaded
+        progress(
+            wasDownloaded ? 0.75 : 0.0,
+            wasDownloaded ? "Warming up \(backend.label)..." : "Downloading \(backend.label)..."
+        )
+        try await transcriptionCoordinator.preloadRequired(
+            backend: backend,
+            enablePostProcessor: isPostProcessorReady,
+            includeMeetingHelpers: onboardingUseCase.includesMeetings,
+            progress: { value, status in
+                if wasDownloaded,
+                   value < 0.85,
+                   status?.localizedCaseInsensitiveContains("preparing") == true {
+                    return
+                }
+                if status?.localizedCaseInsensitiveContains("download") == true {
+                    progress(value, "\(status ?? "Downloading \(backend.label)...")")
+                } else if value >= 0.9 {
+                    progress(value, status ?? "Warming up \(backend.label)...")
+                } else {
+                    progress(value, status ?? "Preparing \(backend.label)...")
+                }
+            }
+        )
+        guard backend.isDownloaded else {
+            throw NSError(
+                domain: "MuesliOnboardingModelDownload",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey: "\(backend.label) was not downloaded successfully."]
+            )
+        }
+        progress(1.0, "\(backend.label) ready")
+    }
+
+    private func applyModelPreparationProgress(_ progress: Double, status: String?, backend: BackendOption) {
+        let detail = status ?? "Preparing \(backend.label)..."
+        let lowercasedDetail = detail.lowercased()
+        let isPreparing = lowercasedDetail.contains("compiling")
+            || lowercasedDetail.contains("warming")
+            || lowercasedDetail.contains("readying")
+
+        if isPreparing {
+            updateModelPreparationStatus(
+                title: "Preparing \(backend.label)",
+                detail: "Optimizing \(backend.label) for this Mac...",
+                progress: nil,
+                isPreparing: true,
+                isComplete: false
+            )
+            return
+        }
+
+        updateModelPreparationStatus(
+            title: "Preparing \(backend.label)",
+            detail: detail,
+            progress: progress,
+            isPreparing: false,
+            isComplete: false
+        )
+    }
+
+    private func updateModelPreparationStatus(
+        title: String,
+        detail: String?,
+        progress: Double?,
+        isPreparing: Bool,
+        isComplete: Bool
+    ) {
+        appState.modelPreparationTitle = title
+        appState.modelPreparationDetail = detail
+        appState.modelPreparationProgress = progress.map { min(max($0, 0), 1) }
+        appState.isModelPreparingAfterDownload = isPreparing
+        appState.modelPreparationIsComplete = isComplete
+        if isComplete {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(5))
+                guard appState.modelPreparationTitle == title,
+                      appState.modelPreparationIsComplete else { return }
+                appState.modelPreparationTitle = nil
+                appState.modelPreparationDetail = nil
+                appState.modelPreparationProgress = nil
+                appState.isModelPreparingAfterDownload = false
+                appState.modelPreparationIsComplete = false
+            }
+        } else if !isPreparing && progress == nil {
+            Task { @MainActor in
+                try? await Task.sleep(for: .seconds(12))
+                guard appState.modelPreparationTitle == title,
+                      appState.modelPreparationProgress == nil,
+                      !appState.isModelPreparingAfterDownload,
+                      !appState.modelPreparationIsComplete else { return }
+                appState.modelPreparationTitle = nil
+                appState.modelPreparationDetail = nil
+            }
+        }
+    }
+
+    private func modelPreparationFailureMessage(for backend: BackendOption) -> String {
+        backend.isDownloaded
+            ? "Model setup failed. Restart Homan or retry from Models."
+            : "Download failed. Check your connection and retry."
+    }
+
+    func completeOnboarding(
+        userName: String,
+        backend: BackendOption,
+        cohereLanguage: CohereTranscribeLanguage,
+        hotkey: HotkeyConfig,
+        onboardingUseCase: OnboardingUseCase,
+        summaryBackend: MeetingSummaryBackendOption?,
+        apiKey: String?,
+        ollamaURL: String? = nil,
+        ollamaAPIKey: String? = nil,
+        gemmaSummaryModel: String? = nil
+    ) {
+        updateConfig { config in
+            config.hasCompletedOnboarding = true
+            config.userName = userName
+            config.sttBackend = backend.backend
+            config.sttModel = backend.model
+            config.cohereLanguage = cohereLanguage.rawValue
+            config.meetingTranscriptionBackend = backend.backend
+            config.meetingTranscriptionModel = backend.model
+            config.dictationHotkey = hotkey
+            config.computerUseHotkey = HotkeyConfig.computerUseDefault(avoiding: hotkey)
+            config.enableComputerUseHotkey = false
+            config.enableComputerUsePlanner = false
+            config.onboardingUseCase = onboardingUseCase.rawValue
+            if let summaryBackend {
+                config.meetingSummaryBackend = summaryBackend.backend
+            }
+            if let gemmaSummaryModel, !gemmaSummaryModel.isEmpty {
+                config.gemmaSummaryModel = gemmaSummaryModel
+            }
+            if let apiKey, !apiKey.isEmpty {
+                if summaryBackend == .openAI {
+                    config.openAIAPIKey = apiKey
+                } else if summaryBackend == .openRouter {
+                    config.openRouterAPIKey = apiKey
+                }
+                // ChatGPT backend uses OAuth tokens stored in app support dir, not an API key
+            }
+            if summaryBackend == .ollama {
+                if let ollamaURL, !ollamaURL.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                    config.ollamaURL = ollamaURL.trimmingCharacters(in: .whitespacesAndNewlines)
+                }
+                if let ollamaAPIKey {
+                    config.ollamaAPIKey = ollamaAPIKey
+                }
+            }
+        }
+        selectBackend(backend)
+        hotkeyMonitor.configure(keyCode: hotkey.keyCode)
+        configureComputerUseHotkeyMonitor()
+        dictationTestCallback = nil
+        dictationTestFailureCallback = nil
+        dictationTestRecordingStarted = nil
+        dictationTestBackend = nil
+        dictationTestCohereLanguage = nil
+
+        onboardingWindowController?.close()
+        onboardingWindowController = nil
+        noteWindowClosed()
+        if hasRequiredStartupPermissions(for: onboardingUseCase) {
+            meetingFeatureMonitorsAllowed = true
+            if onboardingUseCase.includesPushToTalk {
+                hotkeyMonitor.start()
+                startComputerUseHotkeyMonitorIfNeeded()
+            }
+            syncCalendarMonitor()
+            // Start monitors that were deferred during onboarding
+            if shouldRunMeetingFeatureMonitors {
+                startMeetingFeatureMonitors(includeMaraudersMap: false)
+            }
+            TelemetryDeck.signal("onboarding.completed", parameters: [
+                "use_case": onboardingUseCase.rawValue,
+                "voice_notes_selected": onboardingUseCase.includesVoiceNotes ? "true" : "false",
+                "dictation_selected": onboardingUseCase.includesDictation ? "true" : "false",
+                "meetings_selected": onboardingUseCase.includesMeetings ? "true" : "false",
+                "microphone_granted": AVCaptureDevice.authorizationStatus(for: .audio) == .authorized ? "true" : "false",
+                "accessibility_granted": AXIsProcessTrusted() ? "true" : "false",
+                "input_monitoring_granted": CGPreflightListenEventAccess() ? "true" : "false",
+            ])
+            let completionTab = OnboardingFlow.completionTab(for: onboardingUseCase)
+            openHistoryWindow(tab: completionTab)
+        } else {
+            showOnboarding(resumeFrom: onboardingProgressForPermissionRepair())
+        }
+    }
+
+    @objc func openHistoryWindow() {
+        guard ensureBasicDictationPermissionsBeforeDashboard() else { return }
+        showActiveMeetingDocumentIfNeeded()
+        presentHistoryWindow()
+    }
+
+    private func presentHistoryWindow() {
+        DispatchQueue.main.async { [weak self] in
+            self?.historyWindowController?.show()
+        }
+    }
+
+    func openHistoryWindow(tab: DashboardTab) {
+        guard ensureBasicDictationPermissionsBeforeDashboard() else { return }
+        presentHistoryWindow(tab: tab)
+    }
+
+    private func presentHistoryWindow(tab: DashboardTab) {
+        appState.selectedTab = tab
+        syncAppState()
+        DispatchQueue.main.async { [weak self] in
+            self?.historyWindowController?.show()
+        }
+    }
+
+    private func hasRequiredStartupPermissions(for useCase: OnboardingUseCase) -> Bool {
+        OnboardingPermissionGate.hasRequiredPermissions(
+            OnboardingPermissionSnapshot(
+                microphone: AVCaptureDevice.authorizationStatus(for: .audio) == .authorized,
+                accessibility: AXIsProcessTrusted(),
+                inputMonitoring: CGPreflightListenEventAccess(),
+                systemAudio: false,
+                screenRecording: false
+            ),
+            for: useCase
+        )
+    }
+
+    func reclassifyVoiceNotesAsDictationIfReady(
+        microphoneGranted: Bool,
+        accessibilityGranted: Bool,
+        inputMonitoringGranted: Bool
+    ) {
+        guard config.resolvedOnboardingUseCase == .voiceNotes else { return }
+        guard OnboardingPermissionGate.hasRequiredDictationPermissions(
+            OnboardingPermissionSnapshot(
+                microphone: microphoneGranted,
+                accessibility: accessibilityGranted,
+                inputMonitoring: inputMonitoringGranted,
+                systemAudio: false,
+                screenRecording: false
+            )
+        ) else { return }
+
+        updateConfig { $0.onboardingUseCase = OnboardingUseCase.dictation.rawValue }
+        hotkeyMonitor.configure(keyCode: config.dictationHotkey.keyCode)
+        hotkeyMonitor.start()
+        startComputerUseHotkeyMonitorIfNeeded()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.permissionsReady))
+        TelemetryDeck.signal("onboarding.use_case_reclassified", parameters: [
+            "from_use_case": OnboardingUseCase.voiceNotes.rawValue,
+            "to_use_case": OnboardingUseCase.dictation.rawValue,
+            "reason": "dictation_permissions_granted",
+        ])
+    }
+
+    private func ensureBasicDictationPermissionsBeforeDashboard() -> Bool {
+        guard hasRequiredStartupPermissions(for: config.resolvedOnboardingUseCase) else {
+            historyWindowController?.close()
+            if let progress = OnboardingProgress.load() {
+                showOnboarding(resumeFrom: progress)
+            } else {
+                showOnboarding(resumeFrom: onboardingProgressForPermissionRepair())
+            }
+            return false
+        }
+        return true
+    }
+
+    private func onboardingProgressForPermissionRepair() -> OnboardingProgress {
+        OnboardingProgress(
+            currentStep: OnboardingView.permissionsStep,
+            userName: config.userName,
+            selectedBackendKey: config.sttBackend,
+            selectedModelKey: config.sttModel,
+            selectedCohereLanguageCode: config.cohereLanguage,
+            hotkeyKeyCode: config.dictationHotkey.keyCode,
+            hotkeyLabel: config.dictationHotkey.label,
+            systemAudioRequested: false,
+            onboardingUseCaseRawValue: config.onboardingUseCase
+        )
+    }
+
+    func showMeetingsHome(folderID: Int64? = nil) {
+        appState.selectedTab = .meetings
+        appState.selectedFolderID = folderID
+        appState.meetingsNavigationState = .browser
+        syncAppState()
+    }
+
+    func showMeetingDocument(id: Int64) {
+        appState.selectedTab = .meetings
+        appState.selectedMeetingID = id
+        appState.selectedMeetingRecord = meeting(id: id)
+        appState.meetingsNavigationState = .document(id)
+    }
+
+    private func showActiveMeetingDocumentIfNeeded() {
+        guard let activeMeetingID,
+              isMeetingRecording() || isStartingMeetingRecording else {
+            return
+        }
+        showMeetingDocument(id: activeMeetingID)
+    }
+
+    func openActiveMeetingNotes() {
+        guard ensureBasicDictationPermissionsBeforeDashboard() else { return }
+        guard let activeMeetingID,
+              isMeetingRecording() || isStartingMeetingRecording else { return }
+        showMeetingDocument(id: activeMeetingID)
+        appState.meetingNotesFocusRequest &+= 1
+        presentHistoryWindow()
+    }
+
+    func showMeetingTemplatesManager() {
+        appState.selectedTab = .meetings
+        appState.isMeetingTemplatesManagerPresented = true
+    }
+
+    @objc func openPreferences() {
+        openHistoryWindow(tab: .settings)
+    }
+
+    @objc func openSettingsTab() {
+        openHistoryWindow(tab: .settings)
+    }
+
+    @objc func focusSearchField() {
+        guard ensureBasicDictationPermissionsBeforeDashboard() else { return }
+        presentHistoryWindow()
+        DispatchQueue.main.async { [weak self] in
+            self?.appState.focusSearchField = true
+        }
+    }
+
+    @objc func checkForUpdates() {
+        presentStandardUpdateCheck()
+    }
+
+    private func presentStandardUpdateCheck() {
+        guard let updaterController else {
+            appState.sparkleUpdateStatus = .disabled(message: "Update checks are disabled for this build.")
+            return
+        }
+        let existingWindows = Set(NSApplication.shared.windows.map(ObjectIdentifier.init))
+        activateApplicationForSparkle()
+        // Always enter Sparkle's standard path. Sparkle uses this same call to
+        // refocus existing updater UI, so local availability gates would make
+        // in-app buttons less reliable than the status-bar action.
+        updaterController.checkForUpdates(nil)
+        focusUpdaterWindowsCreatedAfterUpdateAction(excluding: existingWindows)
+    }
+
+    private func focusUpdaterWindowsCreatedAfterUpdateAction(excluding existingWindows: Set<ObjectIdentifier>) {
+        for delay in [80_000_000, 240_000_000, 600_000_000, 1_200_000_000, 2_500_000_000] {
+            Task { @MainActor [weak self] in
+                try? await Task.sleep(nanoseconds: UInt64(delay))
+                self?.focusUpdaterWindows(excluding: existingWindows)
+            }
+        }
+    }
+
+    private func focusUpdaterWindows(excluding existingWindows: Set<ObjectIdentifier>) {
+        let updaterWindows = NSApplication.shared.windows.filter { window in
+            guard window.isVisible else { return false }
+            return !existingWindows.contains(ObjectIdentifier(window)) && isLikelyUpdaterWindow(window)
+        }
+        guard !updaterWindows.isEmpty else { return }
+
+        activateApplicationForSparkle()
+        for window in updaterWindows {
+            window.makeKeyAndOrderFront(nil)
+        }
+    }
+
+    private func isLikelyUpdaterWindow(_ window: NSWindow) -> Bool {
+        let className = String(describing: type(of: window))
+        if className.localizedCaseInsensitiveContains("SPU") ||
+            className.localizedCaseInsensitiveContains("SU") ||
+            className.localizedCaseInsensitiveContains("Sparkle") {
+            return true
+        }
+
+        // Sparkle's standard UI can present through AppKit alert/window
+        // classes. Keep this semantic fallback narrow and only apply it to
+        // windows created after the update action.
+        let title = window.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !title.isEmpty else { return false }
+        if title.localizedCaseInsensitiveContains("update") ||
+            title.localizedCaseInsensitiveContains("updater") ||
+            title.localizedCaseInsensitiveContains("new version") ||
+            title.localizedCaseInsensitiveContains("available") {
+            return true
+        }
+        return false
+    }
+
+    private func showBusyStatus(_ message: String, restoring previousStatus: SparkleUpdateStatus) {
+        busyStatusGeneration += 1
+        let generation = busyStatusGeneration
+        let restoreStatus = nonBusyStatus(previousStatus)
+        appState.sparkleUpdateStatus = .busy(message: message)
+
+        Task { @MainActor [weak self] in
+            try? await Task.sleep(nanoseconds: 5_000_000_000)
+            guard let self, self.busyStatusGeneration == generation else { return }
+            guard case .busy = self.appState.sparkleUpdateStatus else { return }
+            self.appState.sparkleUpdateStatus = restoreStatus
+        }
+    }
+
+    private func nonBusyStatus(_ status: SparkleUpdateStatus) -> SparkleUpdateStatus {
+        if case .busy = status {
+            return .idle
+        }
+        return status
+    }
+
+    @MainActor
+    private func activateApplicationForSparkle() {
+        // Sparkle UI is opened from an LSUIElement menu-bar app. This is a
+        // user-initiated update action, so use strong activation even though
+        // AppKit deprecated the argumented API on macOS 14.
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    @objc func quitApp() {
+        NSApplication.shared.terminate(nil)
+    }
+
+    @objc func copyRecentDictation(_ sender: NSMenuItem) {
+        if let text = sender.representedObject as? String {
+            copyToClipboard(text)
+        }
+    }
+
+    @objc func copyRecentMeeting(_ sender: NSMenuItem) {
+        if let text = sender.representedObject as? String {
+            copyToClipboard(text)
+        }
+    }
+
+    @objc func selectBackendFromMenu(_ sender: NSMenuItem) {
+        guard let label = sender.representedObject as? String,
+              let option = BackendOption.all.first(where: { $0.label == label }) else { return }
+        selectBackend(option)
+    }
+
+    @objc func selectMeetingSummaryBackendFromMenu(_ sender: NSMenuItem) {
+        guard let label = sender.representedObject as? String,
+              let option = MeetingSummaryBackendOption.all.first(where: { $0.label == label }) else { return }
+        if option == .chatGPT, !chatGPTAuth.isAuthenticated {
+            Task { await signInWithChatGPT() }
+            return
+        }
+        selectMeetingSummaryBackend(option)
+    }
+
+    func resummarize(
+        meeting: MeetingRecord,
+        summaryBackend: MeetingSummaryBackendOption? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        let templateSnapshot = meetingTemplateSnapshot(for: meeting)
+        resummarize(
+            meeting: meeting,
+            using: templateSnapshot,
+            summaryBackend: summaryBackend,
+            completion: completion
+        )
+    }
+
+    func applyMeetingTemplate(
+        id: String,
+        to meeting: MeetingRecord,
+        summaryBackend: MeetingSummaryBackendOption? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        guard let templateSnapshot = MeetingTemplates.resolveExactSnapshot(
+            id: id,
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        ) else {
+            completion(.failure(MeetingTemplateSelectionError.templateNoLongerExists))
+            return
+        }
+        resummarize(
+            meeting: meeting,
+            using: templateSnapshot,
+            summaryBackend: summaryBackend,
+            completion: completion
+        )
+    }
+
+    private func resummarize(
+        meeting: MeetingRecord,
+        using templateSnapshot: MeetingTemplateSnapshot,
+        summaryBackend: MeetingSummaryBackendOption?,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        Task { [weak self] in
+            guard let self else { return }
+            let plan = MeetingResummarizationPolicy.plan(for: meeting)
+            let runConfig = Self.configForOneTimeSummary(
+                baseConfig: self.config,
+                backend: summaryBackend
+            )
+            do {
+                let summaryStartedAt = Date()
+                let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
+                    transcript: meeting.rawTranscript,
+                    meetingTitle: plan.promptTitle,
+                    config: runConfig,
+                    template: templateSnapshot,
+                    manualNotesToRetain: meeting.manualNotes
+                )
+                let processingMetadata = MeetingProcessingMetadata(
+                    transcription: meeting.processingMetadata.transcription,
+                    summary: MeetingProcessingMetadataFactory.summary(
+                        config: runConfig,
+                        startedAt: summaryStartedAt,
+                        thinkingStatus: summaryResult.thinkingStatus
+                    ),
+                    manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
+                )
+                try self.dictationStore.updateMeetingSummary(
+                    id: meeting.id,
+                    title: plan.persistedTitle,
+                    formattedNotes: summaryResult.notes,
+                    selectedTemplateID: templateSnapshot.id,
+                    selectedTemplateName: templateSnapshot.name,
+                    selectedTemplateKind: templateSnapshot.kind,
+                    selectedTemplatePrompt: templateSnapshot.prompt,
+                    processingMetadata: processingMetadata
+                )
+                await MainActor.run {
+                    self.scheduleICloudSyncAfterLocalChange()
+                    self.syncAppState()
+                    self.historyWindowController?.reload()
+                    completion(.success(()))
+                }
+            } catch {
+                fputs("[muesli-native] failed to generate or persist meeting summary: \(error)\n", stderr)
+                await MainActor.run {
+                    if error is MeetingSummaryError {
+                        completion(.failure(error))
+                    } else {
+                        completion(.failure(MeetingSummaryPersistenceError.failedToSaveSummary(underlying: error)))
+                    }
+                }
+            }
+        }
+    }
+
+    func retranscribe(
+        meeting: MeetingRecord,
+        using requestedBackend: BackendOption? = nil,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                completion(.failure(MeetingRetranscriptionError.controllerUnavailable))
+                return
+            }
+            defer {
+                // A previously deferred expiry can now acquire its deletion
+                // lease after the pipeline has released every source reader.
+                self.performRetentionCleanup()
+            }
+            var didSetProcessing = false
+            do {
+                let recordingUnits = try MeetingRecordingUnitResolver.resolve(
+                    meetingID: meeting.id,
+                    store: self.dictationStore,
+                    supportDirectory: self.configStore.supportDirectory()
+                )
+                guard !recordingUnits.isEmpty else {
+                    throw MeetingRetranscriptionError.recordingUnavailable
+                }
+                guard recordingUnits.contains(where: { $0.hasUsableAudio(onDisk: .default) }) else {
+                    throw MeetingRetranscriptionError.recordingUnavailable
+                }
+                let backend: BackendOption
+                if let requestedBackend {
+                    let isReady = requestedBackend.capabilitiesExecutionLocation == .cloud
+                        ? !self.config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                        : requestedBackend.isDownloaded
+                    guard requestedBackend.supportsMeetingTranscription, isReady else {
+                        throw MeetingRetranscriptionError.noDownloadedTranscriptionModel
+                    }
+                    backend = requestedBackend
+                } else {
+                    guard let configuredBackend = self.normalizeMeetingTranscriptionSelectionForAvailability() else {
+                        throw MeetingRetranscriptionError.noDownloadedTranscriptionModel
+                    }
+                    backend = configuredBackend
+                }
+
+                try self.updateMeetingStatusAndScheduleSyncThrowing(id: meeting.id, status: .processing)
+                didSetProcessing = true
+                self.syncAppState()
+                self.historyWindowController?.reload()
+
+                let transcriptionStartedAt = Date()
+                if backend.backend == BackendOption.homanWhisper.backend {
+                    try await self.transcriptionCoordinator.configureHomanWhisper(
+                        endpointString: self.config.homanWhisperEndpoint,
+                        apiKey: self.config.homanWhisperAPIKey
+                    )
+                }
+                try await self.transcriptionCoordinator.preloadRequired(
+                    backend: backend,
+                    enablePostProcessor: false,
+                    includeMeetingHelpers: true
+                )
+                if backend.backend == BackendOption.nemotron35Multilingual.backend {
+                    await self.transcriptionCoordinator.setNemotron35PromptId(
+                        self.config.resolvedNemotron35Language.promptId
+                    )
+                }
+                let transcription: MeetingTranscriptionResult
+                do {
+                    transcription = try await MeetingTranscriptionPipeline(
+                        coordinator: self.transcriptionCoordinator
+                    ).process(MeetingTranscriptionRequest(
+                        units: recordingUnits,
+                        backend: backend,
+                        languages: MeetingLanguageSnapshot(
+                            cohereLanguage: self.config.resolvedCohereLanguage.rawValue,
+                            indicASRLanguage: self.config.resolvedIndicASRLanguage.rawValue,
+                            nemotron35Language: self.config.resolvedNemotron35Language.rawValue
+                        ),
+                        purpose: .retranscribe,
+                        systemDiarization: .optionalPost,
+                        aecModel: self.config.resolvedMeetingAecModel
+                    ))
+                } catch MeetingTranscriptionPipelineError.emptyTranscript {
+                    throw MeetingRetranscriptionError.emptyTranscript
+                } catch MeetingTranscriptionPipelineError.noUsableAudio {
+                    throw MeetingRetranscriptionError.recordingUnavailable
+                } catch MeetingTranscriptionPipelineError.noRecordingUnits {
+                    throw MeetingRetranscriptionError.recordingUnavailable
+                }
+                let rawTranscript = transcription.formattedTranscript
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                guard !rawTranscript.isEmpty else {
+                    throw MeetingRetranscriptionError.emptyTranscript
+                }
+                let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
+                    backend: backend,
+                    startedAt: transcriptionStartedAt
+                )
+
+                let templateSnapshot = MeetingTemplates.snapshot(
+                    for: meeting,
+                    customTemplates: self.config.customMeetingTemplates,
+                    builtInOverrides: self.config.builtInMeetingTemplateOverrides
+                )
+                let formattedNotes: String
+                var summaryMetadata: MeetingProcessingRunMetadata?
+                let summaryStartedAt = Date()
+                do {
+                    let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
+                        transcript: rawTranscript,
+                        meetingTitle: meeting.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ? "Meeting" : meeting.title,
+                        config: self.config,
+                        template: templateSnapshot,
+                        manualNotesToRetain: meeting.manualNotes
+                    )
+                    formattedNotes = summaryResult.notes
+                    summaryMetadata = MeetingProcessingMetadataFactory.summary(
+                        config: self.config,
+                        startedAt: summaryStartedAt,
+                        thinkingStatus: summaryResult.thinkingStatus
+                    )
+                } catch {
+                    fputs("[muesli-native] re-transcription summary generation failed: \(error)\n", stderr)
+                    formattedNotes = MeetingSummaryClient.summaryFailureNotes(
+                        transcript: rawTranscript,
+                        meetingTitle: meeting.title,
+                        error: error,
+                        manualNotes: meeting.manualNotes
+                    )
+                }
+
+                do {
+                    try self.dictationStore.updateMeetingTranscriptAndSummary(
+                        id: meeting.id,
+                        rawTranscript: rawTranscript,
+                        formattedNotes: formattedNotes,
+                        selectedTemplateID: templateSnapshot.id,
+                        selectedTemplateName: templateSnapshot.name,
+                        selectedTemplateKind: templateSnapshot.kind,
+                        selectedTemplatePrompt: templateSnapshot.prompt,
+                        processingMetadata: MeetingProcessingMetadata(
+                            transcription: transcriptionMetadata,
+                            summary: summaryMetadata,
+                            manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
+                        )
+                    )
+                } catch {
+                    throw MeetingRetranscriptionError.failedToSave(underlying: error)
+                }
+
+                self.scheduleICloudSyncAfterLocalChange()
+                self.syncAppState()
+                self.historyWindowController?.reload()
+                completion(.success(()))
+            } catch {
+                fputs("[muesli-native] failed to re-transcribe meeting \(meeting.id): \(error)\n", stderr)
+                if let status = Self.retranscriptionFailureStatus(
+                    originalStatus: meeting.status,
+                    didSetProcessing: didSetProcessing,
+                    error: error
+                ) {
+                    self.updateMeetingStatusAndScheduleSync(id: meeting.id, status: status)
+                }
+                self.syncAppState()
+                self.historyWindowController?.reload()
+                completion(.failure(error))
+            }
+        }
+    }
+
+    static func retranscriptionFailureStatus(
+        originalStatus: MeetingStatus,
+        didSetProcessing: Bool,
+        error: Error
+    ) -> MeetingStatus? {
+        guard didSetProcessing else { return nil }
+        if let retranscriptionError = error as? MeetingRetranscriptionError {
+            switch retranscriptionError {
+            case .emptyTranscript, .failedToSave:
+                return originalStatus
+            case .controllerUnavailable, .recordingUnavailable, .noDownloadedTranscriptionModel:
+                break
+            }
+        }
+        return .failed
+    }
+
+    func hasRecoverableMeetingAudio(meetingID: Int64) -> Bool {
+        MeetingRawAudioCapture.hasRecoverableSession(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        ) || MeetingProcessingCapture.hasRecoverableSession(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        )
+    }
+
+    func recoverableMeetingAudioSizeLabel(meetingID: Int64) -> String {
+        let bytes = MeetingRawAudioCapture.recoverableByteCount(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        ) + MeetingProcessingCapture.recoverableByteCount(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        )
+        return ByteCountFormatter.string(fromByteCount: bytes, countStyle: .file)
+    }
+
+    func retryMeetingFinalProcessing(
+        meetingID: Int64,
+        presentErrors: Bool = true
+    ) {
+        let stagedRawAudio = MeetingRawAudioCapture.recoverableSessions(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        ).first
+        let legacyStagedAudio = MeetingProcessingCapture.recoverableSessions(
+            meetingID: meetingID,
+            supportDirectory: processingSupportDirectory
+        ).first
+        guard !meetingRecoveryInFlightIDs.contains(meetingID),
+              let meeting = meeting(id: meetingID),
+              stagedRawAudio != nil || legacyStagedAudio != nil else {
+            return
+        }
+        meetingRecoveryInFlightIDs.insert(meetingID)
+        updateMeetingStatusAndScheduleSync(id: meetingID, status: .processing)
+        syncAppState()
+        historyWindowController?.reload()
+
+        let templateSnapshot = MeetingTemplates.snapshot(
+            for: meeting,
+            customTemplates: config.customMeetingTemplates,
+            builtInOverrides: config.builtInMeetingTemplateOverrides
+        )
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            var activeStagedAudio = legacyStagedAudio
+            var activeRawAudio = stagedRawAudio
+            do {
+                if var rawAudio = activeRawAudio {
+                    rawAudio = try MeetingRawAudioCapture.markProcessing(
+                        rawAudio
+                    )
+                    activeRawAudio = rawAudio
+                    if let oldDerived = legacyStagedAudio,
+                       oldDerived.manifest.sessionID == rawAudio.manifest.sessionID {
+                        MeetingProcessingCapture.discard(oldDerived)
+                    }
+                    activeStagedAudio = try await MeetingRawAudioPostProcessor
+                        .prepare(
+                            rawAudio,
+                            aec: MeetingNeuralAec(
+                                localVQEModel: self.config.resolvedMeetingAecModel
+                            ),
+                            supportDirectory: self.processingSupportDirectory
+                        )
+                }
+                guard let stagedAudio = activeStagedAudio else {
+                    throw MeetingFinalProcessingError.noCapturedAudio
+                }
+                let recovered = try await MeetingFinalProcessingService.process(
+                    stagedAudio: stagedAudio,
+                    meeting: meeting,
+                    config: self.config,
+                    templateSnapshot: templateSnapshot,
+                    coordinator: self.transcriptionCoordinator
+                )
+                let isResume = !meeting.rawTranscript
+                    .trimmingCharacters(in: .whitespacesAndNewlines)
+                    .isEmpty
+                if isResume {
+                    self.pendingResumePriorTranscript[meetingID] = meeting.rawTranscript
+                }
+                let retainedRecordingURL: URL?
+                let retainedRecordingError: Error?
+                if self.config.meetingRecordingSavePolicy == .never {
+                    retainedRecordingURL = nil
+                    retainedRecordingError = nil
+                } else {
+                    do {
+                        let staged = recovered.stagedAudio
+                        let rawForPlayback = activeRawAudio
+                        retainedRecordingURL = try await Task.detached(
+                            priority: .utility
+                        ) {
+                            if let rawForPlayback {
+                                let rendered = try MeetingRawAudioRenderer
+                                    .renderForProcessing(rawForPlayback)
+                                defer { rendered.removeTemporaryFiles() }
+                                return try MeetingRecordingWriter
+                                    .makeTemporarySeparatedRecording(
+                                        microphoneURL: rendered.microphoneURL,
+                                        systemURL: rendered.systemURL
+                                    )
+                            }
+                            return try MeetingRecordingWriter.makeTemporarySeparatedRecording(
+                                microphoneURL: staged.manifest.microphoneSampleCount > 0
+                                    ? staged.microphoneURL
+                                    : nil,
+                                systemURL: staged.manifest.systemSampleCount > 0
+                                    ? staged.systemURL
+                                    : nil
+                            )
+                        }.value
+                        retainedRecordingError = nil
+                    } catch {
+                        retainedRecordingURL = nil
+                        retainedRecordingError = error
+                    }
+                }
+                let result = MeetingSessionResult(
+                    title: recovered.title,
+                    originalTitle: meeting.title,
+                    calendarEventID: meeting.calendarEventID,
+                    startTime: recovered.startTime,
+                    endTime: recovered.endTime,
+                    durationSeconds: recovered.durationSeconds,
+                    rawTranscript: recovered.rawTranscript,
+                    formattedNotes: recovered.formattedNotes,
+                    retainedRecordingURL: retainedRecordingURL,
+                    retainedRecordingError: retainedRecordingError,
+                    systemRecordingURL: nil,
+                    stagedAudio: recovered.stagedAudio,
+                    stagedRawAudio: activeRawAudio,
+                    templateSnapshot: recovered.templateSnapshot,
+                    processingMetadata: recovered.processingMetadata,
+                    recordingStartedAt: recovered.stagedAudio.manifest.startedAt
+                )
+                let recordingSaveDecision = await self.recordingSaveDecision(
+                    for: result
+                )
+                let preparedRecordingSave = await self.prepareMeetingRecordingSave(
+                    for: result,
+                    saveDecision: recordingSaveDecision
+                )
+                let persistenceResult = try self.persistCompletedMeetingResultAndDispatchHook(
+                    result,
+                    existingMeetingID: meetingID,
+                    preparedRecordingSave: preparedRecordingSave
+                )
+                self.pendingResumePriorTranscript[meetingID] = nil
+                if let recordingSaveError = persistenceResult.recordingSaveError {
+                    self.updateMeetingStatusAndScheduleSync(
+                        id: meetingID,
+                        status: .failed
+                    )
+                    self.presentErrorAlert(
+                        title: "Meeting Recording",
+                        message: recordingSaveError.localizedDescription
+                    )
+                } else {
+                    _ = try? MeetingProcessingCapture.markState(
+                        .completed,
+                        for: recovered.stagedAudio
+                    )
+                    MeetingProcessingCapture.discard(recovered.stagedAudio)
+                    if let activeRawAudio {
+                        _ = try? MeetingRawAudioCapture.markState(
+                            .completed,
+                            for: activeRawAudio
+                        )
+                        MeetingRawAudioCapture.discard(activeRawAudio)
+                    }
+                    self.enqueueOrShowMeetingCompletionNotification(
+                        meetingID: meetingID,
+                        title: recovered.title
+                    )
+                }
+            } catch {
+                self.pendingResumePriorTranscript[meetingID] = nil
+                if let activeRawAudio {
+                    _ = try? MeetingRawAudioCapture.markFailed(
+                        activeRawAudio,
+                        error: error
+                    )
+                } else if let activeStagedAudio {
+                    _ = try? MeetingProcessingCapture.markFailed(
+                        activeStagedAudio,
+                        error: error
+                    )
+                }
+                self.updateMeetingStatusAndScheduleSync(id: meetingID, status: .failed)
+                if presentErrors {
+                    self.presentErrorAlert(
+                        title: "Meeting Recovery",
+                        message: error.localizedDescription
+                    )
+                }
+                fputs("[muesli-native] meeting recovery failed for \(meetingID): \(error)\n", stderr)
+            }
+            self.meetingRecoveryInFlightIDs.remove(meetingID)
+            self.syncAppState()
+            self.historyWindowController?.reload()
+            self.updateMeetingNotificationVisibility()
+        }
+    }
+
+    func discardMeetingRecoveryAudio(meetingID: Int64) {
+        guard !meetingRecoveryInFlightIDs.contains(meetingID) else { return }
+        do {
+            try MeetingRecordingRetentionService.deleteStaging(
+                meetingID: meetingID,
+                supportDirectory: processingSupportDirectory
+            )
+            if let meeting = meeting(id: meetingID), meeting.status == .failed {
+                let restoredResume = try dictationStore.restoreResumedMeetingIfNeeded(
+                    id: meetingID
+                )
+                if restoredResume {
+                    scheduleICloudSyncAfterLocalChange()
+                } else {
+                    updateMeetingStatusAndScheduleSync(id: meetingID, status: .noteOnly)
+                }
+            }
+            syncAppState()
+            historyWindowController?.reload()
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Discard Recovery Audio",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    // MARK: - Meeting Editing
+
+    func updateMeetingTitle(id: Int64, title: String) {
+        liveMeetingTitleCache[id] = title
+        do {
+            try dictationStore.updateMeetingTitle(id: id, title: title)
+            liveMeetingTitleCache[id] = nil
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to update meeting title \(id): \(error)\n", stderr)
+        }
+        syncAppState()
+    }
+
+    func cacheMeetingTitle(id: Int64, title: String) {
+        liveMeetingTitleCache[id] = title
+    }
+
+    func updateMeetingNotes(id: Int64, notes: String) {
+        try? dictationStore.updateMeetingNotes(id: id, formattedNotes: notes)
+        scheduleICloudSyncAfterLocalChange()
+        syncAppState()
+    }
+
+    func updateMeetingTranscript(id: Int64, transcript: String) {
+        do {
+            try dictationStore.updateMeetingTranscript(id: id, rawTranscript: transcript)
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to update meeting transcript \(id): \(error)\n", stderr)
+        }
+        syncAppState()
+    }
+
+    func updateMeetingManualNotes(id: Int64, notes: String) {
+        liveManualNotesPersistWorkItems[id]?.cancel()
+        liveManualNotesPersistWorkItems[id] = nil
+        liveManualNotesCache[id] = notes
+        do {
+            try dictationStore.updateMeetingManualNotes(id: id, manualNotes: notes)
+            markMeetingManualNotesPersisted(id: id, notes: notes)
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to update manual notes for \(id): \(error)\n", stderr)
+        }
+        syncAppState()
+    }
+
+    func cacheMeetingManualNotes(id: Int64, notes: String) {
+        liveManualNotesCache[id] = notes
+        scheduleCachedMeetingManualNotesPersistence(id: id)
+    }
+
+    func flushCachedMeetingManualNotes(id: Int64, sync: Bool = true) {
+        liveManualNotesPersistWorkItems[id]?.cancel()
+        liveManualNotesPersistWorkItems[id] = nil
+        guard let notes = liveManualNotesCache[id] else { return }
+        persistCachedMeetingManualNotes(id: id, notes: notes, sync: sync)
+    }
+
+    func hasPersistedMeetingManualNotes(id: Int64, notes: String) -> Bool {
+        if liveManualNotesLastPersistedValue[id] == notes {
+            return true
+        }
+        return (try? dictationStore.meeting(id: id)?.manualNotes) == notes
+    }
+
+    private func scheduleCachedMeetingManualNotesPersistence(id: Int64) {
+        guard let notes = liveManualNotesCache[id] else { return }
+        if shouldPersistCachedMeetingManualNotesImmediately(id: id, notes: notes) {
+            flushCachedMeetingManualNotes(id: id, sync: false)
+            return
+        }
+
+        let lastPersistedAt = liveManualNotesLastPersistedAt[id] ?? .distantPast
+        let delay = max(liveManualNotesPersistInterval - Date().timeIntervalSince(lastPersistedAt), 0)
+        liveManualNotesPersistWorkItems[id]?.cancel()
+        let item = DispatchWorkItem { [weak self] in
+            self?.flushCachedMeetingManualNotes(id: id, sync: false)
+        }
+        liveManualNotesPersistWorkItems[id] = item
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: item)
+    }
+
+    private func shouldPersistCachedMeetingManualNotesImmediately(id: Int64, notes: String) -> Bool {
+        if liveManualNotesLastPersistedValue[id] == nil { return true }
+        if notes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty { return true }
+        let lastPersistedAt = liveManualNotesLastPersistedAt[id] ?? .distantPast
+        return Date().timeIntervalSince(lastPersistedAt) >= liveManualNotesPersistInterval
+    }
+
+    private func persistCachedMeetingManualNotes(id: Int64, notes: String, sync: Bool) {
+        if liveManualNotesLastPersistedValue[id] == notes {
+            if sync {
+                syncAppState()
+            }
+            return
+        }
+        do {
+            try dictationStore.updateMeetingManualNotes(id: id, manualNotes: notes)
+            markMeetingManualNotesPersisted(id: id, notes: notes)
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to persist manual notes for \(id): \(error)\n", stderr)
+        }
+        if sync {
+            syncAppState()
+        }
+    }
+
+    private func markMeetingManualNotesPersisted(id: Int64, notes: String) {
+        liveManualNotesLastPersistedAt[id] = Date()
+        liveManualNotesLastPersistedValue[id] = notes
+    }
+
+    private func clearCachedMeetingManualNotes(id: Int64) {
+        liveManualNotesPersistWorkItems[id]?.cancel()
+        liveManualNotesPersistWorkItems[id] = nil
+        liveManualNotesCache[id] = nil
+        liveManualNotesLastPersistedAt[id] = nil
+        liveManualNotesLastPersistedValue[id] = nil
+    }
+
+    private func clearCachedMeetingTitle(id: Int64) {
+        liveMeetingTitleCache[id] = nil
+    }
+
+    private func flushCachedMeetingTitle(id: Int64) {
+        guard let title = liveMeetingTitleCache[id] else { return }
+        do {
+            try dictationStore.updateMeetingTitle(id: id, title: title)
+            liveMeetingTitleCache[id] = nil
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to flush cached meeting title \(id): \(error)\n", stderr)
+        }
+    }
+
+    private func clearAllCachedMeetingManualNotes() {
+        liveManualNotesPersistWorkItems.values.forEach { $0.cancel() }
+        liveManualNotesPersistWorkItems.removeAll()
+        liveManualNotesCache.removeAll()
+        liveManualNotesLastPersistedAt.removeAll()
+        liveManualNotesLastPersistedValue.removeAll()
+    }
+
+    private func clearAllCachedMeetingTitles() {
+        liveMeetingTitleCache.removeAll()
+    }
+
+    private func manualNotesForLiveMeeting(id: Int64) -> String {
+        if let cached = liveManualNotesCache[id] {
+            return cached
+        }
+        return (try? dictationStore.meeting(id: id)?.manualNotes) ?? ""
+    }
+
+    // MARK: - Folder Management
+
+    nonisolated static func treeOrderedFolders(_ folders: [MeetingFolder], order: [Int64]) -> [MeetingFolder] {
+        let orderedFolders = folders.sorted { a, b in
+            let ai = order.firstIndex(of: a.id) ?? Int.max
+            let bi = order.firstIndex(of: b.id) ?? Int.max
+            if ai != bi { return ai < bi }
+            return a.id < b.id
+        }
+        var childrenMap: [Int64?: [MeetingFolder]] = [:]
+        for folder in folders {
+            childrenMap[folder.parentID, default: []].append(folder)
+        }
+        // Sort siblings by folderOrder index, then by id as fallback.
+        for key in childrenMap.keys {
+            childrenMap[key]?.sort { a, b in
+                let ai = order.firstIndex(of: a.id) ?? Int.max
+                let bi = order.firstIndex(of: b.id) ?? Int.max
+                if ai != bi { return ai < bi }
+                return a.id < b.id
+            }
+        }
+        var result: [MeetingFolder] = []
+        var visited: Set<Int64> = []
+        func visit(_ parentID: Int64?) {
+            for folder in childrenMap[parentID] ?? [] {
+                guard visited.insert(folder.id).inserted else { continue }
+                result.append(folder)
+                visit(folder.id)
+            }
+        }
+        visit(nil)
+        // Include orphaned folders and closed cycles so corrupt hierarchy data never hides folders.
+        for folder in orderedFolders where !visited.contains(folder.id) {
+            visited.insert(folder.id)
+            result.append(folder)
+            visit(folder.id)
+        }
+        return result
+    }
+
+    @discardableResult
+    func createFolder(name: String) -> Int64? {
+        let id = try? dictationStore.createFolder(name: name)
+        syncAppState()
+        return id
+    }
+
+    func renameFolder(id: Int64, name: String) {
+        try? dictationStore.renameFolder(id: id, name: name)
+        syncAppState()
+    }
+
+    func reorderFolders(ids: [Int64]) {
+        updateConfig { $0.folderOrder = ids }
+        syncAppState()
+    }
+
+    @discardableResult
+    func createSubfolder(name: String, parentID: Int64) -> Int64? {
+        let id = try? dictationStore.createFolder(name: name, parentID: parentID)
+        syncAppState()
+        return id
+    }
+
+    func moveFolder(id: Int64, toParent newParentID: Int64?) {
+        try? dictationStore.moveFolder(id: id, toParent: newParentID)
+        syncAppState()
+    }
+
+    func createFolderAndMoveMeeting(name: String, meetingID: Int64) {
+        guard let folderID = try? dictationStore.createFolder(name: name) else { return }
+        try? dictationStore.moveMeeting(id: meetingID, toFolder: folderID)
+        syncAppState()
+    }
+
+    func deleteFolder(id: Int64) {
+        try? dictationStore.deleteFolder(id: id)
+        if appState.selectedFolderID == id {
+            appState.selectedFolderID = nil
+        }
+        syncAppState()
+    }
+
+    func hideCalendarEvent(_ event: UnifiedCalendarEvent) {
+        appState.hiddenCalendarEventIDs.insert(event.id)
+        updateConfig {
+            $0.hiddenCalendarEventIDs = self.appState.hiddenCalendarEventIDs.sorted()
+            $0.hiddenCalendarEventSourceHints[event.id] = event.source.rawValue
+        }
+        statusBarController?.refresh()
+    }
+
+    func createMeetingFromCalendarEvent(_ event: UnifiedCalendarEvent, folderID: Int64?) {
+        let occurrence = event.resolvedCalendarOccurrence
+        // Calendar placeholders are idempotent per occurrence. Recordings are
+        // intentionally not: users may record the same occurrence more than once.
+        if let existing = try? dictationStore.meetingByCalendarOccurrence(occurrence) {
+            if let folderID {
+                try? dictationStore.moveMeeting(id: existing.id, toFolder: folderID)
+            }
+            syncAppState()
+            fputs("[muesli-native] calendar event already exists as meeting \(existing.id), moved to folder\n", stderr)
+            return
+        }
+
+        do {
+            let meetingID = try dictationStore.insertMeeting(
+                title: event.title,
+                calendarEventID: event.id,
+                startTime: event.startDate,
+                endTime: event.endDate,
+                rawTranscript: "",
+                formattedNotes: "",
+                micAudioPath: nil,
+                systemAudioPath: nil,
+                calendarOccurrence: occurrence
+            )
+            if let folderID {
+                try? dictationStore.moveMeeting(id: meetingID, toFolder: folderID)
+            }
+            scheduleICloudSyncAfterLocalChange()
+            syncAppState()
+            fputs("[muesli-native] created meeting from calendar event: \(event.title) (folder=\(folderID.map(String.init) ?? "none"))\n", stderr)
+        } catch {
+            fputs("[muesli-native] failed to create meeting from calendar event: \(error)\n", stderr)
+        }
+    }
+
+    func moveMeeting(id: Int64, toFolder folderID: Int64?) {
+        try? dictationStore.moveMeeting(id: id, toFolder: folderID)
+        syncAppState()
+    }
+
+    func loadMoreDictations() {
+        guard appState.hasMoreDictations else { return }
+        let offset = appState.dictationRows.count
+        let more = (try? dictationStore.recentDictations(
+            limit: appState.dictationPageSize,
+            offset: offset,
+            fromDate: appState.dictationFromDate,
+            toDate: appState.dictationToDate,
+            origin: appState.dictationOriginFilter
+        )) ?? []
+        appState.dictationRows.append(contentsOf: more)
+        appState.hasMoreDictations = more.count >= appState.dictationPageSize
+    }
+
+    func filterDictations(from: Date?, to: Date?) {
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime]
+        appState.dictationFromDate = from.map { formatter.string(from: $0) }
+        appState.dictationToDate = to.map { formatter.string(from: Calendar.current.date(byAdding: .day, value: 1, to: $0)!) }
+        syncAppState()
+    }
+
+    func clearDictationFilter() {
+        appState.dictationFromDate = nil
+        appState.dictationToDate = nil
+        syncAppState()
+    }
+
+    func filterDictations(origin: RecordOriginFilter) {
+        appState.dictationOriginFilter = origin
+        syncAppState()
+    }
+
+    func filterMeetings(origin: RecordOriginFilter) {
+        appState.meetingOriginFilter = origin
+        syncAppState()
+    }
+
+    func deleteDictation(id: Int64) {
+        try? dictationStore.deleteDictation(id: id)
+        scheduleICloudSyncAfterLocalChange()
+        syncAppState()
+    }
+
+    func deleteMeeting(id: Int64) {
+        guard let meeting = meeting(id: id) else { return }
+        guard canDeleteMeeting(meeting) else { return }
+
+        do {
+            // Playback, waveform cache, canonical sources, and same-session
+            // staging are one deletion unit. Leave the meeting row intact if
+            // any active playback or processing lease keeps a unit busy.
+            let recordings = try dictationStore.meetingRecordings(meetingID: id)
+            MeetingRecordingPlaybackControl.stop(
+                recordingIDs: Set(recordings.map(\.id))
+            )
+            for recording in recordings {
+                guard try removeMeetingRecording(recording) else {
+                    throw NSError(
+                        domain: "MeetingRecordingRetention",
+                        code: 1,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "A meeting recording is currently in use. Stop playback or processing and try again."
+                        ]
+                    )
+                }
+            }
+            if let savedRecordingPath = meeting.savedRecordingPath,
+               !recordings.contains(where: { $0.path == savedRecordingPath }) {
+                let hasOtherReference = try dictationStore.hasMeetingRecordingReference(
+                    toPath: savedRecordingPath,
+                    excludingMeetingID: id
+                )
+                if !hasOtherReference,
+                   try shouldDeleteSavedMeetingRecording(at: savedRecordingPath, excluding: id) {
+                    try deleteSavedMeetingRecording(at: savedRecordingPath)
+                }
+            }
+            try MeetingRecordingRetentionService.deleteStaging(
+                meetingID: id,
+                supportDirectory: processingSupportDirectory
+            )
+            try dictationStore.deleteMeeting(id: id)
+            cleanupOrphanedMeetingWaveformCacheFiles()
+            scheduleICloudSyncAfterLocalChange()
+        } catch let error as MeetingLifecycleError {
+            presentErrorAlert(title: "Couldn't Delete Meeting", message: error.localizedDescription)
+            return
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Delete Meeting",
+                message: MeetingLifecycleError.failedToDeleteMeeting(underlying: error).localizedDescription
+            )
+            return
+        }
+
+        if appState.selectedMeetingID == id {
+            appState.selectedMeetingID = nil
+            appState.selectedMeetingRecord = nil
+            if case .document(let selectedID) = appState.meetingsNavigationState, selectedID == id {
+                appState.meetingsNavigationState = .browser
+            }
+        }
+        clearCachedMeetingManualNotes(id: id)
+        clearCachedMeetingTitle(id: id)
+        staleLiveMeetingRecoveryFailures.remove(id)
+
+        historyWindowController?.reload()
+        statusBarController?.refresh()
+        syncAppState()
+    }
+
+    func clearDictationHistory() {
+        try? dictationStore.clearDictations()
+        scheduleICloudSyncAfterLocalChange()
+        statusBarController?.refresh()
+        historyWindowController?.reload()
+        syncAppState()
+    }
+
+    func canDeleteMeeting(_ meeting: MeetingRecord) -> Bool {
+        guard meeting.id != activeMeetingID else { return false }
+        if staleLiveMeetingRecoveryFailures.contains(meeting.id) {
+            return true
+        }
+        switch meeting.status {
+        case .recording, .processing:
+            return false
+        case .completed, .noteOnly, .failed:
+            return true
+        }
+    }
+
+    func activeLiveMeetingRecord() -> MeetingRecord? {
+        guard let activeMeetingID,
+              isMeetingRecording() || isStartingMeetingRecording else {
+            return nil
+        }
+        return meeting(id: activeMeetingID)
+    }
+
+    func clearMeetingHistory() {
+        guard !isMeetingRecording(), !isStartingMeetingRecording, backgroundMeetingProcessingCount == 0 else {
+            presentErrorAlert(
+                title: "Couldn't Clear Meeting History",
+                message: "A meeting is recording or still being processed. Please wait before clearing saved meetings."
+            )
+            return
+        }
+
+        do {
+            let recordings = try dictationStore.allMeetingRecordings()
+            MeetingRecordingPlaybackControl.stop(
+                recordingIDs: Set(recordings.map(\.id))
+            )
+            for recording in recordings {
+                guard try removeMeetingRecording(recording) else {
+                    throw NSError(
+                        domain: "MeetingRecordingRetention",
+                        code: 2,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "A meeting recording is currently in use."
+                        ]
+                    )
+                }
+            }
+            try? clearSavedMeetingWaveformCache()
+            try clearSavedMeetingRecordingsDirectory()
+            try MeetingRecordingRetentionService.deleteAllStaging(
+                supportDirectory: processingSupportDirectory
+            )
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Clear Meeting History",
+                message: "Saved meeting audio files could not be deleted, so meeting history was left in place. \(error.localizedDescription)"
+            )
+            return
+        }
+
+        try? dictationStore.clearMeetings()
+        scheduleICloudSyncAfterLocalChange()
+        clearAllCachedMeetingManualNotes()
+        clearAllCachedMeetingTitles()
+        appState.selectedMeetingID = nil
+        appState.selectedMeetingRecord = nil
+        appState.meetingsNavigationState = .browser
+        statusBarController?.refresh()
+        historyWindowController?.reload()
+        syncAppState()
+    }
+
+    func isMeetingRecording() -> Bool {
+        activeMeetingSession?.isRecording == true || isStoppingMeetingRecording
+    }
+
+    func isMeetingRecordingPaused() -> Bool {
+        activeMeetingSession?.isPaused == true
+    }
+
+    private var meetingTerminationState: MeetingTerminationState {
+        MeetingTerminationPolicy.state(
+            isStarting: isStartingMeetingRecording,
+            hasActiveSession: activeMeetingSession != nil,
+            isRecording: activeMeetingSession?.isRecording == true,
+            isStopping: isStoppingMeetingRecording || backgroundMeetingProcessingCount > 0
+        )
+    }
+
+    @MainActor
+    func shouldTerminateApplication() -> Bool {
+        let state = meetingTerminationState
+        let messageText: String
+        let informativeText: String
+
+        if isTerminatingAfterMeetingConfirmation {
+            isTerminatingAfterMeetingConfirmation = false
+            return true
+        }
+
+        switch state {
+        case .none:
+            return true
+        case .starting:
+            messageText = "Meeting recording is starting"
+            informativeText = "Quitting now will cancel the meeting recording before it has been saved."
+        case .recording:
+            messageText = "Meeting recording in progress"
+            informativeText = "Quitting now will stop the meeting recording and the current transcript may be lost. Stop the recording first if you want Homan to save notes."
+        case .processing:
+            messageText = "Meeting transcription in progress"
+            informativeText = "Quitting now will interrupt transcription and the meeting notes may not be saved."
+        }
+
+        guard !isPresentingMeetingTerminationConfirmation else {
+            return false
+        }
+
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        alert.messageText = messageText
+        alert.informativeText = informativeText
+        alert.addButton(withTitle: "Keep Homan Running")
+        alert.addButton(withTitle: "Quit Anyway")
+
+        isPresentingMeetingTerminationConfirmation = true
+        let didPresent = presentAlert(alert, fallbackLogContext: "meeting termination confirmation") { [weak self] response in
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                self.isPresentingMeetingTerminationConfirmation = false
+                guard response == .alertSecondButtonReturn else { return }
+                self.discardMeetingStateForTermination()
+                self.isTerminatingAfterMeetingConfirmation = true
+                NSApp.terminate(nil)
+            }
+        }
+        if !didPresent {
+            isPresentingMeetingTerminationConfirmation = false
+        }
+
+        return false
+    }
+
+    private func discardMeetingStateForTermination() {
+        activeMeetingSession?.discard()
+        activeMeetingSession = nil
+        preparingMeetingSession?.discard()
+        preparingMeetingSession = nil
+        clearLiveMeetingTranscript()
+        disarmMeetingAutoStop()
+        if let meetingStartMeetingID {
+            canceledMeetingStartIDs.insert(meetingStartMeetingID)
+            resolveLiveMeetingAfterStartFailure(id: meetingStartMeetingID)
+        }
+        meetingStartTask?.cancel()
+        meetingStartTask = nil
+        meetingStartMeetingID = nil
+        isStartingMeetingRecording = false
+        isStoppingMeetingRecording = false
+        updateMeetingStartStatus(nil)
+        updateMeetingNotificationVisibility()
+        endMeetingActivity()
+        syncAppState()
+    }
+
+    @objc func toggleMeetingRecording() {
+        if isMeetingRecording() {
+            stopMeetingRecording()
+        } else {
+            let wasMeetingRecording = isMeetingRecording()
+            startForegroundMeetingRecording()
+            if !isMeetingRecording() && !isStartingMeetingRecording && !wasMeetingRecording {
+                meetingRecordingHotkeyMonitor.cancelToggleMode()
+            }
+        }
+    }
+
+    @objc func toggleMeetingRecordingPause() {
+        if isMeetingRecordingPaused() {
+            resumeMeetingRecording()
+        } else {
+            pauseMeetingRecording()
+        }
+    }
+
+    func confirmStartMeetingRecordingFromFloatingBar() {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
+        let alert = NSAlert()
+        alert.messageText = "Start a meeting recording?"
+        alert.informativeText = "Homan will record this meeting using your microphone and system audio."
+        alert.addButton(withTitle: "Start Recording")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        startForegroundMeetingRecording()
+    }
+
+    func confirmStopMeetingRecordingFromFloatingBar() {
+        guard isMeetingRecording() else { return }
+        let alert = NSAlert()
+        alert.messageText = "Stop the meeting recording?"
+        alert.informativeText = "The recording will be processed and added to your meetings."
+        alert.addButton(withTitle: "Stop Recording")
+        alert.addButton(withTitle: "Cancel")
+        guard alert.runModal() == .alertFirstButtonReturn else { return }
+        stopMeetingRecording()
+    }
+
+    func pauseMeetingRecording() {
+        guard let activeMeetingSession,
+              activeMeetingSession.isRecording,
+              !activeMeetingSession.isPaused,
+              !isStoppingMeetingRecording else { return }
+        activeMeetingSession.pause()
+        indicator.setMeetingRecordingPaused(true, config: config)
+        statusBarController?.setStatus("Meeting paused")
+        statusBarController?.refresh()
+        syncAppState()
+    }
+
+    func resumeMeetingRecording() {
+        guard let activeMeetingSession,
+              activeMeetingSession.isRecording,
+              activeMeetingSession.isPaused,
+              !isStoppingMeetingRecording else { return }
+        activeMeetingSession.resume()
+        indicator.setMeetingRecordingPaused(false, config: config)
+        statusBarController?.setStatus("Meeting: \(activeMeetingDisplayTitle())")
+        statusBarController?.refresh()
+        syncAppState()
+    }
+
+    func selectActiveMeetingLiveModel(_ modelID: ASRModelID, meetingID: Int64) {
+        guard activeMeetingID == meetingID,
+              let activeMeetingSession,
+              activeMeetingSession.isRecording else { return }
+        _ = activeMeetingSession.selectLiveModel(modelID)
+    }
+
+    func startActiveMeetingLive(meetingID: Int64) {
+        guard activeMeetingID == meetingID,
+              let activeMeetingSession,
+              activeMeetingSession.isRecording else { return }
+        activeMeetingSession.startLive()
+    }
+
+    func stopActiveMeetingLive(meetingID: Int64) {
+        guard activeMeetingID == meetingID,
+              let activeMeetingSession,
+              activeMeetingSession.isRecording else { return }
+        activeMeetingSession.stopLive()
+    }
+
+    func enableLiveCaptionsFromFloatingBar() {
+        guard let session = activeMeetingSession,
+              session.isRecording else { return }
+        guard let modelID = resolveAvailableLiveCaptionModelID() else {
+            presentErrorAlert(
+                title: "Live captions unavailable",
+                message: "No live-capable transcription model is downloaded. Install Parakeet v3 to enable live captions."
+            )
+            return
+        }
+        session.startLive(modelID: modelID)
+    }
+
+    /// Prefers the configured live model when it's live-capable and downloaded;
+    /// otherwise falls back to the mandatory Parakeet v3 (chunked live).
+    private func resolveAvailableLiveCaptionModelID() -> ASRModelID? {
+        let configured = config.resolvedMeetingLiveASRModelID
+        if MeetingSession.liveModelIDIsAvailable(configured) {
+            return configured
+        }
+        let fallback = BackendOption.parakeetMultilingual.asrModelID
+        if MeetingSession.liveModelIDIsAvailable(fallback) {
+            return fallback
+        }
+        return nil
+    }
+
+    @objc func startMeetingFromCalendarMenuItem(_ sender: NSMenuItem) {
+        if let payload = sender.representedObject as? CalendarMenuMeetingPayload {
+            startForegroundMeetingRecording(
+                title: payload.title,
+                calendarOccurrence: payload.calendarOccurrence,
+                endDate: payload.endDate,
+                autoStopSource: payload.autoStopSource,
+                startOrigin: .scheduledMeetingPrompt
+            )
+            return
+        }
+
+        guard let title = sender.representedObject as? String else { return }
+        startForegroundMeetingRecording(title: title)
+    }
+
+    @discardableResult
+    func startForegroundMeetingRecording(
+        title: String = "Meeting",
+        calendarEventID: String? = nil,
+        calendarOccurrence: CalendarOccurrenceReference? = nil,
+        endDate: Date? = nil,
+        autoStopSource: MeetingAutoStopSource? = nil,
+        startOrigin: MeetingRecordingStartOrigin = .manual
+    ) -> Bool {
+        startMeetingRecordingFromEntryPoint(
+            title: title,
+            calendarEventID: calendarEventID,
+            calendarOccurrence: calendarOccurrence,
+            endDate: endDate,
+            autoStopSource: autoStopSource,
+            presentation: .foregroundNotes,
+            startOrigin: startOrigin
+        )
+    }
+
+    @discardableResult
+    func startMeetingRecordingFromEntryPoint(
+        title: String = "Meeting",
+        calendarEventID: String? = nil,
+        calendarOccurrence: CalendarOccurrenceReference? = nil,
+        endDate: Date? = nil,
+        autoStopSource: MeetingAutoStopSource? = nil,
+        presentation: MeetingStartPresentation = .foregroundNotes,
+        startOrigin: MeetingRecordingStartOrigin = .manual
+    ) -> Bool {
+        guard ensureBasicDictationPermissionsBeforeDashboard() else { return false }
+        if isMeetingRecording() {
+            if presentation.presentsHistoryWindow {
+                presentHistoryWindow(tab: .meetings)
+            }
+            return false
+        }
+        guard !isStartingMeetingRecording else { return false }
+        let didStart = startMeetingRecording(
+            title: title,
+            calendarEventID: calendarEventID,
+            calendarOccurrence: calendarOccurrence,
+            openDocument: presentation.opensMeetingDocument,
+            endDate: endDate,
+            autoStopSource: autoStopSource,
+            startOrigin: startOrigin
+        )
+        guard didStart else { return false }
+        if presentation.presentsHistoryWindow {
+            presentHistoryWindow(tab: .meetings)
+        }
+        return true
+    }
+
+    @discardableResult
+    func startMeetingRecording(
+        title: String = "Meeting",
+        calendarEventID: String? = nil,
+        calendarOccurrence: CalendarOccurrenceReference? = nil,
+        openDocument: Bool = false,
+        endDate: Date? = nil,
+        autoStopSource: MeetingAutoStopSource? = nil,
+        startOrigin: MeetingRecordingStartOrigin = .manual,
+        followUpToID: Int64? = nil,
+        inheritedFolderID: Int64? = nil,
+        previousMeetingNotes: String? = nil
+    ) -> Bool {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return false }
+        guard let meetingBackend = normalizeMeetingTranscriptionSelectionForAvailability() else {
+            presentErrorAlert(
+                title: "Meeting failed to start",
+                message: "Configure the selected cloud transcription provider or download a local model before recording a meeting."
+            )
+            return false
+        }
+        let templateSnapshot = defaultMeetingTemplate()
+        let resolvedCalendarEventID = calendarOccurrence?.eventID ?? calendarEventID
+        let meetingID: Int64
+        do {
+            meetingID = try dictationStore.createLiveMeeting(
+                title: title,
+                calendarEventID: resolvedCalendarEventID,
+                startTime: Date(),
+                selectedTemplateID: templateSnapshot.id,
+                selectedTemplateName: templateSnapshot.name,
+                selectedTemplateKind: templateSnapshot.kind,
+                selectedTemplatePrompt: templateSnapshot.prompt,
+                folderID: inheritedFolderID,
+                followUpToID: followUpToID,
+                calendarOccurrence: calendarOccurrence
+            )
+            activeMeetingID = meetingID
+            activeMeetingInputDeviceUID = config.meetingInputDeviceUID
+            dictationAudioRoutingController.selectedMeetingInputDeviceUID =
+                activeMeetingInputDeviceUID
+            activeMeetingAudioWarning = nil
+            syncAppState()
+            if openDocument {
+                showMeetingDocument(id: meetingID)
+            }
+        } catch {
+            fputs("[muesli-native] failed to create live meeting: \(error)\n", stderr)
+            recordDiagnosticIncident(
+                kind: .meetingStartFailed,
+                stage: .createLiveMeeting,
+                backend: meetingBackend,
+                error: error
+            )
+            presentErrorAlert(title: "Meeting failed to start", message: error.localizedDescription)
+            return false
+        }
+        armMeetingAutoStop(
+            source: startOrigin.signalLossSource(
+                explicitSource: autoStopSource,
+                recentSource: recentMeetingAutoStopSource()
+            ),
+            response: startOrigin.signalLossResponse
+        )
+        isStartingMeetingRecording = true
+        // Keep this after backend normalization and live-meeting creation so
+        // a failed meeting start does not silently cancel an active dictation.
+        cancelDictationAudioSessionForMeetingRecordingIfNeeded()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+        meetingStartMeetingID = meetingID
+        updateMeetingStartStatus("Meeting transcription will start shortly.")
+        indicator.setState(.preparing, config: config)
+        beginMeetingActivity(reason: "Recording and transcribing a meeting")
+        meetingMonitor.suppressWhileActive()
+        meetingMonitor.refreshState()
+        updateMeetingNotificationVisibility()
+
+        meetingStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                try await self.startMeetingRecordingWithSystemAudioRecovery(
+                    title: title,
+                    calendarEventID: resolvedCalendarEventID,
+                    meetingID: meetingID,
+                    backend: meetingBackend,
+                    templateSnapshot: templateSnapshot,
+                    endDate: endDate,
+                    previousMeetingNotes: previousMeetingNotes
+                )
+            } catch is CancellationError {
+                if self.meetingStartMeetingID == meetingID {
+                    self.disarmMeetingAutoStop()
+                    self.resolveLiveMeetingAfterStartFailure(id: meetingID)
+                    self.cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: meetingID)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                    self.statusBarController?.setStatus("Idle")
+                    self.statusBarController?.refresh()
+                    self.setState(.idle)
+                    self.endMeetingActivity()
+                    self.syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+                }
+            } catch {
+                if self.meetingStartMeetingID == meetingID {
+                    fputs("[muesli-native] failed to start meeting: \(error)\n", stderr)
+                    _ = self.recordDiagnosticIncident(
+                        kind: .meetingStartFailed,
+                        stage: .startMeetingRecording,
+                        backend: meetingBackend,
+                        error: error
+                    )
+                    self.disarmMeetingAutoStop()
+                    self.resolveLiveMeetingAfterStartFailure(id: meetingID)
+                    self.cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: meetingID)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                    self.statusBarController?.setStatus("Idle")
+                    self.statusBarController?.refresh()
+                    self.setState(.idle)
+                    self.endMeetingActivity()
+                    self.syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+
+                    self.presentMeetingStartFailureAlert(error: error)
+                }
+            }
+            self.finishMeetingStartAttempt(meetingID: meetingID)
+        }
+        return true
+    }
+
+    /// Whether a finished meeting can be resumed right now (used to gate the UI control too).
+    func canResumeFinishedMeeting(_ meeting: MeetingRecord) -> Bool {
+        MeetingResumePolicy.canResume(status: meeting.status)
+    }
+
+    /// Whether `meeting` can spawn a follow-up meeting right now (also gates the UI control).
+    func canStartFollowUpMeeting(_ meeting: MeetingRecord) -> Bool {
+        MeetingFollowUpPolicy.canStartFollowUp(status: meeting.status)
+    }
+
+    /// Starts a *new* meeting linked into `meetingID`'s thread (vs. resume, which
+    /// reopens the same row). Follow-ups attach to the selected meeting, so a
+    /// meeting can have more than one follow-up. The new meeting inherits the
+    /// predecessor's folder and carries its notes into the summary prompt so
+    /// open action items follow the thread.
+    func startFollowUpMeeting(fromMeetingID meetingID: Int64) {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
+        guard let predecessor = meeting(id: meetingID),
+              canStartFollowUpMeeting(predecessor) else { return }
+        startMeetingRecording(
+            title: MeetingFollowUpPolicy.followUpTitle(from: predecessor.title),
+            openDocument: true,
+            followUpToID: predecessor.id,
+            inheritedFolderID: predecessor.folderID,
+            previousMeetingNotes: MeetingFollowUpPolicy.carriedContext(from: predecessor)
+        )
+    }
+
+    /// Thread parent, direct child follow-ups, and total size for the
+    /// detail-view breadcrumb/list.
+    /// Returns nil for meetings that are not part of a follow-up thread.
+    func meetingThreadContext(for meetingID: Int64) -> MeetingThreadContext? {
+        do {
+            guard let navigation = try dictationStore.meetingThreadNavigation(containing: meetingID) else { return nil }
+            return MeetingThreadContext(
+                predecessor: navigation.predecessorID.flatMap { meeting(id: $0) },
+                successors: navigation.successorIDs.compactMap { meeting(id: $0) },
+                count: navigation.count
+            )
+        } catch {
+            fputs("[muesli-native] failed to resolve meeting thread for \(meetingID): \(error)\n", stderr)
+            return nil
+        }
+    }
+
+    /// Reopens a finished meeting and appends more recording onto the *same* row
+    /// (vs. `startMeetingRecording`, which creates a new row). Mirrors the start
+    /// scaffolding but skips `createLiveMeeting` and reuses the existing meeting id.
+    /// Named distinctly from `MeetingSession.resume()` (the in-session un-pause).
+    func resumeFinishedMeeting(meetingID: Int64) {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
+        guard let meeting = meeting(id: meetingID), canResumeFinishedMeeting(meeting) else { return }
+        guard let meetingBackend = normalizeMeetingTranscriptionSelectionForAvailability() else {
+            presentErrorAlert(
+                title: "Resume failed",
+                message: "Configure the selected cloud transcription provider or download a local model before recording."
+            )
+            return
+        }
+
+        let priorTranscript: String
+        do {
+            priorTranscript = try dictationStore.prepareMeetingForResume(id: meetingID)
+        } catch {
+            fputs("[muesli-native] failed to prepare meeting resume \(meetingID): \(error)\n", stderr)
+            presentErrorAlert(title: "Resume failed", message: error.localizedDescription)
+            return
+        }
+        pendingResumePriorTranscript[meetingID] = priorTranscript
+        let previousMeetingNotes = meeting.followUpToID
+            .flatMap { self.meeting(id: $0) }
+            .flatMap { MeetingFollowUpPolicy.carriedContext(from: $0) }
+
+        // REUSE the existing row — do NOT call createLiveMeeting.
+        activeMeetingID = meetingID
+        activeMeetingInputDeviceUID = config.meetingInputDeviceUID
+        dictationAudioRoutingController.selectedMeetingInputDeviceUID =
+            activeMeetingInputDeviceUID
+        activeMeetingAudioWarning = nil
+        syncAppState()
+
+        armMeetingAutoStop(
+            source: MeetingRecordingStartOrigin.manual.signalLossSource(
+                explicitSource: nil,
+                recentSource: recentMeetingAutoStopSource()
+            ),
+            response: MeetingRecordingStartOrigin.manual.signalLossResponse
+        )
+        isStartingMeetingRecording = true
+        cancelDictationAudioSessionForMeetingRecordingIfNeeded()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+        meetingStartMeetingID = meetingID
+        updateMeetingStartStatus("Resuming meeting recording…")
+        indicator.setState(.preparing, config: config)
+        beginMeetingActivity(reason: "Recording and transcribing a meeting")
+        meetingMonitor.suppressWhileActive()
+        meetingMonitor.refreshState()
+        updateMeetingNotificationVisibility()
+
+        meetingStartTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            do {
+                try Task.checkCancellation()
+                try await self.startMeetingRecordingWithSystemAudioRecovery(
+                    title: meeting.title,
+                    calendarEventID: meeting.calendarEventID,
+                    meetingID: meetingID,
+                    backend: meetingBackend,
+                    templateSnapshot: self.meetingTemplateSnapshot(for: meeting),
+                    endDate: nil,
+                    previousMeetingNotes: previousMeetingNotes
+                )
+            } catch is CancellationError {
+                if self.meetingStartMeetingID == meetingID {
+                    self.disarmMeetingAutoStop()
+                    self.resolveLiveMeetingAfterStartFailure(id: meetingID)
+                    self.cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: meetingID)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                    self.statusBarController?.setStatus("Idle")
+                    self.statusBarController?.refresh()
+                    self.setState(.idle)
+                    self.endMeetingActivity()
+                    self.syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+                }
+            } catch {
+                if self.meetingStartMeetingID == meetingID {
+                    fputs("[muesli-native] failed to resume meeting: \(error)\n", stderr)
+                    self.disarmMeetingAutoStop()
+                    self.resolveLiveMeetingAfterStartFailure(id: meetingID)
+                    self.cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: meetingID)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                    self.statusBarController?.setStatus("Idle")
+                    self.statusBarController?.refresh()
+                    self.setState(.idle)
+                    self.endMeetingActivity()
+                    self.syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+                    self.presentMeetingStartFailureAlert(error: error)
+                }
+            }
+            self.finishMeetingStartAttempt(meetingID: meetingID)
+        }
+    }
+
+    // MARK: - Audio File Import
+
+    /// Presents a file picker and imports an audio file for offline transcription.
+    func importAudioFile() {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
+        guard normalizeMeetingTranscriptionSelectionForAvailability() != nil else {
+            presentErrorAlert(
+                title: "Import Failed",
+                message: "Configure the selected cloud transcription provider or download a local model before importing audio files."
+            )
+            return
+        }
+
+        isStartingMeetingRecording = true
+        let sessionID = UUID()
+        importSessionID = sessionID
+
+        importTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            guard let sourceURL = await AudioFileImportController.selectFile() else {
+                self.isStartingMeetingRecording = false
+                self.importTask = nil
+                self.importSessionID = nil
+                self.syncAppState()
+                return
+            }
+            await self.importAudioFile(from: sourceURL, sessionID: sessionID)
+        }
+    }
+
+    /// Imports an audio file from a URL (drag-and-drop or file picker).
+    func importAudioFileFromURL(_ url: URL) {
+        guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
+        guard AudioFileImportController.isSupportedFileURL(url) else {
+            presentErrorAlert(
+                title: "Import Failed",
+                message: "This audio file format is not supported."
+            )
+            return
+        }
+        guard normalizeMeetingTranscriptionSelectionForAvailability() != nil else {
+            presentErrorAlert(
+                title: "Import Failed",
+                message: "Configure the selected cloud transcription provider or download a local model before importing audio files."
+            )
+            return
+        }
+
+        isStartingMeetingRecording = true
+        let sessionID = UUID()
+        importSessionID = sessionID
+
+        importTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            await self.importAudioFile(from: url, sessionID: sessionID)
+        }
+    }
+
+    private func importAudioFile(from sourceURL: URL, sessionID: UUID) async {
+        let filename = sourceURL.deletingPathExtension().lastPathComponent
+        let title = filename.isEmpty ? "Imported Recording" : filename
+
+        self.updateImportProgressStatus("Importing audio file...", sessionID: sessionID)
+        self.beginMeetingActivity(reason: "Importing audio file for transcription")
+
+        do {
+            let result = try await AudioFileImportController.importAudioFile(
+                sourceURL: sourceURL,
+                title: title,
+                controller: self,
+                progress: { [weak self] status in
+                    Task { @MainActor in
+                        guard let self,
+                              self.importSessionID == sessionID else { return }
+                        self.updateImportProgressStatus(status, sessionID: sessionID)
+                    }
+                }
+            )
+
+            await MainActor.run {
+                self.importTask = nil
+                self.importSessionID = nil
+                self.isStartingMeetingRecording = false
+                self.updateMeetingStartStatus(nil)
+                self.indicator.hideLoading()
+                self.endMeetingActivity()
+                self.statusBarController?.setStatus("Idle")
+                self.statusBarController?.refresh()
+                self.syncAppState()
+                self.historyWindowController?.reload()
+                self.showMeetingDocument(id: result.meetingID)
+                TelemetryDeck.signal("meeting.imported")
+            }
+        } catch is CancellationError {
+            await MainActor.run {
+                self.importTask = nil
+                self.importSessionID = nil
+                self.isStartingMeetingRecording = false
+                self.updateMeetingStartStatus(nil)
+                self.indicator.hideLoading()
+                self.endMeetingActivity()
+                self.statusBarController?.setStatus("Idle")
+                self.statusBarController?.refresh()
+                self.syncAppState()
+            }
+        } catch {
+            await MainActor.run {
+                self.importTask = nil
+                self.importSessionID = nil
+                self.isStartingMeetingRecording = false
+                self.updateMeetingStartStatus(nil)
+                self.indicator.hideLoading()
+                self.endMeetingActivity()
+                self.statusBarController?.setStatus("Idle")
+                self.statusBarController?.refresh()
+                self.syncAppState()
+                self.presentErrorAlert(
+                    title: "Import Failed",
+                    message: error.localizedDescription
+                )
+            }
+        }
+    }
+
+    func audioFileImportContext() -> AudioFileImportController.ImportContext {
+        AudioFileImportController.ImportContext(
+            config: config,
+            backend: selectedMeetingTranscriptionBackend,
+            transcriptionCoordinator: transcriptionCoordinator,
+            templateSnapshot: defaultMeetingTemplate()
+        )
+    }
+
+    func persistImportedAudioMeeting(
+        title: String,
+        calendarEventID: String?,
+        startTime: Date,
+        endTime: Date,
+        rawTranscript: String,
+        formattedNotes: String,
+        micAudioPath: String?,
+        systemAudioPath: String?,
+        savedRecordingPath: String?,
+        selectedTemplateID: String?,
+        selectedTemplateName: String?,
+        selectedTemplateKind: MeetingTemplateKind?,
+        selectedTemplatePrompt: String?,
+        processingMetadata: MeetingProcessingMetadata
+    ) throws -> Int64 {
+        let meetingID = try dictationStore.insertMeeting(
+            title: title,
+            calendarEventID: calendarEventID,
+            startTime: startTime,
+            endTime: endTime,
+            rawTranscript: rawTranscript,
+            formattedNotes: formattedNotes,
+            micAudioPath: micAudioPath,
+            systemAudioPath: systemAudioPath,
+            savedRecordingPath: savedRecordingPath,
+            savedRecordingDeleteAfter: savedRecordingPath == nil
+                ? nil
+                : meetingRecordingDeleteAfter(createdAt: endTime),
+            selectedTemplateID: selectedTemplateID,
+            selectedTemplateName: selectedTemplateName,
+            selectedTemplateKind: selectedTemplateKind,
+            selectedTemplatePrompt: selectedTemplatePrompt,
+            source: .audioImport,
+            processingMetadata: processingMetadata
+        )
+        scheduleICloudSyncAfterLocalChange()
+        return meetingID
+    }
+
+    func cancelMeetingPreparation() {
+        guard isStartingMeetingRecording, activeMeetingSession == nil else { return }
+
+        if let meetingID = meetingStartMeetingID {
+            // Live meeting start cancellation
+            canceledMeetingStartIDs.insert(meetingID)
+            meetingStartTask?.cancel()
+            preparingMeetingSession?.stopStreamingPartials()
+            clearLiveMeetingTranscript(ownerID: meetingID)
+            resolveLiveMeetingAfterStartFailure(id: meetingID)
+            cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: meetingID)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+            meetingStartTask = nil
+            meetingStartMeetingID = nil
+            syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+        } else {
+            // Audio import cancellation
+            importTask?.cancel()
+            importTask = nil
+            importSessionID = nil
+            indicator.hideLoading()
+        }
+
+        statusBarController?.setStatus("Idle")
+        statusBarController?.refresh()
+        setState(.idle)
+        endMeetingActivity()
+        disarmMeetingAutoStop()
+        meetingStartTask = nil
+        meetingStartMeetingID = nil
+        isStartingMeetingRecording = false
+        updateMeetingStartStatus(nil)
+        updateMeetingNotificationVisibility()
+        syncAppState()
+    }
+
+    private func finishMeetingStartAttempt(meetingID: Int64) {
+        guard meetingStartMeetingID == meetingID else { return }
+        let didStartActiveSession = activeMeetingID == meetingID && activeMeetingSession != nil
+        canceledMeetingStartIDs.remove(meetingID)
+        meetingStartTask = nil
+        meetingStartMeetingID = nil
+        isStartingMeetingRecording = false
+        updateMeetingStartStatus(nil)
+        updateMeetingNotificationVisibility()
+        if !didStartActiveSession {
+            meetingRecordingHotkeyMonitor.cancelToggleMode()
+            resetActiveMeetingMicrophoneSelection()
+        }
+        syncAppState()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+    }
+
+    private func cancelMeetingRecordingHotkeyToggleAfterFailedStart(meetingID: Int64) {
+        guard meetingStartMeetingID == meetingID else { return }
+        guard activeMeetingID != meetingID || activeMeetingSession == nil else { return }
+        meetingRecordingHotkeyMonitor.cancelToggleMode()
+    }
+
+    private func startMeetingRecordingWithSystemAudioRecovery(
+        title: String,
+        calendarEventID: String?,
+        meetingID: Int64,
+        backend: BackendOption,
+        templateSnapshot: MeetingTemplateSnapshot,
+        endDate: Date?,
+        previousMeetingNotes: String? = nil
+    ) async throws {
+        var shouldRetryAfterPermissionRequest = config.useCoreAudioTap
+        statusBarController?.setStatus("Meeting transcription will start shortly.")
+        statusBarController?.refresh()
+        try Task.checkCancellation()
+        await transcriptionCoordinator.preloadMeetingHelpers()
+        try Task.checkCancellation()
+        try checkMeetingStartStillCurrent(meetingID)
+
+        while true {
+            try Task.checkCancellation()
+            try checkMeetingStartStillCurrent(meetingID)
+            let audioRoutingController = dictationAudioRoutingController
+            let routeSnapshot = audioRoutingController.meetingInputRouteSnapshot()
+            let meetingMicRecorder = RouteAwareMeetingMicRecorder(
+                routeSnapshotProvider: {
+                    audioRoutingController.meetingInputRouteSnapshot()
+                }
+            )
+            meetingMicRecorder.preferredInputDeviceID = routeSnapshot.preferredInputDeviceID
+            let meetingSession = MeetingSession(
+                meetingID: meetingID,
+                title: title,
+                calendarEventID: calendarEventID,
+                backend: backend,
+                runtime: runtime,
+                config: config,
+                templateSnapshot: templateSnapshot,
+                transcriptionCoordinator: transcriptionCoordinator,
+                processingSupportDirectory: processingSupportDirectory,
+                meetingMicRecorder: meetingMicRecorder
+            )
+            let transcriptGeneration = UUID()
+            meetingSession.previousMeetingNotes = previousMeetingNotes
+
+            do {
+                preparingMeetingSession = meetingSession
+                defer {
+                    if preparingMeetingSession === meetingSession {
+                        preparingMeetingSession = nil
+                    }
+                }
+                meetingSession.manualNotesProvider = { [weak self] in
+                    await MainActor.run {
+                        guard let self else { return nil }
+                        return self.manualNotesForLiveMeeting(id: meetingID)
+                    }
+                }
+                meetingSession.liveTitleProvider = { [weak self] in
+                    await MainActor.run {
+                        guard let self else { return nil }
+                        return self.liveMeetingTitle(id: meetingID)
+                    }
+                }
+                meetingSession.onChunkTranscribed = { [weak self, weak meetingSession] segments, speaker, liveGeneration in
+                    Task { @MainActor [weak self, weak meetingSession] in
+                        guard let self else { return }
+                        guard self.isCurrentLiveMeetingTranscriptSession(
+                            ownerID: meetingID,
+                            generation: transcriptGeneration
+                        ),
+                        self.appState.meetingLiveState.generation == liveGeneration,
+                        self.appState.meetingLiveState.phase == .running
+                            || self.appState.meetingLiveState.phase == .lagging else { return }
+                        let liveTranscriptStart = meetingSession?.startTime ?? Date()
+                        let liveTranscriptCalendar = Calendar(identifier: .gregorian)
+                        let entries = segments.compactMap { segment -> LiveTranscriptCheckpointEntry? in
+                            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                            guard !text.isEmpty else { return nil }
+                            let timestampDate = liveTranscriptStart.addingTimeInterval(segment.start)
+                            let components = liveTranscriptCalendar.dateComponents([.hour, .minute, .second], from: timestampDate)
+                            let timestamp = String(
+                                format: "%02d:%02d:%02d",
+                                components.hour ?? 0,
+                                components.minute ?? 0,
+                                components.second ?? 0
+                            )
+                            return LiveTranscriptCheckpointEntry(
+                                timestampLabel: timestamp,
+                                speaker: speaker,
+                                startSeconds: segment.start,
+                                endSeconds: segment.end,
+                                text: text
+                            )
+                        }
+                        guard !entries.isEmpty else { return }
+                        let lines = entries.map { "[\($0.timestampLabel)] \($0.speaker): \($0.text)" }
+                        self.appState.liveMeetingTranscript += lines.joined(separator: "\n") + "\n"
+                        self.indicator.updateMeetingTranscript(
+                            transcript: self.appState.liveMeetingTranscript,
+                            partialYou: self.appState.liveMeetingPartialYou,
+                            partialOthers: self.appState.liveMeetingPartialOthers
+                        )
+                    }
+                }
+                meetingSession.onPartialTranscript = { [weak self] speaker, tail, liveGeneration in
+                    Task { @MainActor [weak self] in
+                        guard let self else { return }
+                        guard self.isCurrentLiveMeetingTranscriptSession(
+                            ownerID: meetingID,
+                            generation: transcriptGeneration
+                        ),
+                        self.appState.meetingLiveState.generation == liveGeneration,
+                        self.appState.meetingLiveState.phase == .running
+                            || self.appState.meetingLiveState.phase == .lagging else { return }
+                        if speaker == "You" {
+                            guard self.appState.liveMeetingPartialYou != tail else { return }
+                            self.appState.liveMeetingPartialYou = tail
+                        } else {
+                            guard self.appState.liveMeetingPartialOthers != tail else { return }
+                            self.appState.liveMeetingPartialOthers = tail
+                        }
+                        self.indicator.updateMeetingTranscript(
+                            transcript: self.appState.liveMeetingTranscript,
+                            partialYou: self.appState.liveMeetingPartialYou,
+                            partialOthers: self.appState.liveMeetingPartialOthers
+                        )
+                    }
+                }
+                meetingSession.onLiveStateChanged = { [weak self] state in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.isCurrentLiveMeetingTranscriptSession(
+                                ownerID: meetingID,
+                                generation: transcriptGeneration
+                              ) else { return }
+                        self.appState.meetingLiveState = state
+                        if state.phase == .off
+                            || state.phase == .failed
+                            || state.phase == .stopping {
+                            self.clearLiveMeetingPartialTails()
+                        }
+                        let liveActive = state.phase != .off
+                            && state.phase != .failed
+                            && state.phase != .stopping
+                        self.indicator.setLiveCaptionsActive(liveActive)
+                    }
+                }
+                appState.liveMeetingTranscriptOwnerID = meetingID
+                liveMeetingTranscriptGeneration = transcriptGeneration
+                appState.liveMeetingTranscript = ""
+                appState.liveMeetingPartialYou = ""
+                appState.liveMeetingPartialOthers = ""
+                appState.meetingLiveState = meetingSession.liveStateSnapshot()
+                indicator.updateMeetingTranscript(
+                    transcript: "",
+                    partialYou: "",
+                    partialOthers: ""
+                )
+                let micHealthWarningLock = NSLock()
+                var lastForwardedMicHealthWarning: String?
+                meetingSession.onMicHealthChanged = { [weak self] snapshot in
+                    let warningMessage = snapshot.warningMessage
+                    micHealthWarningLock.lock()
+                    let shouldForward = warningMessage != lastForwardedMicHealthWarning
+                    lastForwardedMicHealthWarning = warningMessage
+                    micHealthWarningLock.unlock()
+                    guard shouldForward else { return }
+                    Task { @MainActor in
+                        guard let self,
+                              self.activeMeetingID == meetingID || self.meetingStartMeetingID == meetingID else { return }
+                        self.updateActiveMeetingAudioWarning(meetingID: meetingID, health: snapshot)
+                        if warningMessage != nil {
+                            self.recordDiagnosticIncident(
+                                kind: .meetingMicrophoneCaptureFailed,
+                                severity: .warning,
+                                stage: .meetingMicrophoneCapture,
+                                promptUser: false
+                            )
+                        }
+                    }
+                }
+                meetingSession.onCaptureIntegrityFailure = { [weak self] error in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.activeMeetingID == meetingID
+                                || self.meetingStartMeetingID == meetingID else {
+                            return
+                        }
+                        self.activeMeetingAudioWarning = ActiveMeetingAudioWarning(
+                            meetingID: meetingID,
+                            message: "Full recovery audio could not be preserved. Stop the meeting and check available disk space. \(error.localizedDescription)"
+                        )
+                        self.syncAppState()
+                    }
+                }
+                try await meetingSession.start()
+                if Task.isCancelled || canceledMeetingStartIDs.contains(meetingID) {
+                    throw CancellationError()
+                }
+                activeMeetingSession = meetingSession
+                activeMeetingID = meetingID
+                activeMeetingAutoStop.markRecordingStarted(now: Date())
+                meetingMonitor.suppressWhileActive()
+                meetingMonitor.refreshState()
+                statusBarController?.setStatus("Meeting: \(title)")
+                indicator.powerProvider = { [weak meetingSession] in
+                    meetingSession?.currentPower() ?? -160
+                }
+                indicator.setMeetingRecording(true, config: config)
+                statusBarController?.refresh()
+                syncAppState()
+                scheduleMeetingEndNotification(endDate: endDate, title: title)
+                return
+            } catch {
+                clearLiveMeetingTranscript(ownerID: meetingID, generation: transcriptGeneration)
+                meetingSession.discard()
+                guard shouldRetryAfterPermissionRequest,
+                      case .tapCreationFailed = error as? CoreAudioSystemRecorder.RecorderError else {
+                    throw error
+                }
+
+                shouldRetryAfterPermissionRequest = false
+                try Task.checkCancellation()
+                try checkMeetingStartStillCurrent(meetingID)
+                updateMeetingStartStatus("Requesting system audio permission...")
+                statusBarController?.setStatus("Requesting system audio permission...")
+                statusBarController?.refresh()
+                let granted = await CoreAudioSystemRecorder.requestSystemAudioAccess()
+                try Task.checkCancellation()
+                try checkMeetingStartStillCurrent(meetingID)
+                if granted {
+                    updateMeetingStartStatus("Retrying meeting start...")
+                    statusBarController?.setStatus("Retrying meeting start...")
+                    statusBarController?.refresh()
+                    continue
+                }
+                throw error
+            }
+        }
+    }
+
+    private func checkMeetingStartStillCurrent(_ meetingID: Int64) throws {
+        if canceledMeetingStartIDs.contains(meetingID) || meetingStartMeetingID != meetingID {
+            throw CancellationError()
+        }
+    }
+
+    /// Open meeting URL, start recording, schedule end notification, and suppress detection.
+    /// Single entry point for "Join & Record" from both notification panel and Coming Up section.
+    func joinAndRecord(
+        title: String,
+        meetingURL: URL,
+        endDate: Date?,
+        calendarOccurrence: CalendarOccurrenceReference? = nil,
+        presentation: MeetingStartPresentation = .foregroundNotes
+    ) {
+        NSWorkspace.shared.open(meetingURL)
+        startMeetingRecordingFromEntryPoint(
+            title: title,
+            calendarOccurrence: calendarOccurrence,
+            endDate: endDate,
+            autoStopSource: MeetingAutoStopSource(meetingURL: meetingURL),
+            presentation: presentation,
+            startOrigin: .joinAndRecord
+        )
+    }
+
+    /// Open meeting URL and suppress detection for the event duration.
+    /// Single entry point for "Join Only" from both notification panel and Coming Up section.
+    func joinOnly(meetingURL: URL, endDate: Date?) {
+        let remaining = endDate.map { max($0.timeIntervalSinceNow, 120) } ?? 120
+        meetingMonitor.suppress(for: remaining)
+        meetingMonitor.refreshState()
+        NSWorkspace.shared.open(meetingURL)
+    }
+
+    enum MeetingDiscardResolution: Equatable {
+        case discardRecording
+        case keepManualNotes
+        case deleteDraft
+    }
+
+    private struct MeetingDiscardAccessory {
+        let view: NSView
+        let manualNotesCheckbox: NSButton
+    }
+
+    private final class MeetingDiscardAccessoryView: NSView {
+        var titleUpdater: AnyObject?
+    }
+
+    private final class MeetingDiscardButtonTitleUpdater: NSObject {
+        weak var discardButton: NSButton?
+
+        init(discardButton: NSButton?) {
+            self.discardButton = discardButton
+        }
+
+        @MainActor @objc func manualNotesCheckboxChanged(_ sender: NSButton) {
+            discardButton?.title = sender.state == .on ? "Discard" : "Discard Recording"
+        }
+    }
+
+    @objc func discardMeetingWithConfirmation() {
+        NSApp.activate(ignoringOtherApps: true)
+
+        let alert = NSAlert()
+        let hasManualNotes = activeMeetingID.map { id in
+            !manualNotesForLiveMeeting(id: id).trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        } ?? false
+        alert.messageText = "Discard recording?"
+        alert.alertStyle = .warning
+        var manualNotesCheckbox: NSButton?
+        if hasManualNotes {
+            alert.informativeText = "This will stop the meeting. Choose whether to delete the written notes too."
+            let accessory = Self.makeDiscardMeetingAccessoryView()
+            manualNotesCheckbox = accessory.manualNotesCheckbox
+            alert.accessoryView = accessory.view
+            alert.addButton(withTitle: "Discard Recording")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons.first?.hasDestructiveAction = true
+            let titleUpdater = MeetingDiscardButtonTitleUpdater(discardButton: alert.buttons.first)
+            manualNotesCheckbox?.target = titleUpdater
+            manualNotesCheckbox?.action = #selector(MeetingDiscardButtonTitleUpdater.manualNotesCheckboxChanged(_:))
+            (accessory.view as? MeetingDiscardAccessoryView)?.titleUpdater = titleUpdater
+        } else {
+            alert.informativeText = "This will stop the meeting recording and delete all captured audio. This cannot be undone."
+            alert.addButton(withTitle: "Discard")
+            alert.addButton(withTitle: "Cancel")
+            alert.buttons.first?.hasDestructiveAction = true
+        }
+        presentDiscardMeetingAlert(alert, manualNotesCheckbox: manualNotesCheckbox)
+    }
+
+    private static func makeDiscardMeetingAccessoryView() -> MeetingDiscardAccessory {
+        let label = NSTextField(labelWithString: "Will delete:")
+        label.font = .systemFont(ofSize: NSFont.systemFontSize)
+        label.textColor = .secondaryLabelColor
+
+        let recordingCheckbox = NSButton(checkboxWithTitle: "Recording audio", target: nil, action: nil)
+        recordingCheckbox.state = .on
+        recordingCheckbox.isEnabled = false
+
+        let notesCheckbox = NSButton(checkboxWithTitle: "Manual notes", target: nil, action: nil)
+        notesCheckbox.state = .off
+
+        let container = MeetingDiscardAccessoryView(frame: NSRect(x: 0, y: 0, width: 230, height: 76))
+        let stack = NSStackView(views: [label, recordingCheckbox, notesCheckbox])
+        stack.frame = container.bounds
+        stack.orientation = .vertical
+        stack.alignment = .leading
+        stack.spacing = 6
+        stack.autoresizingMask = [.width, .height]
+        container.addSubview(stack)
+        return MeetingDiscardAccessory(view: container, manualNotesCheckbox: notesCheckbox)
+    }
+
+    private func presentDiscardMeetingAlert(_ alert: NSAlert, manualNotesCheckbox: NSButton?, attempt: Int = 0) {
+        if let window = confirmationAnchorWindow() {
+            beginDiscardMeetingAlert(alert, for: window, manualNotesCheckbox: manualNotesCheckbox)
+            return
+        }
+
+        showActiveMeetingDocumentIfNeeded()
+        historyWindowController?.show()
+        if let window = confirmationAnchorWindow() {
+            beginDiscardMeetingAlert(alert, for: window, manualNotesCheckbox: manualNotesCheckbox)
+            return
+        }
+
+        guard attempt < 20 else {
+            NSLog("Unable to present discard meeting confirmation: no anchor window became available")
+            NSSound.beep()
+            return
+        }
+
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.1) { [weak self, alert] in
+            self?.presentDiscardMeetingAlert(alert, manualNotesCheckbox: manualNotesCheckbox, attempt: attempt + 1)
+        }
+    }
+
+    private func beginDiscardMeetingAlert(_ alert: NSAlert, for window: NSWindow, manualNotesCheckbox: NSButton?) {
+        alert.beginSheetModal(for: window) { [weak self] response in
+            guard let resolution = Self.discardResolution(
+                for: response,
+                deleteManualNotes: manualNotesCheckbox.map { $0.state == .on }
+            ) else { return }
+            Task { @MainActor [weak self] in
+                self?.discardMeetingRecording(resolution: resolution)
+            }
+        }
+    }
+
+    static func discardResolution(for response: NSApplication.ModalResponse, deleteManualNotes: Bool?) -> MeetingDiscardResolution? {
+        guard response == .alertFirstButtonReturn else { return nil }
+        if let deleteManualNotes {
+            return deleteManualNotes ? .deleteDraft : .keepManualNotes
+        }
+        return .discardRecording
+    }
+
+    private func confirmationAnchorWindow() -> NSWindow? {
+        NSApp.windows.first { window in
+            isUsableSheetHost(window, allowPanel: false)
+        } ?? NSApp.windows.first { window in
+            isUsableSheetHost(window, allowPanel: true)
+        }
+    }
+
+    private func isUsableSheetHost(_ window: NSWindow, allowPanel: Bool) -> Bool {
+        window.isVisible &&
+            !window.isMiniaturized &&
+            window.canBecomeKey &&
+            (allowPanel || !(window is NSPanel))
+    }
+
+    private func discardMeetingRecording(resolution: MeetingDiscardResolution = .discardRecording) {
+        meetingRecordingHotkeyMonitor.cancelToggleMode()
+        clearLiveMeetingTranscript()
+        guard let sessionToDiscard = activeMeetingSession else {
+            // Fallback recovery: reset indicator if session is nil
+            guard !isStartingMeetingRecording else { return }
+            disarmMeetingAutoStop()
+            indicator.setMeetingRecording(false, config: config)
+            if let meetingID = activeMeetingID {
+                activeMeetingID = nil
+                resetActiveMeetingMicrophoneSelection()
+                if activeMeetingAudioWarning?.meetingID == meetingID {
+                    activeMeetingAudioWarning = nil
+                }
+                resolveLiveMeetingAfterDiscard(id: meetingID, resolution: resolution)
+            } else {
+                finishDiscardMeetingRecording()
+            }
+            return
+        }
+        sessionToDiscard.discard()
+        disarmMeetingAutoStop()
+        self.activeMeetingSession = nil
+        indicator.setMeetingRecording(false, config: config)
+        if let meetingID = activeMeetingID {
+            activeMeetingID = nil
+            resetActiveMeetingMicrophoneSelection()
+            if activeMeetingAudioWarning?.meetingID == meetingID {
+                activeMeetingAudioWarning = nil
+            }
+            resolveLiveMeetingAfterDiscard(id: meetingID, resolution: resolution)
+        } else {
+            finishDiscardMeetingRecording()
+        }
+    }
+
+    private func finishDiscardMeetingRecording() {
+        isStoppingMeetingRecording = false
+        endMeetingActivity()
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        setState(.idle)
+        statusBarController?.refresh()
+        syncAppState()
+        updateMeetingNotificationVisibility()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+    }
+
+    private func resolveLiveMeetingAfterDiscard(id: Int64, resolution: MeetingDiscardResolution) {
+        if restoreResumedMeetingIfNeeded(id: id) {
+            finishDiscardMeetingRecording()
+            return
+        }
+
+        switch resolution {
+        case .keepManualNotes:
+            keepManualNotesAfterDiscard(id: id)
+        case .deleteDraft:
+            deleteManualNotesDraftAfterDiscard(id: id)
+        case .discardRecording:
+            let manualNotes = manualNotesForLiveMeeting(id: id)
+            if manualNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                deleteManualNotesDraftAfterDiscard(id: id)
+            } else {
+                // Defensive fallback: the UI routes manual-note meetings through
+                // explicit Keep Notes/Delete Draft choices. If notes appear after
+                // the simpler discard alert was built, preserve user-written text.
+                keepManualNotesAfterDiscard(id: id)
+            }
+        }
+        finishDiscardMeetingRecording()
+    }
+
+    private func deleteManualNotesDraftAfterDiscard(id: Int64) {
+        deleteMeetingDraftAndScheduleSync(id: id)
+        clearCachedMeetingManualNotes(id: id)
+        clearCachedMeetingTitle(id: id)
+        if appState.selectedMeetingID == id {
+            appState.selectedMeetingID = nil
+            appState.selectedMeetingRecord = nil
+            appState.meetingsNavigationState = .browser
+        }
+    }
+
+    private func keepManualNotesAfterDiscard(id: Int64) {
+        flushCachedMeetingTitle(id: id)
+        flushCachedMeetingManualNotes(id: id, sync: false)
+        updateMeetingStatusAndScheduleSync(id: id, status: .noteOnly)
+        clearCachedMeetingManualNotes(id: id)
+        clearCachedMeetingTitle(id: id)
+    }
+
+    /// If `id` is a resume in flight, restore it to its prior `.completed` state
+    /// instead of deleting/failing it — the meeting pre-existed and must not be lost.
+    /// Returns true when it handled the meeting.
+    @discardableResult
+    private func restoreResumedMeetingIfNeeded(id: Int64) -> Bool {
+        let hadPendingResume = pendingResumePriorTranscript[id] != nil
+        do {
+            let restored = try dictationStore.restoreResumedMeetingIfNeeded(id: id)
+            guard restored || hadPendingResume else { return false }
+            if restored {
+                scheduleICloudSyncAfterLocalChange()
+            } else {
+                updateMeetingStatusAndScheduleSync(id: id, status: .completed)
+            }
+        } catch {
+            fputs("[muesli-native] failed to restore resumed meeting \(id): \(error)\n", stderr)
+            guard hadPendingResume else { return false }
+            updateMeetingStatusAndScheduleSync(id: id, status: .completed)
+        }
+        pendingResumePriorTranscript[id] = nil
+        if activeMeetingID == id {
+            activeMeetingID = nil
+        }
+        if activeMeetingAudioWarning?.meetingID == id {
+            activeMeetingAudioWarning = nil
+        }
+        syncAppState()
+        return true
+    }
+
+    private func resolveLiveMeetingAfterStartFailure(id: Int64) {
+        if restoreResumedMeetingIfNeeded(id: id) { return }
+        let manualNotes = manualNotesForLiveMeeting(id: id)
+        if manualNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            deleteMeetingDraftAndScheduleSync(id: id)
+            clearCachedMeetingManualNotes(id: id)
+            clearCachedMeetingTitle(id: id)
+            if appState.selectedMeetingID == id {
+                appState.selectedMeetingID = nil
+                appState.selectedMeetingRecord = nil
+                appState.meetingsNavigationState = .browser
+            }
+        } else {
+            flushCachedMeetingTitle(id: id)
+            flushCachedMeetingManualNotes(id: id, sync: false)
+            updateMeetingStatusAndScheduleSync(id: id, status: .failed)
+            clearCachedMeetingManualNotes(id: id)
+            clearCachedMeetingTitle(id: id)
+        }
+        if activeMeetingID == id {
+            activeMeetingID = nil
+        }
+        if activeMeetingAudioWarning?.meetingID == id {
+            activeMeetingAudioWarning = nil
+        }
+        syncAppState()
+    }
+
+    private func resolveLiveMeetingAfterStopFailure(id: Int64) {
+        if MeetingProcessingCapture.hasRecoverableSession(
+            meetingID: id,
+            supportDirectory: processingSupportDirectory
+        ) {
+            flushCachedMeetingTitle(id: id)
+            flushCachedMeetingManualNotes(id: id, sync: false)
+            updateMeetingStatusAndScheduleSync(id: id, status: .failed)
+            clearCachedMeetingManualNotes(id: id)
+            clearCachedMeetingTitle(id: id)
+            pendingResumePriorTranscript[id] = nil
+            if activeMeetingAudioWarning?.meetingID == id {
+                activeMeetingAudioWarning = nil
+            }
+            syncAppState()
+            return
+        }
+        if restoreResumedMeetingIfNeeded(id: id) { return }
+        let manualNotes = manualNotesForLiveMeeting(id: id)
+        if manualNotes.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            deleteMeetingDraftAndScheduleSync(id: id)
+            clearCachedMeetingManualNotes(id: id)
+            clearCachedMeetingTitle(id: id)
+            if appState.selectedMeetingID == id {
+                appState.selectedMeetingID = nil
+                appState.selectedMeetingRecord = nil
+                appState.meetingsNavigationState = .browser
+            }
+        } else {
+            flushCachedMeetingTitle(id: id)
+            flushCachedMeetingManualNotes(id: id, sync: false)
+            updateMeetingStatusAndScheduleSync(id: id, status: .failed)
+            clearCachedMeetingManualNotes(id: id)
+            clearCachedMeetingTitle(id: id)
+        }
+        if activeMeetingAudioWarning?.meetingID == id {
+            activeMeetingAudioWarning = nil
+        }
+        syncAppState()
+    }
+
+    private func deleteMeetingDraftAndScheduleSync(id: Int64) {
+        do {
+            try MeetingRecordingRetentionService.deleteStaging(
+                meetingID: id,
+                supportDirectory: processingSupportDirectory
+            )
+            try dictationStore.deleteMeeting(id: id)
+            scheduleICloudSyncAfterLocalChange()
+        } catch {
+            fputs("[muesli-native] failed to delete meeting draft \(id): \(error)\n", stderr)
+        }
+    }
+
+    private func updateMeetingStatusAndScheduleSync(id: Int64, status: MeetingStatus) {
+        do {
+            try updateMeetingStatusAndScheduleSyncThrowing(id: id, status: status)
+        } catch {
+            fputs("[muesli-native] failed to update meeting \(id) status to \(status.rawValue): \(error)\n", stderr)
+        }
+    }
+
+    private func updateMeetingStatusAndScheduleSyncThrowing(id: Int64, status: MeetingStatus) throws {
+        try dictationStore.updateMeetingStatus(id: id, status: status)
+        scheduleICloudSyncAfterLocalChange()
+    }
+
+    func openManualDiagnosticReport() {
+        diagnosticIncidentReporter.recordManualReport()
+    }
+
+    func setAutomaticDiagnosticIssuePrompts(_ enabled: Bool) {
+        updateConfig { $0.enableAutomaticDiagnosticIssuePrompts = enabled }
+        if !enabled,
+           let pending = appState.pendingDiagnosticIncident,
+           pending.kind != .manualReport {
+            diagnosticIncidentReporter.dismissCurrentPrompt()
+        }
+    }
+
+    func dismissDiagnosticIncidentPrompt() {
+        diagnosticIncidentReporter.dismissCurrentPrompt()
+    }
+
+    func openDiagnosticIncidentIssue(_ incident: DiagnosticIncident) {
+        let url = incident.githubIssueURL ?? DiagnosticIncident.githubIssueFallbackURL
+        diagnosticIncidentReporter.dismissCurrentPrompt()
+        DispatchQueue.main.async {
+            guard let applicationURL = NSWorkspace.shared.urlForApplication(toOpen: url) else {
+                NSWorkspace.shared.open(url)
+                return
+            }
+            let configuration = NSWorkspace.OpenConfiguration()
+            configuration.activates = true
+            NSWorkspace.shared.open([url], withApplicationAt: applicationURL, configuration: configuration) { _, error in
+                if let error {
+                    fputs("[muesli-native] failed to open diagnostic issue URL with activation: \(error)\n", stderr)
+                    NSWorkspace.shared.open(url)
+                }
+            }
+        }
+    }
+
+    @discardableResult
+    private func recordDiagnosticIncident(
+        kind: DiagnosticIncidentKind,
+        severity: DiagnosticIncidentSeverity = .error,
+        stage: DiagnosticIncidentStage,
+        backend: BackendOption? = nil,
+        error: Error? = nil,
+        promptUser: Bool = true
+    ) -> DiagnosticIncident {
+        diagnosticIncidentReporter.record(
+            kind: kind,
+            severity: severity,
+            stage: stage,
+            backend: backend,
+            error: error,
+            promptUser: promptUser
+        )
+    }
+
+    private func updateActiveMeetingAudioWarning(meetingID: Int64, health: MeetingMicHealthSnapshot) {
+        let nextWarning = health.warningMessage.map {
+            ActiveMeetingAudioWarning(meetingID: meetingID, message: $0)
+        }
+        guard activeMeetingAudioWarning != nextWarning else { return }
+        activeMeetingAudioWarning = nextWarning
+        syncAppState()
+    }
+
+    func stopMeetingRecording() {
+        meetingRecordingHotkeyMonitor.cancelToggleMode()
+        guard !isStoppingMeetingRecording else { return }
+        guard let sessionToStop = activeMeetingSession else {
+            // Fallback recovery: reset indicator if session is nil
+            guard !isStartingMeetingRecording else { return }
+            disarmMeetingAutoStop()
+            if let activeMeetingID {
+                resolveLiveMeetingAfterStopFailure(id: activeMeetingID)
+                if activeMeetingAudioWarning?.meetingID == activeMeetingID {
+                    activeMeetingAudioWarning = nil
+                }
+                self.activeMeetingID = nil
+                resetActiveMeetingMicrophoneSelection()
+            }
+            indicator.setMeetingRecording(false, config: config)
+            isStoppingMeetingRecording = false
+            endMeetingActivity()
+            setState(.idle)
+            return
+        }
+        isStoppingMeetingRecording = true
+        disarmMeetingAutoStop()
+        meetingEndTimer?.invalidate()
+        meetingEndTimer = nil
+        meetingNotification.close()
+        let liveMeetingID = activeMeetingID
+        if let liveMeetingID {
+            flushCachedMeetingManualNotes(id: liveMeetingID, sync: false)
+            flushCachedMeetingTitle(id: liveMeetingID)
+            updateMeetingStatusAndScheduleSync(id: liveMeetingID, status: .processing)
+            syncAppState()
+        }
+        indicator.setMeetingRecording(false, config: config)
+        indicator.setTranscribingTitle("Transcribing", config: config)
+        setState(.transcribing)
+        let processingGeneration = backgroundMeetingProcessingCount + 1
+        sessionToStop.onProgress = { [weak self] stage in
+            Task { @MainActor [weak self] in
+                guard let self,
+                      !self.isMeetingRecording(),
+                      !self.isStartingMeetingRecording,
+                      self.backgroundMeetingProcessingCount == processingGeneration else { return }
+                self.setMeetingProcessingStage(stage)
+            }
+        }
+
+        // Unblock new recordings immediately — transcription runs in the background
+        activeMeetingSession = nil
+        activeMeetingID = nil
+        resetActiveMeetingMicrophoneSelection()
+        if let liveMeetingID, activeMeetingAudioWarning?.meetingID == liveMeetingID {
+            activeMeetingAudioWarning = nil
+        }
+        isStoppingMeetingRecording = false
+        backgroundMeetingProcessingCount += 1
+        // The previous meeting still counts as background processing for quit
+        // protection, but it no longer owns capture. Publish that distinction
+        // immediately so Record Meeting is available for the next call.
+        syncAppState()
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+
+        Task { [weak self] in
+            guard let self else { return }
+            var meetingTitle = "Meeting"
+            var completedMeetingID: Int64?
+            var meetingResult: MeetingSessionResult?
+            var failedLiveMeetingID: Int64?
+            var shouldRemoveProcessingStaging = false
+            do {
+                let stopped = try await sessionToStop.stop()
+                let result = await self.mergedResumeResult(for: stopped, meetingID: liveMeetingID)
+                meetingResult = result
+                meetingTitle = result.title
+                await MainActor.run {
+                    self.setMeetingProcessingStatus("Finalizing")
+                }
+                let recordingSaveDecision = await self.recordingSaveDecision(for: result)
+                let preparedRecordingSave = await self.prepareMeetingRecordingSave(
+                    for: result,
+                    saveDecision: recordingSaveDecision
+                )
+                let persistenceResult = try await MainActor.run {
+                    try self.persistCompletedMeetingResultAndDispatchHook(
+                        result,
+                        existingMeetingID: liveMeetingID,
+                        preparedRecordingSave: preparedRecordingSave
+                    )
+                }
+                completedMeetingID = persistenceResult.meetingID
+                shouldRemoveProcessingStaging = persistenceResult.recordingSaveError == nil
+                if let recordingSaveError = persistenceResult.recordingSaveError {
+                    failedLiveMeetingID = persistenceResult.meetingID
+                    completedMeetingID = nil
+                    await MainActor.run {
+                        self.recordDiagnosticIncident(
+                            kind: .meetingRecordingSaveFailed,
+                            stage: .saveMeetingRecording,
+                            backend: self.selectedMeetingTranscriptionBackend,
+                            error: recordingSaveError
+                        )
+                        self.presentErrorAlert(title: "Meeting Recording", message: recordingSaveError.localizedDescription)
+                    }
+                }
+            } catch {
+                fputs("[muesli-native] meeting transcription failed: \(error)\n", stderr)
+                if let liveMeetingID,
+                   let stagedRawAudio = MeetingRawAudioCapture
+                    .recoverableSessions(
+                        meetingID: liveMeetingID,
+                        supportDirectory: processingSupportDirectory
+                    )
+                    .first {
+                    _ = try? MeetingRawAudioCapture.markFailed(
+                        stagedRawAudio,
+                        error: error
+                    )
+                } else if let liveMeetingID,
+                          let stagedAudio = MeetingProcessingCapture
+                    .recoverableSessions(
+                        meetingID: liveMeetingID,
+                        supportDirectory: processingSupportDirectory
+                    )
+                    .first {
+                    _ = try? MeetingProcessingCapture.markFailed(stagedAudio, error: error)
+                }
+                await MainActor.run {
+                    _ = self.recordDiagnosticIncident(
+                        kind: .meetingProcessingFailed,
+                        stage: .meetingStopProcessing,
+                        backend: self.selectedMeetingTranscriptionBackend,
+                        error: error
+                    )
+                }
+                let message: String
+                if let lifecycleError = error as? MeetingLifecycleError {
+                    message = lifecycleError.localizedDescription
+                } else {
+                    message = error.localizedDescription
+                }
+                failedLiveMeetingID = liveMeetingID
+                await MainActor.run {
+                    self.presentErrorAlert(title: "Meeting Recording", message: message)
+                }
+            }
+            await MainActor.run {
+                self.backgroundMeetingProcessingCount -= 1
+                if let failedLiveMeetingID {
+                    self.resolveLiveMeetingAfterStopFailure(id: failedLiveMeetingID)
+                } else if let liveMeetingID {
+                    // Resume merged + persisted successfully — drop the prior-transcript marker.
+                    self.pendingResumePriorTranscript[liveMeetingID] = nil
+                }
+                if !self.isMeetingRecording() && !self.isStartingMeetingRecording && self.backgroundMeetingProcessingCount == 0 {
+                    self.setState(.idle)
+                    self.statusBarController?.refresh()
+                }
+                self.endMeetingActivity()
+                self.historyWindowController?.reload()
+                self.syncAppState()
+                self.clearLiveMeetingTranscript(ownerID: liveMeetingID)
+                if let meetingResult {
+                    self.cleanupTemporaryMeetingAudioFiles(
+                        for: meetingResult,
+                        removeProcessingStaging: completedMeetingID != nil
+                            && shouldRemoveProcessingStaging
+                    )
+                }
+                self.performRetentionCleanup()
+                TelemetryDeck.signal("meeting.completed")
+
+                self.enqueueOrShowMeetingCompletionNotification(
+                    meetingID: completedMeetingID,
+                    title: meetingTitle
+                )
+                self.updateMeetingNotificationVisibility()
+            }
+        }
+    }
+
+    func revealMeetingRecordingInFinder(path: String) {
+        let url = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: url.path) else {
+            presentErrorAlert(
+                title: "Recording Not Found",
+                message: "The saved meeting recording is no longer available on disk."
+            )
+            return
+        }
+        NSWorkspace.shared.activateFileViewerSelecting([url])
+    }
+
+    func persistCompletedMeetingResult(
+        _ result: MeetingSessionResult,
+        existingMeetingID: Int64? = nil,
+        preparedRecordingSave: PreparedMeetingRecordingSave
+    ) throws -> CompletedMeetingPersistenceResult {
+        let meetingID: Int64
+        let savedRecordingPath = preparedRecordingSave.path
+        let recordingSaveError = preparedRecordingSave.error
+        var processingMetadata = result.processingMetadata
+        if let existingMeetingID,
+           let existingMeeting = try dictationStore.meeting(id: existingMeetingID) {
+            processingMetadata.manualNotesUpdatedAt =
+                existingMeeting.processingMetadata.manualNotesUpdatedAt
+        }
+
+        if let existingMeetingID {
+            let persistedTitle = completedLiveMeetingTitle(for: result, existingMeetingID: existingMeetingID)
+            let durationOverride = pendingResumePriorTranscript[existingMeetingID] == nil
+                ? nil
+                : result.durationSeconds
+            try dictationStore.completeLiveMeeting(
+                id: existingMeetingID,
+                title: persistedTitle,
+                calendarEventID: result.calendarEventID,
+                startTime: result.startTime,
+                endTime: result.endTime,
+                durationSeconds: durationOverride,
+                rawTranscript: result.rawTranscript,
+                formattedNotes: result.formattedNotes,
+                micAudioPath: nil,
+                systemAudioPath: nil,
+                savedRecordingPath: savedRecordingPath,
+                savedRecordingDeleteAfter: savedRecordingPath == nil
+                    ? nil
+                    : meetingRecordingDeleteAfter(createdAt: result.endTime),
+                savedRecordingSourceLayout: preparedRecordingSave.sourceLayout,
+                selectedTemplateID: result.templateSnapshot.id,
+                selectedTemplateName: result.templateSnapshot.name,
+                selectedTemplateKind: result.templateSnapshot.kind,
+                selectedTemplatePrompt: result.templateSnapshot.prompt,
+                processingMetadata: processingMetadata
+            )
+            meetingID = existingMeetingID
+            clearCachedMeetingManualNotes(id: existingMeetingID)
+            clearCachedMeetingTitle(id: existingMeetingID)
+        } else {
+            meetingID = try dictationStore.insertMeeting(
+                title: result.title,
+                calendarEventID: result.calendarEventID,
+                startTime: result.startTime,
+                endTime: result.endTime,
+                rawTranscript: result.rawTranscript,
+                formattedNotes: result.formattedNotes,
+                micAudioPath: nil,
+                systemAudioPath: nil,
+                savedRecordingPath: savedRecordingPath,
+                savedRecordingDeleteAfter: savedRecordingPath == nil
+                    ? nil
+                    : meetingRecordingDeleteAfter(createdAt: result.endTime),
+                savedRecordingSourceLayout: preparedRecordingSave.sourceLayout,
+                selectedTemplateID: result.templateSnapshot.id,
+                selectedTemplateName: result.templateSnapshot.name,
+                selectedTemplateKind: result.templateSnapshot.kind,
+                selectedTemplatePrompt: result.templateSnapshot.prompt,
+                processingMetadata: processingMetadata
+            )
+        }
+        if let savedRecordingPath,
+           let sourceBundlePath = preparedRecordingSave.sourceBundlePath,
+           let schemaVersion = preparedRecordingSave.sourceBundleSchemaVersion,
+           let sourceState = preparedRecordingSave.sourceBundleState {
+            _ = try dictationStore.registerMeetingRecordingWithSourceBundle(
+                meetingID: meetingID,
+                playbackPath: savedRecordingPath,
+                createdAt: result.endTime,
+                deleteAfter: meetingRecordingDeleteAfter(createdAt: result.endTime),
+                bundlePath: sourceBundlePath,
+                schemaVersion: schemaVersion,
+                sourceState: sourceState,
+                lastVerifiedAt: Date(),
+                lastErrorMessage: nil
+            )
+        }
+        scheduleICloudSyncAfterLocalChange()
+        return CompletedMeetingPersistenceResult(meetingID: meetingID, recordingSaveError: recordingSaveError)
+    }
+
+    private func liveMeetingTitle(id: Int64) -> String? {
+        if let cached = liveMeetingTitleCache[id] {
+            return cached
+        }
+        return try? dictationStore.meeting(id: id)?.title
+    }
+
+    private func activeMeetingDisplayTitle() -> String {
+        guard let activeMeetingID,
+              let title = liveMeetingTitle(id: activeMeetingID)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !title.isEmpty else {
+            return "Meeting"
+        }
+        return title
+    }
+
+    private func completedLiveMeetingTitle(for result: MeetingSessionResult, existingMeetingID: Int64) -> String {
+        guard let liveTitle = liveMeetingTitle(id: existingMeetingID)?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !liveTitle.isEmpty,
+              liveTitle != result.originalTitle.trimmingCharacters(in: .whitespacesAndNewlines) else {
+            return result.title
+        }
+        return liveTitle
+    }
+
+    func persistCompletedMeetingResultAndDispatchHook(
+        _ result: MeetingSessionResult,
+        existingMeetingID: Int64? = nil,
+        preparedRecordingSave: PreparedMeetingRecordingSave
+    ) throws -> CompletedMeetingPersistenceResult {
+        let persistenceResult = try persistCompletedMeetingResult(
+            result,
+            existingMeetingID: existingMeetingID,
+            preparedRecordingSave: preparedRecordingSave
+        )
+        meetingHookDispatcher.dispatchCompletedMeetingHook(
+            meetingID: persistenceResult.meetingID,
+            completedAt: result.endTime,
+            config: config
+        )
+        if config.autoExportMarkdownEnabled {
+            do {
+                if let record = try dictationStore.meeting(id: persistenceResult.meetingID) {
+                    meetingMarkdownAutoExporter.exportIfConfigured(meeting: record, config: config)
+                } else {
+                    meetingMarkdownAutoExporter.recordMeetingLookupFailure(
+                        meetingID: persistenceResult.meetingID,
+                        error: nil
+                    )
+                }
+            } catch {
+                meetingMarkdownAutoExporter.recordMeetingLookupFailure(
+                    meetingID: persistenceResult.meetingID,
+                    error: error
+                )
+            }
+        }
+        return persistenceResult
+    }
+
+    /// For a resumed meeting, concatenates the prior transcript with the newly
+    /// recorded one and regenerates the summary when new transcript content exists.
+    /// Returns the stop result unchanged when this meeting is not a resume. Does not
+    /// clear the pending-transcript marker — that happens on successful persist or
+    /// failure restore.
+    private func mergedResumeResult(
+        for result: MeetingSessionResult,
+        meetingID: Int64?
+    ) async -> MeetingSessionResult {
+        guard let meetingID,
+              let prior = pendingResumePriorTranscript[meetingID] else {
+            return result
+        }
+        let manualNotes = manualNotesForLiveMeeting(id: meetingID)
+        let combined = MeetingResumePolicy.combinedResumeTranscript(
+            prior: prior,
+            new: result.rawTranscript
+        )
+        let originalMeeting = meeting(id: meetingID)
+        let originalStart = originalMeeting
+            .flatMap { ISO8601DateFormatter().date(from: $0.startTime) }
+        let accumulatedDuration = (originalMeeting?.durationSeconds ?? 0) + result.durationSeconds
+
+        guard MeetingResumePolicy.hasNewTranscriptContent(prior: prior, new: result.rawTranscript) else {
+            return result.overriding(
+                startTime: originalStart,
+                durationSeconds: accumulatedDuration,
+                rawTranscript: combined,
+                formattedNotes: originalMeeting?.formattedNotes ?? result.formattedNotes
+            )
+        }
+
+        let regeneratedNotes: String
+        let regeneratedProcessingMetadata: MeetingProcessingMetadata
+        do {
+            let summaryStartedAt = Date()
+            let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
+                transcript: combined,
+                meetingTitle: result.title,
+                config: config,
+                template: result.templateSnapshot,
+                manualNotesToRetain: manualNotes,
+                visualContext: nil
+            )
+            regeneratedNotes = summaryResult.notes
+            regeneratedProcessingMetadata = MeetingProcessingMetadata(
+                transcription: result.processingMetadata.transcription,
+                summary: MeetingProcessingMetadataFactory.summary(
+                    config: config,
+                    startedAt: summaryStartedAt,
+                    thinkingStatus: summaryResult.thinkingStatus
+                ),
+                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt
+            )
+        } catch {
+            fputs("[muesli-native] resume summary regeneration failed: \(error.localizedDescription)\n", stderr)
+            regeneratedNotes = MeetingSummaryClient.summaryFailureNotes(
+                transcript: combined,
+                meetingTitle: result.title,
+                error: error,
+                manualNotes: manualNotes
+            )
+            regeneratedProcessingMetadata = MeetingProcessingMetadata(
+                transcription: result.processingMetadata.transcription,
+                summary: nil,
+                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt
+            )
+        }
+        return result.overriding(
+            startTime: originalStart,
+            durationSeconds: accumulatedDuration,
+            rawTranscript: combined,
+            formattedNotes: regeneratedNotes,
+            processingMetadata: regeneratedProcessingMetadata
+        )
+    }
+
+    private func meetingRecordingSavePlan(
+        for result: MeetingSessionResult,
+        saveDecision: Bool? = nil
+    ) -> MeetingRecordingSavePlan {
+        let shouldSave: Bool
+        if let saveDecision {
+            shouldSave = saveDecision
+        } else {
+            switch config.meetingRecordingSavePolicy {
+            case .never:
+                shouldSave = false
+            case .always:
+                shouldSave = true
+            case .prompt:
+                shouldSave = result.retainedRecordingError != nil
+            }
+        }
+
+        guard shouldSave else {
+            if let retainedRecordingURL = result.retainedRecordingURL {
+                return .discard(tempURL: retainedRecordingURL)
+            }
+            return .none
+        }
+
+        if let retainedRecordingError = result.retainedRecordingError {
+            return .failed(.failedToSaveRecording(underlying: retainedRecordingError))
+        }
+
+        guard let retainedRecordingURL = result.retainedRecordingURL else {
+            return .none
+        }
+
+        return .save(MeetingRecordingSaveRequest(
+            tempURL: retainedRecordingURL,
+            stagedAudio: result.stagedAudio,
+            stagedRawAudio: result.stagedRawAudio,
+            meetingTitle: result.title,
+            startedAt: result.recordingStartedAt ?? result.startTime,
+            supportDirectory: configStore.supportDirectory(),
+            fileFormat: config.resolvedMeetingRecordingFileFormat
+        ))
+    }
+
+    func prepareMeetingRecordingSave(
+        for result: MeetingSessionResult,
+        saveDecision: Bool? = nil
+    ) async -> PreparedMeetingRecordingSave {
+        let plan = meetingRecordingSavePlan(for: result, saveDecision: saveDecision)
+        return await Self.prepareMeetingRecordingSave(plan)
+    }
+
+    private nonisolated static func prepareMeetingRecordingSave(
+        _ plan: MeetingRecordingSavePlan
+    ) async -> PreparedMeetingRecordingSave {
+        switch plan {
+        case .none:
+            return PreparedMeetingRecordingSave(path: nil, error: nil)
+        case .discard(let tempURL):
+            try? FileManager.default.removeItem(at: tempURL)
+            return PreparedMeetingRecordingSave(path: nil, error: nil)
+        case .failed(let error):
+            return PreparedMeetingRecordingSave(path: nil, error: error)
+        case .save(let request):
+            do {
+                let outputURL = try await MeetingRecordingWriter.persistTemporaryRecordingAsync(
+                    from: request.tempURL,
+                    meetingTitle: request.meetingTitle,
+                    startedAt: request.startedAt,
+                    supportDirectory: request.supportDirectory,
+                    fileFormat: request.fileFormat
+                )
+                let sourceLayout = request.stagedAudio.flatMap {
+                    separatedSourceLayout(for: $0)
+                }
+                let sourceBundle: MeetingRecordingBundle?
+                if let stagedRawAudio = request.stagedRawAudio {
+                    sourceBundle = try MeetingRecordingBundlePublisher.publish(
+                        stagedRawAudio: stagedRawAudio,
+                        playbackURL: outputURL,
+                        supportDirectory: request.supportDirectory
+                    )
+                } else if let stagedAudio = request.stagedAudio {
+                    sourceBundle = try MeetingRecordingBundlePublisher.publish(
+                        stagedAudio: stagedAudio,
+                        playbackURL: outputURL,
+                        supportDirectory: request.supportDirectory
+                    )
+                } else {
+                    sourceBundle = nil
+                }
+                return PreparedMeetingRecordingSave(
+                    path: outputURL.path,
+                    sourceLayout: sourceLayout,
+                    sourceBundlePath: sourceBundle?.directoryURL.path,
+                    sourceBundleSchemaVersion: sourceBundle?.manifest.schemaVersion,
+                    sourceBundleState: sourceBundle?.sourceState,
+                    error: nil
+                )
+            } catch {
+                return PreparedMeetingRecordingSave(
+                    path: nil,
+                    error: .failedToSaveRecording(underlying: error)
+                )
+            }
+        }
+    }
+
+    private nonisolated static func separatedSourceLayout(
+        for stagedAudio: MeetingStagedAudio
+    ) -> MeetingRecordingSourceLayout? {
+        let hasMicrophone = stagedAudio.manifest.microphoneSampleCount > 0
+        let hasSystem = stagedAudio.manifest.systemSampleCount > 0
+        switch (hasMicrophone, hasSystem) {
+        case (true, true):
+            return .separateStereoMicrophoneAndSystem
+        case (true, false):
+            return .separateStereoMicrophoneOnly
+        case (false, true):
+            return .separateStereoSystemOnly
+        case (false, false):
+            return nil
+        }
+    }
+
+    private func cleanupTemporaryMeetingAudioFiles(
+        for result: MeetingSessionResult,
+        removeProcessingStaging: Bool = true
+    ) {
+        if let retainedRecordingURL = result.retainedRecordingURL {
+            try? FileManager.default.removeItem(at: retainedRecordingURL)
+        }
+        if let systemRecordingURL = result.systemRecordingURL {
+            try? FileManager.default.removeItem(at: systemRecordingURL)
+        }
+        if removeProcessingStaging, let stagedAudio = result.stagedAudio {
+            MeetingProcessingCapture.discard(stagedAudio)
+        }
+        if removeProcessingStaging, let stagedRawAudio = result.stagedRawAudio {
+            MeetingRawAudioCapture.discard(stagedRawAudio)
+        }
+    }
+
+    private func cleanupTemporaryDirectory(named directoryName: String, logDescription: String) {
+        let directoryURL = FileManager.default.temporaryDirectory.appendingPathComponent(directoryName)
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: directoryURL,
+            includingPropertiesForKeys: nil
+        ) else {
+            return
+        }
+
+        for file in files {
+            try? FileManager.default.removeItem(at: file)
+        }
+
+        if !files.isEmpty {
+            fputs("[muesli-native] cleaned up \(files.count) \(logDescription)\n", stderr)
+        }
+    }
+
+    private var meetingRecordingRetentionInterval: TimeInterval {
+        TimeInterval(
+            min(
+                max(config.meetingRecordingRetentionDays, 1),
+                AppConfig.maximumMeetingRecordingRetentionDays
+            )
+        ) * 24 * 60 * 60
+    }
+
+    private func meetingRecordingDeleteAfter(createdAt: Date) -> Date {
+        createdAt.addingTimeInterval(meetingRecordingRetentionInterval)
+    }
+
+    private func initializeRetentionPolicies(now: Date = Date()) {
+        do {
+            _ = try dictationStore.scheduleUnscheduledMeetingRecordings(
+                deleteAfter: now.addingTimeInterval(meetingRecordingRetentionInterval)
+            )
+        } catch {
+            fputs("[muesli-native] failed to initialize meeting recording retention: \(error)\n", stderr)
+        }
+    }
+
+    func performRetentionCleanup(now: Date = Date()) {
+        var didChangeHistory = false
+        var didExpireSyncedText = false
+
+        do {
+            let recovery = try MeetingRecordingRecoveryService.reconcile(
+                store: dictationStore,
+                supportDirectory: configStore.supportDirectory()
+            )
+            if recovery.didChange {
+                didChangeHistory = true
+                fputs(
+                    "[muesli-native] reconciled meeting recording storage: \(recovery)\n",
+                    stderr
+                )
+            }
+        } catch {
+            // Retention must not run against storage whose ownership links
+            // could not be reconciled safely.
+            fputs(
+                "[muesli-native] skipped meeting recording retention because recovery failed: \(error)\n",
+                stderr
+            )
+            return
+        }
+
+        if let retentionHours = config.dictationRetentionHours {
+            do {
+                let cutoff = now.addingTimeInterval(-TimeInterval(retentionHours) * 60 * 60)
+                let expiredCount = try dictationStore.expireDictations(
+                    endedBefore: cutoff,
+                    deletedAt: now
+                )
+                if expiredCount > 0 {
+                    didChangeHistory = true
+                    didExpireSyncedText = true
+                    fputs("[muesli-native] expired \(expiredCount) dictation history record\(expiredCount == 1 ? "" : "s")\n", stderr)
+                }
+            } catch {
+                fputs("[muesli-native] failed to expire dictation history: \(error)\n", stderr)
+            }
+        }
+
+        do {
+            let expiredRecordings = try dictationStore.expiredMeetingRecordings(asOf: now)
+            var removedCount = 0
+            for recording in expiredRecordings {
+                if try removeMeetingRecording(recording) {
+                    removedCount += 1
+                }
+            }
+            if removedCount > 0 {
+                didChangeHistory = true
+                cleanupOrphanedMeetingWaveformCacheFiles()
+                fputs("[muesli-native] expired \(removedCount) meeting recording\(removedCount == 1 ? "" : "s")\n", stderr)
+            }
+        } catch {
+            fputs("[muesli-native] failed to expire meeting recordings: \(error)\n", stderr)
+        }
+
+        do {
+            let clearedCount = try dictationStore.clearExpiredMeetingTranscripts(
+                asOf: now,
+                retentionDays: config.meetingTranscriptRetentionDays
+            )
+            if clearedCount > 0 {
+                didChangeHistory = true
+                fputs("[muesli-native] cleared \(clearedCount) expired meeting transcript\(clearedCount == 1 ? "" : "s")\n", stderr)
+            }
+        } catch {
+            fputs("[muesli-native] failed to clear expired meeting transcripts: \(error)\n", stderr)
+        }
+
+        if didExpireSyncedText {
+            scheduleICloudSyncAfterLocalChange()
+        }
+        if didChangeHistory {
+            historyWindowController?.reload()
+            statusBarController?.refresh()
+            syncAppState()
+        }
+    }
+
+    /// Dictation-completion retention: expire old dictation history only.
+    ///
+    /// `performRetentionCleanup()` must NOT be used from the dictation path: its
+    /// meeting-recording reconciliation reads and SHA-256-hashes every raw meeting
+    /// audio bundle on the main thread (tens to hundreds of MB per dictation),
+    /// which visibly delays the dictation paste. Meeting-recording recovery keeps
+    /// running from the launch/meeting lifecycle call sites of
+    /// `performRetentionCleanup()`.
+    func performDictationRetentionCleanup(now: Date = Date()) {
+        guard let retentionHours = config.dictationRetentionHours else { return }
+        do {
+            let cutoff = now.addingTimeInterval(-TimeInterval(retentionHours) * 60 * 60)
+            let expiredCount = try dictationStore.expireDictations(
+                endedBefore: cutoff,
+                deletedAt: now
+            )
+            if expiredCount > 0 {
+                fputs("[muesli-native] expired \(expiredCount) dictation history record\(expiredCount == 1 ? "" : "s")\n", stderr)
+                scheduleICloudSyncAfterLocalChange()
+                historyWindowController?.reload()
+                statusBarController?.refresh()
+                syncAppState()
+            }
+        } catch {
+            fputs("[muesli-native] failed to expire dictation history: \(error)\n", stderr)
+        }
+    }
+
+    func meetingRecordings(for meetingID: Int64) -> [MeetingRecordingRecord] {
+        (try? dictationStore.meetingRecordings(meetingID: meetingID)) ?? []
+    }
+
+    func meetingRecordingUnits(for meetingID: Int64) -> [MeetingRecordingUnitRecord] {
+        (try? dictationStore.meetingRecordingUnits(meetingID: meetingID)) ?? []
+    }
+
+    func setMeetingRecordingRetentionProtected(meetingID: Int64, protected: Bool) {
+        do {
+            try dictationStore.setMeetingRecordingRetentionProtected(
+                meetingID: meetingID,
+                protected: protected,
+                unprotectedDeleteAfter: protected
+                    ? nil
+                    : Date().addingTimeInterval(meetingRecordingRetentionInterval)
+            )
+            historyWindowController?.reload()
+            syncAppState()
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Update Audio Retention",
+                message: error.localizedDescription
+            )
+        }
+    }
+
+    func deleteMeetingRecordingNow(_ recording: MeetingRecordingRecord) {
+        do {
+            MeetingRecordingPlaybackControl.stop(
+                recordingIDs: [recording.id]
+            )
+            guard try removeMeetingRecording(recording) else {
+                presentErrorAlert(
+                    title: "Couldn't Delete Recording",
+                    message: "This recording is currently being played or processed. Stop it and try again."
+                )
+                return
+            }
+            cleanupOrphanedMeetingWaveformCacheFiles()
+            historyWindowController?.reload()
+            statusBarController?.refresh()
+            syncAppState()
+        } catch let error as MeetingLifecycleError {
+            presentErrorAlert(title: "Couldn't Delete Recording", message: error.localizedDescription)
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Delete Recording",
+                message: MeetingLifecycleError.failedToDeleteRecording(underlying: error).localizedDescription
+            )
+        }
+    }
+
+    func deleteAllMeetingRecordingsNow(meetingID: Int64) {
+        do {
+            let recordings = try dictationStore.meetingRecordings(
+                meetingID: meetingID
+            )
+            MeetingRecordingPlaybackControl.stop(
+                recordingIDs: Set(recordings.map(\.id))
+            )
+            for recording in recordings {
+                guard try removeMeetingRecording(recording) else {
+                    throw NSError(
+                        domain: "MeetingRecordingRetention",
+                        code: 3,
+                        userInfo: [
+                            NSLocalizedDescriptionKey:
+                                "A recording is currently being played or processed."
+                        ]
+                    )
+                }
+            }
+            cleanupOrphanedMeetingWaveformCacheFiles()
+            historyWindowController?.reload()
+            statusBarController?.refresh()
+            syncAppState()
+        } catch let error as MeetingLifecycleError {
+            presentErrorAlert(title: "Couldn't Delete Recordings", message: error.localizedDescription)
+        } catch {
+            presentErrorAlert(
+                title: "Couldn't Delete Recordings",
+                message: MeetingLifecycleError.failedToDeleteRecording(underlying: error).localizedDescription
+            )
+        }
+    }
+
+    @discardableResult
+    private func removeMeetingRecording(_ recording: MeetingRecordingRecord) throws -> Bool {
+        switch try MeetingRecordingRetentionService.delete(
+            recording: recording,
+            store: dictationStore,
+            supportDirectory: configStore.supportDirectory()
+        ) {
+        case .deleted:
+            return true
+        case .deferred, .notFound:
+            return false
+        }
+    }
+
+    func cleanupHistoricalMeetingWaveformCacheFilesIfNeeded() {
+        guard !config.waveformCacheOrphanCleanupMigrationApplied else { return }
+        guard cleanupOrphanedMeetingWaveformCacheFiles() else { return }
+        guard cleanupLegacyJSONMeetingWaveformCacheFiles() else { return }
+        config.waveformCacheOrphanCleanupMigrationApplied = true
+        appState.config = config
+        configStore.save(config)
+    }
+
+    @discardableResult
+    private func cleanupOrphanedMeetingWaveformCacheFiles() -> Bool {
+        let recordingURLs: [URL]
+        do {
+            recordingURLs = try dictationStore.allMeetingRecordings()
+                .compactMap { savedRecordingURL(from: $0.path) }
+        } catch {
+            return false
+        }
+        let result = RecordingWaveformCacheFiles.sweepOrphanedCachedWaveforms(
+            retainedRecordingURLs: recordingURLs,
+            supportDirectory: configStore.supportDirectory()
+        )
+        if case .skipped = result {
+            return false
+        }
+        return true
+    }
+
+    private func cleanupLegacyJSONMeetingWaveformCacheFiles() -> Bool {
+        let result = RecordingWaveformCacheFiles.removeLegacyJSONWaveformCaches(
+            supportDirectory: configStore.supportDirectory()
+        )
+        if case .skipped = result {
+            return false
+        }
+        return true
+    }
+
+    private func clearSavedMeetingRecordingsDirectory() throws {
+        let recordingsDirectory = configStore.supportDirectory()
+            .appendingPathComponent("meeting-recordings", isDirectory: true)
+        guard FileManager.default.fileExists(atPath: recordingsDirectory.path) else { return }
+        try FileManager.default.removeItem(at: recordingsDirectory)
+    }
+
+    private func clearSavedMeetingWaveformCache() throws {
+        try RecordingWaveformCacheFiles.removeAllCachedWaveforms(
+            supportDirectory: configStore.supportDirectory()
+        )
+    }
+
+    private func deleteSavedMeetingRecording(at path: String) throws {
+        guard let url = savedRecordingURL(from: path) else { return }
+        guard FileManager.default.fileExists(atPath: url.path) else { return }
+
+        do {
+            // Waveform cache is derived data; recording deletion must still proceed if cache cleanup fails.
+            try? RecordingWaveformCacheFiles.removeCachedWaveform(
+                for: url,
+                supportDirectory: configStore.supportDirectory()
+            )
+            try FileManager.default.removeItem(at: url)
+        } catch {
+            throw MeetingLifecycleError.failedToDeleteRecording(underlying: error)
+        }
+    }
+
+    private func shouldDeleteSavedMeetingRecording(at path: String, excluding meetingID: Int64) throws -> Bool {
+        guard let url = savedRecordingURL(from: path) else { return false }
+        let targetPath = url.standardizedFileURL.path
+        let meetings = try dictationStore.recentMeetings(limit: nil)
+        return !meetings.contains { meeting in
+            guard meeting.id != meetingID,
+                  let otherURL = savedRecordingURL(from: meeting.savedRecordingPath) else {
+                return false
+            }
+            return otherURL.standardizedFileURL.path == targetPath
+        }
+    }
+
+    private func savedRecordingURL(from path: String?) -> URL? {
+        guard let path else { return nil }
+        let trimmed = path.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+        return URL(fileURLWithPath: trimmed)
+    }
+
+    @MainActor
+    private func recordingSaveDecision(for result: MeetingSessionResult) async -> Bool? {
+        guard config.meetingRecordingSavePolicy == .prompt else { return nil }
+        guard result.retainedRecordingURL != nil, result.retainedRecordingError == nil else { return nil }
+        return await promptToSaveMeetingRecording(for: result.title)
+    }
+
+    @MainActor
+    private func setMeetingRecordingSavePolicy(_ policy: MeetingRecordingSavePolicy) {
+        updateConfig { $0.meetingRecordingSavePolicy = policy }
+    }
+
+    @MainActor
+    private func promptToSaveMeetingRecording(for title: String) async -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        let alert = NSAlert()
+        alert.messageText = "Save meeting recording?"
+        alert.informativeText =
+            "Keep a two-channel audio file for \"\(title)\" with microphone and system audio stored separately."
+        alert.alertStyle = .informational
+        alert.addButton(withTitle: "Save Recording")
+        alert.addButton(withTitle: "Don't Save")
+        alert.addButton(withTitle: "Always Save, Don't Ask Again")
+        alert.addButton(withTitle: "Never Save, Don't Ask Again")
+        guard let window = alertPresentationWindow(showHistoryIfNeeded: true) else {
+            fputs("[muesli-native] no window available for recording save prompt; saving recording by default\n", stderr)
+            return true
+        }
+
+        return await withCheckedContinuation { continuation in
+            alert.beginSheetModal(for: window) { [weak self] response in
+                switch response {
+                case .alertFirstButtonReturn:
+                    continuation.resume(returning: true)
+                case .alertSecondButtonReturn:
+                    continuation.resume(returning: false)
+                case .alertThirdButtonReturn:
+                    let controller: MuesliController? = self
+                    Task { @MainActor in
+                        controller?.setMeetingRecordingSavePolicy(.always)
+                        continuation.resume(returning: true)
+                    }
+                case NSApplication.ModalResponse(rawValue: 1003):
+                    let controller: MuesliController? = self
+                    Task { @MainActor in
+                        controller?.setMeetingRecordingSavePolicy(.never)
+                        continuation.resume(returning: false)
+                    }
+                default:
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+    }
+
+    @MainActor
+    private func alertPresentationWindow(showHistoryIfNeeded: Bool = true) -> NSWindow? {
+        if let window = historyWindowController?.presentationWindow,
+           isUsableSheetHost(window, allowPanel: false) {
+            return window
+        }
+
+        if showHistoryIfNeeded {
+            historyWindowController?.show()
+        }
+
+        if let window = historyWindowController?.presentationWindow,
+           isUsableSheetHost(window, allowPanel: false) {
+            return window
+        }
+
+        return NSApp.windows.first { window in
+            isUsableSheetHost(window, allowPanel: false)
+        } ?? NSApp.windows.first { window in
+            isUsableSheetHost(window, allowPanel: true)
+        }
+    }
+
+    @discardableResult
+    private func presentAlert(
+        _ alert: NSAlert,
+        fallbackLogContext: String,
+        completion: ((NSApplication.ModalResponse) -> Void)? = nil
+    ) -> Bool {
+        NSApp.activate(ignoringOtherApps: true)
+        guard let window = alertPresentationWindow(showHistoryIfNeeded: true) else {
+            fputs(
+                "[muesli-native] unable to present \(fallbackLogContext) alert: \(alert.messageText) - \(alert.informativeText)\n",
+                stderr
+            )
+            statusBarController?.setStatus(alert.messageText)
+            statusBarController?.refresh()
+            NSSound.beep()
+            return false
+        }
+
+        alert.beginSheetModal(for: window) { response in
+            completion?(response)
+        }
+        return true
+    }
+
+    private func presentMeetingStartFailureAlert(error: Error) {
+        let isSystemAudioError = error is CoreAudioSystemRecorder.RecorderError
+        let alert = NSAlert()
+        alert.alertStyle = .warning
+        if isSystemAudioError {
+            alert.messageText = "System audio capture failed"
+            alert.informativeText = "Could not start system audio recording. Open System Settings > Privacy & Security > Screen & System Audio Recording and enable \(AppIdentity.displayName) under \"System Audio Recording Only\".\n\nError: \(error.localizedDescription)"
+            alert.addButton(withTitle: "Open System Settings")
+            alert.addButton(withTitle: "OK")
+        } else {
+            alert.messageText = "Meeting failed to start"
+            alert.informativeText = error.localizedDescription
+            alert.addButton(withTitle: "OK")
+        }
+
+        presentAlert(alert, fallbackLogContext: "meeting start failure") { response in
+            guard isSystemAudioError, response == .alertFirstButtonReturn else { return }
+            CoreAudioSystemRecorder.openSystemAudioSettings()
+        }
+    }
+
+    private func presentErrorAlert(title: String, message: String) {
+        // A failure can originate from a button inside a SwiftUI confirmation
+        // sheet. Let that sheet finish dismissing before beginning an NSAlert
+        // sheet on the same host window.
+        Task { @MainActor [weak self] in
+            await Task.yield()
+            guard let self else { return }
+            let alert = NSAlert()
+            alert.messageText = title
+            alert.informativeText = message
+            alert.alertStyle = .warning
+            alert.addButton(withTitle: "OK")
+            self.presentAlert(alert, fallbackLogContext: title)
+        }
+    }
+
+    func copyToClipboard(_ text: String) {
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
+    }
+
+    func noteWindowOpened() {
+        openWindowCount += 1
+        applyDashboardWindowPresencePolicy()
+        NSApplication.shared.activate(ignoringOtherApps: true)
+    }
+
+    func noteWindowClosed() {
+        openWindowCount = max(0, openWindowCount - 1)
+        applyDashboardWindowPresencePolicy()
+    }
+
+    private func applyDashboardWindowPresencePolicy() {
+        let application = NSApplication.shared
+        let desiredPolicy = DashboardWindowPresencePolicy.activationPolicy(
+            openWindowCount: openWindowCount,
+            closeBehavior: config.dashboardCloseBehavior
+        )
+        if application.activationPolicy() != desiredPolicy {
+            application.setActivationPolicy(desiredPolicy)
+        }
+    }
+
+    private func setState(_ state: DictationState) {
+        pendingPreparingIndicatorWorkItem?.cancel()
+        pendingPreparingIndicatorWorkItem = nil
+        dictationState = state
+        appState.dictationState = state
+        let status: String
+        switch state {
+        case .idle: status = "Idle"
+        case .preparing: status = "Preparing"
+        case .recording: status = "Recording"
+        case .transcribing: status = "Transcribing"
+        }
+        statusBarController?.setStatus(status)
+        if !isDictationTestMode {
+            if state == .preparing {
+                let workItem = DispatchWorkItem { [weak self] in
+                    guard let self, self.dictationState == .preparing else { return }
+                    self.indicator.setPreparingWaveformWaiting(config: self.config)
+                }
+                pendingPreparingIndicatorWorkItem = workItem
+                DispatchQueue.main.asyncAfter(deadline: .now() + 0.12, execute: workItem)
+            } else {
+                indicator.setState(state, config: config)
+            }
+        }
+    }
+
+    private var isDictationActivityInProgress: Bool {
+        dictationState != .idle || dictationStartedAt != nil || computerUseCommandStartedAt != nil || isNemotron35Streaming
+    }
+
+    private func configureComputerUseHotkeyMonitor() {
+        guard config.enableComputerUseHotkey else {
+            computerUseHotkeyMonitor.stop()
+            return
+        }
+        computerUseHotkeyMonitor.configure(config.computerUseHotkey)
+        startComputerUseHotkeyMonitorIfNeeded()
+    }
+
+    private func configureHotkeyMonitorTiming() {
+        hotkeyMonitor.configureTriggerThreshold(milliseconds: config.hotkeyTriggerThresholdMS)
+        computerUseHotkeyMonitor.configureTriggerThreshold(milliseconds: config.computerUseHotkeyTriggerThresholdMS)
+        meetingRecordingHotkeyMonitor.configureTriggerThreshold(milliseconds: config.meetingRecordingHotkeyTriggerThresholdMS)
+    }
+
+    private func startComputerUseHotkeyMonitorIfNeeded() {
+        guard config.enableComputerUseHotkey else {
+            computerUseHotkeyMonitor.stop()
+            return
+        }
+        guard config.resolvedOnboardingUseCase.includesDictation else {
+            computerUseHotkeyMonitor.stop()
+            return
+        }
+        guard !ShortcutHotkeyPolicy.hotkeysConflict(config.computerUseHotkey, config.dictationHotkey) else {
+            computerUseHotkeyMonitor.stop()
+            fputs("[cua] computer use hotkey disabled because it matches dictation hotkey\n", stderr)
+            return
+        }
+        guard !config.enableMeetingRecordingHotkey
+            || !ShortcutHotkeyPolicy.hotkeysConflict(config.computerUseHotkey, config.meetingRecordingHotkey) else {
+            computerUseHotkeyMonitor.stop()
+            fputs("[cua] computer use hotkey disabled because it matches meeting recording hotkey\n", stderr)
+            return
+        }
+        computerUseHotkeyMonitor.doubleTapEnabled = config.enableDoubleTapDictation
+        computerUseHotkeyMonitor.configure(config.computerUseHotkey)
+        computerUseHotkeyMonitor.start()
+    }
+
+    private func startMeetingRecordingHotkeyMonitorIfNeeded() {
+        guard config.enableMeetingRecordingHotkey else {
+            meetingRecordingHotkeyMonitor.stop()
+            return
+        }
+        let validation = ShortcutHotkeyPolicy.validateMeetingRecordingHotkey(
+            config.meetingRecordingHotkey,
+            dictationHotkey: config.dictationHotkey,
+            computerUseHotkey: config.computerUseHotkey,
+            isComputerUseEnabled: config.enableComputerUseHotkey
+        )
+        guard validation.didUpdate else {
+            meetingRecordingHotkeyMonitor.stop()
+            fputs("[meetings] meeting recording hotkey disabled because it conflicts with another active shortcut\n", stderr)
+            return
+        }
+        meetingRecordingHotkeyMonitor.doubleTapEnabled = false
+        meetingRecordingHotkeyMonitor.configure(config.meetingRecordingHotkey)
+        meetingRecordingHotkeyMonitor.start()
+    }
+
+    private func beginMeetingActivity(reason: String) {
+        guard meetingActivity == nil else { return }
+        meetingActivity = ProcessInfo.processInfo.beginActivity(
+            options: [
+                .userInitiatedAllowingIdleSystemSleep,
+                .suddenTerminationDisabled,
+                .automaticTerminationDisabled,
+            ],
+            reason: reason
+        )
+    }
+
+    private func updateMeetingStartStatus(_ status: String?) {
+        meetingStartStatus = status
+        appState.isMeetingStarting = isStartingMeetingRecording
+        appState.meetingStartStatus = status
+    }
+
+    private func updateImportProgressStatus(_ status: String, sessionID: UUID) {
+        guard importTask != nil,
+              importSessionID == sessionID,
+              isStartingMeetingRecording else { return }
+        updateMeetingStartStatus(status)
+        statusBarController?.setStatus(status)
+        statusBarController?.refresh()
+        indicator.showLoading(status)
+    }
+
+    private func blockDictationForMeetingActivityIfNeeded() -> Bool {
+        guard isStartingMeetingRecording else { return false }
+        let status = meetingStartStatus ?? "Preparing meeting..."
+        indicator.showLoading(status)
+        statusBarController?.setStatus(status)
+        statusBarController?.refresh()
+        return true
+    }
+
+    private func endMeetingActivity() {
+        guard backgroundMeetingProcessingCount == 0,
+              activeMeetingSession?.isRecording != true else { return }
+        guard let activity = meetingActivity else { return }
+        ProcessInfo.processInfo.endActivity(activity)
+        meetingActivity = nil
+    }
+
+    private func dismissPresentedMeetingDetection() {
+        guard let candidate = presentedMeetingCandidate else { return }
+        presentedMeetingCandidate = nil
+        meetingMonitor.markPromptClosed(candidate)
+        if !isShowingCalendarNotification,
+           meetingNotification.currentPromptID == candidate.id {
+            meetingNotification.close()
+        }
+        showPendingMeetingCompletionNotificationIfPossible()
+    }
+
+    private func updateMeetingNotificationVisibility() {
+        meetingMonitor.refreshState()
+        showPendingMeetingCompletionNotificationIfPossible()
+    }
+
+    private func enqueueOrShowMeetingCompletionNotification(meetingID: Int64?, title: String) {
+        let notification = PendingMeetingCompletionNotification(meetingID: meetingID, title: title)
+        guard canShowMeetingCompletionNotification else {
+            pendingMeetingCompletionNotification = notification
+            return
+        }
+        showMeetingCompletionNotification(notification)
+    }
+
+    private func showPendingMeetingCompletionNotificationIfPossible() {
+        guard let notification = pendingMeetingCompletionNotification,
+              canShowMeetingCompletionNotification else { return }
+        pendingMeetingCompletionNotification = nil
+        showMeetingCompletionNotification(notification)
+    }
+
+    private var canShowMeetingCompletionNotification: Bool {
+        MeetingCompletionNotificationPolicy.shouldShow(
+            hasPresentedMeetingCandidate: presentedMeetingCandidate != nil,
+            isShowingCalendarNotification: isShowingCalendarNotification,
+            isMeetingNotificationVisible: meetingNotification.isVisible
+        )
+    }
+
+    private func showMeetingCompletionNotification(_ notification: PendingMeetingCompletionNotification) {
+        meetingNotification.show(
+            title: "Transcription complete",
+            subtitle: notification.title,
+            actionLabel: "View Notes",
+            onStartRecording: { [weak self] in
+                guard let self else { return }
+                if let meetingID = notification.meetingID {
+                    self.showMeetingDocument(id: meetingID)
+                }
+                self.syncAppState()
+                self.historyWindowController?.show()
+            },
+            onClose: { [weak self] in
+                self?.showPendingMeetingCompletionNotificationIfPossible()
+            }
+        )
+    }
+
+    private func armMeetingAutoStop(
+        source: MeetingAutoStopSource?,
+        response: MeetingSignalLossResponse = .autoStopAfterWarning
+    ) {
+        activeMeetingAutoStop.arm(source: source)
+        activeMeetingSignalLossResponse = source == nil ? .none : response
+        meetingSignalLossPromptState.resetForRecording()
+        syncMeetingDetectionMonitor()
+    }
+
+    private func recentMeetingAutoStopSource() -> MeetingAutoStopSource? {
+        guard let candidate = latestMeetingActivityCandidate,
+              let observedAt = latestMeetingActivityCandidateObservedAt,
+              Date().timeIntervalSince(observedAt) <= 15 else {
+            return nil
+        }
+        guard !isMutedMeetingDetectionCandidate(candidate) else {
+            latestMeetingActivityCandidate = nil
+            latestMeetingActivityCandidateObservedAt = nil
+            return nil
+        }
+        return MeetingAutoStopSource(candidate: candidate)
+    }
+
+    private func isMutedMeetingDetectionCandidate(_ candidate: MeetingCandidate) -> Bool {
+        guard let sourceBundleID = candidate.sourceBundleID else { return false }
+        return isMutedMeetingDetectionBundleID(sourceBundleID)
+    }
+
+    private func isMutedMeetingDetectionBundleID(_ bundleID: String) -> Bool {
+        config.mutedMeetingDetectionAppBundleIDs.contains(bundleID)
+    }
+
+    private func disarmMeetingAutoStop() {
+        activeMeetingAutoStop.disarm()
+        activeMeetingSignalLossResponse = .none
+        meetingSignalLossPromptState.resetForRecording()
+        latestMeetingActivityCandidate = nil
+        latestMeetingActivityCandidateObservedAt = nil
+        syncMeetingDetectionMonitor()
+    }
+
+    private func handleMeetingActivityCandidate(_ candidate: MeetingCandidate?) {
+        if !activeMeetingAutoStop.isArmed,
+           !isMeetingRecording(),
+           !isStartingMeetingRecording {
+            if let candidate {
+                latestMeetingActivityCandidate = candidate
+                latestMeetingActivityCandidateObservedAt = Date()
+            } else {
+                latestMeetingActivityCandidate = nil
+                latestMeetingActivityCandidateObservedAt = nil
+            }
+        }
+
+        if activeMeetingAutoStop.isArmed,
+           isStartingMeetingRecording,
+           !isStoppingMeetingRecording {
+            activeMeetingAutoStop.observeBeforeRecordingStarted(candidate: candidate)
+            return
+        }
+
+        guard activeMeetingAutoStop.isArmed,
+              activeMeetingSession?.isRecording == true,
+              !isStoppingMeetingRecording else {
+            return
+        }
+        if let sourceBundleID = activeMeetingAutoStop.source?.sourceBundleID,
+           isMutedMeetingDetectionBundleID(sourceBundleID) {
+            return
+        }
+
+        let now = Date()
+        let matchedSource = candidate.flatMap { candidate in
+            activeMeetingAutoStop.source.map { source in
+                MeetingAutoStopPolicy.matches(candidate: candidate, source: source)
+            }
+        } ?? false
+        if matchedSource {
+            meetingSignalLossPromptState.markSourceRecovered()
+            dismissMeetingSignalLossPromptIfVisible(for: activeMeetingID)
+        }
+        if activeMeetingAutoStop.observe(
+            candidate: candidate,
+            now: now,
+            gracePeriod: meetingAutoStopGracePeriod
+        ) {
+            presentMeetingSignalLossPromptIfNeeded()
+        }
+    }
+
+    private func meetingSignalLossPromptID(for meetingID: Int64?) -> String {
+        meetingID.map { "meeting-signal-lost:\($0)" } ?? "meeting-signal-lost"
+    }
+
+    private func dismissMeetingSignalLossPromptIfVisible(for meetingID: Int64?) {
+        guard meetingNotification.isVisible,
+              meetingNotification.currentPromptID == meetingSignalLossPromptID(for: meetingID) else {
+            return
+        }
+        meetingNotification.close()
+    }
+
+    private func presentMeetingSignalLossPromptIfNeeded() {
+        guard activeMeetingSignalLossResponse != .none,
+              meetingSignalLossPromptState.canPresentPrompt,
+              activeMeetingSession?.isRecording == true,
+              !isStoppingMeetingRecording else { return }
+
+        let meetingID = activeMeetingID
+        let promptID = meetingSignalLossPromptID(for: meetingID)
+        guard meetingNotification.currentPromptID != promptID || !meetingNotification.isVisible else { return }
+
+        meetingSignalLossPromptState.markPromptPresented()
+        let response = activeMeetingSignalLossResponse
+        let didShow = meetingNotification.show(
+            promptID: promptID,
+            title: "Meeting signal lost",
+            subtitle: "Still recording. Stop if the meeting ended.",
+            actionLabel: "Stop Recording",
+            dismissAfter: 30,
+            // MeetingNotificationController uses onStartRecording as its generic
+            // primary-action slot; here the primary action is stopping recording.
+            onStartRecording: { [weak self] in
+                guard let self, self.activeMeetingID == meetingID else { return }
+                self.stopMeetingRecording()
+            },
+            onDismiss: { [weak self] in
+                guard let self, self.activeMeetingID == meetingID else { return }
+                self.meetingSignalLossPromptState.markDismissedByUser()
+            },
+            onAutoDismiss: { [weak self] in
+                guard let self else { return }
+                guard self.activeMeetingID == meetingID else { return }
+                self.meetingSignalLossPromptState.markAutoDismissed()
+                guard response == .autoStopAfterWarning else { return }
+                fputs("[meeting] auto-stopping recording after meeting source disappeared and warning timed out\n", stderr)
+                self.stopMeetingRecording()
+            }
+        )
+
+        if !didShow, response == .autoStopAfterWarning {
+            fputs("[meeting] auto-stopping recording after meeting source disappeared; warning unavailable\n", stderr)
+            stopMeetingRecording()
+        }
+    }
+
+    private func presentMeetingDetection(_ candidate: MeetingCandidate) {
+        guard config.showMeetingDetectionNotification,
+              !isShowingCalendarNotification,
+              !isMeetingRecording(),
+              !isStartingMeetingRecording else { return }
+
+        guard meetingNotification.currentPromptID != candidate.id || !meetingNotification.isVisible else {
+            presentedMeetingCandidate = candidate
+            return
+        }
+
+        let title = candidate.subtitle
+        presentedMeetingCandidate = candidate
+        let preferredScreen = meetingSourceWindowLocator.screen(for: candidate)
+        let didShow = meetingNotification.show(
+            promptID: candidate.id,
+            title: "Meeting detected",
+            subtitle: title,
+            preferredScreen: preferredScreen,
+            platform: MeetingPlatform(candidate.platform),
+            onStartRecording: { [weak self] in
+                guard let self else { return }
+                if self.startMeetingRecordingFromEntryPoint(
+                    title: title,
+                    autoStopSource: MeetingAutoStopSource(candidate: candidate),
+                    presentation: .backgroundPill,
+                    startOrigin: .detectedPrompt
+                ) {
+                    self.meetingMonitor.markRecordingStarted(candidate)
+                    self.presentedMeetingCandidate = nil
+                    self.showPendingMeetingCompletionNotificationIfPossible()
+                } else {
+                    self.meetingMonitor.refreshState()
+                }
+            },
+            onDismiss: { [weak self] in
+                guard let self else { return }
+                self.presentedMeetingCandidate = nil
+                self.meetingMonitor.markPromptUserDismissed(candidate)
+                self.meetingMonitor.refreshState()
+                self.showPendingMeetingCompletionNotificationIfPossible()
+            },
+            onAutoDismiss: { [weak self] in
+                guard let self else { return }
+                self.meetingMonitor.markPromptAutoDismissed(candidate)
+                if self.presentedMeetingCandidate == candidate {
+                    self.presentedMeetingCandidate = nil
+                }
+                self.meetingMonitor.refreshState()
+                self.showPendingMeetingCompletionNotificationIfPossible()
+            },
+            onClose: { [weak self] in
+                guard let self, self.presentedMeetingCandidate == candidate else { return }
+                self.presentedMeetingCandidate = nil
+                self.meetingMonitor.markPromptClosed(candidate)
+                self.showPendingMeetingCompletionNotificationIfPossible()
+            }
+        )
+        if didShow {
+            meetingMonitor.markPromptShown(candidate)
+        } else if presentedMeetingCandidate == candidate {
+            presentedMeetingCandidate = nil
+        }
+    }
+
+    @MainActor
+    private func setMeetingProcessingStage(_ stage: MeetingProcessingStage) {
+        switch stage {
+        case .transcribingAudio:
+            setMeetingProcessingStatus("Transcribing")
+        case .cleaningAudio:
+            setMeetingProcessingStatus("Cleaning")
+        case .generatingTitle:
+            setMeetingProcessingStatus("Titling")
+        case .summarizingNotes:
+            setMeetingProcessingStatus("Summarizing")
+        }
+    }
+
+    @MainActor
+    private func setMeetingProcessingStatus(_ status: String) {
+        statusBarController?.setStatus(status)
+        statusBarController?.refresh()
+        indicator.setTranscribingTitle(status, config: config)
+    }
+
+    private func handleComputerUsePrepare() {
+        guard canPrepareComputerUseCommand else { return }
+        fputs("[cua] prepare\n", stderr)
+        meetingMonitor.suppressWhileActive()
+        meetingMonitor.refreshState()
+        setState(.preparing)
+        computerUseAudioSessionManager.arm(source: "computer_use_hotkey_prepare")
+        activeComputerUseAudioSessionID = computerUseAudioSessionManager.currentSessionID
+    }
+
+    private func handleComputerUseStart() {
+        guard canStartComputerUseCommand else { return }
+        fputs("[cua] recording start\n", stderr)
+        meetingMonitor.suppressWhileActive()
+        computerUseCommandStartedAt = Date()
+        indicator.powerProvider = { [weak self] in
+            self?.computerUseAudioSessionManager.currentPower() ?? -160
+        }
+        setState(.preparing)
+        computerUseAudioSessionManager.beginRecording(
+            mode: "computer_use",
+            duckingEnabled: false,
+            mediaPauseEnabled: false
+        )
+        activeComputerUseAudioSessionID = computerUseAudioSessionManager.currentSessionID
+    }
+
+    private func handleComputerUseToggleStart() {
+        guard canStartComputerUseCommand else {
+            computerUseHotkeyMonitor.cancelToggleMode()
+            return
+        }
+        fputs("[cua] toggle command start\n", stderr)
+        indicator.isToggleDictation = true
+        handleComputerUseStart()
+    }
+
+    private func handleComputerUseToggleStop() {
+        fputs("[cua] toggle command stop\n", stderr)
+        indicator.isToggleDictation = false
+        handleComputerUseStop()
+    }
+
+    private func handleComputerUseCancel() {
+        fputs("[cua] cancel\n", stderr)
+        guard !interactiveAudioSessionOwnership.shouldIgnoreCleanup(for: .computerUse) else {
+            fputs("[cua] ignoring cleanup while dictation owns interactive audio\n", stderr)
+            computerUseHotkeyMonitor.cancelToggleMode()
+            return
+        }
+        computerUseCommandTask?.cancel()
+        computerUseCommandTask = nil
+        computerUseCommandTaskID = nil
+        computerUseAudioSessionManager.cancel(reason: "computer_use_cancel")
+        activeComputerUseAudioSessionID = nil
+        computerUseCommandStartedAt = nil
+        pendingComputerUseStopSessionID = nil
+        pendingComputerUseStopStartedAt = nil
+        indicator.isToggleDictation = false
+        computerUseHotkeyMonitor.cancelToggleMode()
+        indicator.hideComputerUseCursor()
+        resetComputerUseFloatingStatus()
+        setState(.idle)
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+    }
+
+    private func handleComputerUseStop() {
+        fputs("[cua] stop\n", stderr)
+        guard pendingComputerUseStopSessionID == nil else {
+            fputs("[cua] stop already pending\n", stderr)
+            return
+        }
+        guard let sessionID = activeComputerUseAudioSessionID,
+              computerUseAudioSessionManager.currentSessionID == sessionID else {
+            fputs("[cua] stop without owned audio session\n", stderr)
+            return
+        }
+        indicator.isToggleDictation = false
+        let startedAt = computerUseCommandStartedAt ?? Date()
+        computerUseCommandStartedAt = nil
+        activeComputerUseAudioSessionID = nil
+        pendingComputerUseStopSessionID = sessionID
+        pendingComputerUseStopStartedAt = startedAt
+        computerUseAudioSessionManager.stop()
+    }
+
+    private func finishComputerUseAudioStop(wavURL: URL?, startedAt: Date) {
+        guard let wavURL else {
+            fputs("[cua] stop without wav\n", stderr)
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+            return
+        }
+        let duration = max(Date().timeIntervalSince(startedAt), 0)
+        if duration < 0.3 {
+            fputs("[cua] discarded short recording\n", stderr)
+            try? FileManager.default.removeItem(at: wavURL)
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+            return
+        }
+
+        indicator.setTranscribingTitle("Parsing command", config: config)
+        setState(.transcribing)
+        computerUseCommandTask?.cancel()
+        let taskID = UUID()
+        computerUseCommandTaskID = taskID
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                try? FileManager.default.removeItem(at: wavURL)
+            }
+
+            do {
+                let result = try await self.transcriptionCoordinator.transcribeDictation(
+                    at: wavURL,
+                    backend: self.selectedBackend,
+                    cohereLanguage: self.config.resolvedCohereLanguage,
+                    indicASRLanguage: self.config.resolvedIndicASRLanguage,
+                    enablePostProcessor: false,
+                    customWords: self.serializedCustomWords(),
+                    appContext: nil
+                )
+                try Task.checkCancellation()
+                let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                await MainActor.run {
+                    guard self.computerUseCommandTaskID == taskID else { return }
+                    TelemetryDeck.signal("computer_use.command_parsed", parameters: [
+                        "planner_enabled": self.config.enableComputerUsePlanner ? "true" : "false",
+                    ])
+                }
+                guard !text.isEmpty else {
+                    fputs("[cua] empty transcript, skipping planner\n", stderr)
+                    await MainActor.run {
+                        guard self.computerUseCommandTaskID == taskID else { return }
+                        self.computerUseCommandTask = nil
+                        self.computerUseCommandTaskID = nil
+                        self.setState(.idle)
+                        self.meetingMonitor.resumeAfterCooldown()
+                        self.meetingMonitor.refreshState()
+                    }
+                    return
+                }
+                guard await MainActor.run(body: {
+                    self.computerUseCommandTaskID == taskID
+                }) else { return }
+                try Task.checkCancellation()
+                let commandEndedAt = Date()
+                let dictationID = try? self.dictationStore.insertDictation(
+                    text: text,
+                    durationSeconds: duration,
+                    source: "cua",
+                    startedAt: startedAt,
+                    endedAt: commandEndedAt
+                )
+                guard await MainActor.run(body: {
+                    self.computerUseCommandTaskID == taskID
+                }) else { return }
+                await MainActor.run {
+                    self.scheduleICloudSyncAfterLocalChange()
+                    self.performRetentionCleanup()
+                }
+                await self.handleComputerUseCommand(
+                    transcript: text,
+                    dictationID: dictationID,
+                    taskID: taskID
+                )
+            } catch is CancellationError {
+                fputs("[cua] command parsing cancelled\n", stderr)
+                await MainActor.run {
+                    guard self.computerUseCommandTaskID == taskID else { return }
+                    self.computerUseCommandTask = nil
+                    self.computerUseCommandTaskID = nil
+                    self.setState(.idle)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                }
+            } catch {
+                fputs("[cua] transcription failed: \(error)\n", stderr)
+                await MainActor.run {
+                    guard self.computerUseCommandTaskID == taskID else { return }
+                    self.computerUseCommandTask = nil
+                    self.computerUseCommandTaskID = nil
+                    self.setState(.idle)
+                    self.indicator.showWarning("CUA command failed", icon: "!")
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.meetingMonitor.refreshState()
+                }
+            }
+        }
+        computerUseCommandTask = task
+    }
+
+    private var canPrepareComputerUseCommand: Bool {
+        !isMeetingRecording()
+            && !isDictationTestMode
+            && dictationStartedAt == nil
+            && computerUseCommandStartedAt == nil
+            && pendingComputerUseStopSessionID == nil
+            && computerUseCommandTask == nil
+            && !isNemotron35Streaming
+            && interactiveAudioSessionOwnership.canStart(.computerUse)
+            && dictationState == .idle
+    }
+
+    private var canStartComputerUseCommand: Bool {
+        !isMeetingRecording()
+            && !isDictationTestMode
+            && dictationStartedAt == nil
+            && computerUseCommandStartedAt == nil
+            && pendingComputerUseStopSessionID == nil
+            && computerUseCommandTask == nil
+            && !isNemotron35Streaming
+            && interactiveAudioSessionOwnership.canStart(.computerUse)
+            && (dictationState == .idle || dictationState == .preparing)
+    }
+
+    private var interactiveAudioSessionOwnership: InteractiveAudioSessionOwnership {
+        let computerUseIsActive = computerUseAudioSessionManager.hasActiveSession
+            || computerUseCommandStartedAt != nil
+            || pendingComputerUseStopSessionID != nil
+            || computerUseCommandTask != nil
+        let dictationIsActive = dictationAudioSessionManager.hasActiveSession
+            || dictationStartedAt != nil
+            || pendingDictationStopSessionID != nil
+            || isNemotron35Streaming
+            || (!computerUseIsActive && dictationState != .idle)
+        return InteractiveAudioSessionOwnership(
+            dictationIsActive: dictationIsActive,
+            computerUseIsActive: computerUseIsActive
+        )
+    }
+
+    private func shouldRejectDictationForComputerUseActivity() -> Bool {
+        guard !interactiveAudioSessionOwnership.canStart(.dictation) else { return false }
+        fputs("[muesli-native] ignoring dictation start while computer use owns interactive audio\n", stderr)
+        hotkeyMonitor.cancelToggleMode()
+        return true
+    }
+
+    private func shouldIgnoreDictationCleanupForComputerUseActivity() -> Bool {
+        guard interactiveAudioSessionOwnership.shouldIgnoreCleanup(for: .dictation) else { return false }
+        fputs("[muesli-native] ignoring dictation cleanup while computer use owns interactive audio\n", stderr)
+        hotkeyMonitor.cancelToggleMode()
+        return true
+    }
+
+    @MainActor
+    private func handleComputerUseCommand(
+        transcript: String,
+        dictationID: Int64?,
+        taskID: UUID
+    ) async {
+        guard computerUseCommandTaskID == taskID else { return }
+        resetComputerUseFloatingStatus()
+        presentComputerUseTranscript(transcript)
+        setState(.transcribing)
+        let runtime = ComputerUsePlannerRuntime(config: config) { [weak self] status in
+            guard let self, self.computerUseCommandTaskID == taskID else { return }
+            self.presentComputerUseFloatingStatus(status)
+        }
+
+        let result = await runtime.run(command: transcript)
+        guard computerUseCommandTaskID == taskID else { return }
+        indicator.hideComputerUseCursor()
+        if result.status == .cancelled {
+            computerUseCommandTask = nil
+            computerUseCommandTaskID = nil
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+            TelemetryDeck.signal("computer_use.command_finished", parameters: [
+                "status": "\(result.status)",
+            ])
+            return
+        }
+        persistComputerUseTrace(result, dictationID: dictationID)
+        await waitForComputerUseFloatingStatusDwell()
+        guard computerUseCommandTaskID == taskID else { return }
+        computerUseCommandTask = nil
+        computerUseCommandTaskID = nil
+        presentComputerUseRuntimeResult(result)
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        TelemetryDeck.signal("computer_use.command_finished", parameters: [
+            "status": "\(result.status)",
+        ])
+    }
+
+    @MainActor
+    private func resetComputerUseFloatingStatus() {
+        computerUseFloatingStatusWorkItem?.cancel()
+        computerUseFloatingStatusWorkItem = nil
+        computerUseLastFloatingStatusAt = .distantPast
+        computerUseLastFloatingStatus = ""
+        computerUseTranscriptVisible = false
+    }
+
+    @MainActor
+    private func presentComputerUseTranscript(_ transcript: String) {
+        computerUseTranscriptVisible = true
+        computerUseLastFloatingStatusAt = .distantPast
+        computerUseLastFloatingStatus = ""
+        indicator.showComputerUseTranscript(transcript, config: config)
+    }
+
+    @MainActor
+    private func presentComputerUseFloatingStatus(_ status: String) {
+        let trimmed = status.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return }
+
+        statusBarController?.setStatus(trimmed)
+        guard dictationState == .transcribing else { return }
+        guard let floatingStatus = computerUseFloatingStatusLabel(for: trimmed) else { return }
+        if computerUseTranscriptVisible && !shouldReplaceComputerUseTranscript(with: floatingStatus) {
+            return
+        }
+        guard floatingStatus != computerUseLastFloatingStatus else { return }
+
+        let now = Date()
+        let elapsed = now.timeIntervalSince(computerUseLastFloatingStatusAt)
+        if shouldShowComputerUseStatusImmediately(floatingStatus, elapsed: elapsed) {
+            computerUseFloatingStatusWorkItem?.cancel()
+            computerUseFloatingStatusWorkItem = nil
+            applyComputerUseFloatingStatus(floatingStatus, at: now)
+            return
+        }
+
+        let delay = max(0.08, computerUseFloatingStatusMinimumDwell - elapsed)
+        computerUseFloatingStatusWorkItem?.cancel()
+        let workItem = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            Task { @MainActor in
+                guard self.dictationState == .transcribing else { return }
+                self.applyComputerUseFloatingStatus(floatingStatus, at: Date())
+                self.computerUseFloatingStatusWorkItem = nil
+            }
+        }
+        computerUseFloatingStatusWorkItem = workItem
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay, execute: workItem)
+    }
+
+    @MainActor
+    private func computerUseFloatingStatusLabel(for status: String) -> String? {
+        if status.hasPrefix("Planning step") {
+            return computerUseLastFloatingStatus.isEmpty ? "Thinking..." : nil
+        }
+        if status == "Observing screen" {
+            return "Reading screen"
+        }
+        if status == "Screen fallback" {
+            return "Using screen"
+        }
+        if status == "Retrying planner" {
+            return "Retrying"
+        }
+        return status
+    }
+
+    @MainActor
+    private func shouldShowComputerUseStatusImmediately(_ status: String, elapsed: TimeInterval) -> Bool {
+        guard !computerUseLastFloatingStatus.isEmpty else { return true }
+        if elapsed >= computerUseFloatingStatusMinimumDwell { return true }
+        if status == "Done" || status == "Failed" || status == "Confirm" { return true }
+        if computerUseLastFloatingStatus == "Thinking...", elapsed >= 0.25 {
+            return true
+        }
+        if isConcreteComputerUseFloatingStatus(status) {
+            return elapsed >= 0.2
+        }
+        return false
+    }
+
+    @MainActor
+    private func shouldReplaceComputerUseTranscript(with status: String) -> Bool {
+        if status == "Thinking..." || status == "Reading screen" {
+            return false
+        }
+        return true
+    }
+
+    @MainActor
+    private func isConcreteComputerUseFloatingStatus(_ status: String) -> Bool {
+        status.hasPrefix("Opening")
+            || status.hasPrefix("Opened")
+            || status.hasPrefix("Clicked")
+            || status.hasPrefix("Typed")
+            || status.hasPrefix("Navigated")
+            || status == "Navigating"
+            || status == "Typing"
+            || status == "Moving cursor"
+            || status.hasPrefix("Moving to")
+            || status == "Clicking"
+            || status == "Scrolling"
+            || status == "Pressing key"
+            || status == "Using screen"
+    }
+
+    @MainActor
+    private func applyComputerUseFloatingStatus(_ status: String, at date: Date) {
+        computerUseTranscriptVisible = false
+        computerUseLastFloatingStatus = status
+        computerUseLastFloatingStatusAt = date
+        indicator.setTranscribingTitle(status, config: config)
+    }
+
+    @MainActor
+    private func waitForComputerUseFloatingStatusDwell() async {
+        computerUseFloatingStatusWorkItem?.cancel()
+        computerUseFloatingStatusWorkItem = nil
+        let elapsed = Date().timeIntervalSince(computerUseLastFloatingStatusAt)
+        let remaining = computerUseLastFloatingStatus.isEmpty
+            ? 0
+            : computerUseFloatingStatusMinimumDwell - elapsed
+        if remaining > 0 {
+            try? await Task.sleep(nanoseconds: UInt64(remaining * 1_000_000_000))
+        }
+    }
+
+    private func persistComputerUseTrace(_ result: ComputerUsePlannerRuntimeResult, dictationID: Int64?) {
+        guard let dictationID else { return }
+        try? dictationStore.insertComputerUseTrace(
+            dictationID: dictationID,
+            finalStatus: computerUseTraceStatus(result.status),
+            finalMessage: result.message,
+            events: result.traceEvents
+        )
+        statusBarController?.refresh()
+        historyWindowController?.reload()
+        syncAppState()
+    }
+
+    private func computerUseTraceStatus(_ status: ComputerUsePlannerRuntimeResult.Status) -> String {
+        switch status {
+        case .done:
+            return "done"
+        case .timedOut:
+            return "timed_out"
+        case .needsConfirmation:
+            return "confirm"
+        case .failed:
+            return "failed"
+        case .cancelled:
+            return "cancelled"
+        }
+    }
+
+    private func presentComputerUseRuntimeResult(_ result: ComputerUsePlannerRuntimeResult) {
+        setState(.idle)
+        let message: String
+        let floatingMessage: String
+        let icon: String
+        switch result.status {
+        case .done:
+            message = result.message.hasPrefix("Done") ? result.message : "Done: \(result.message)"
+            floatingMessage = "Done"
+            icon = ""
+        case .timedOut:
+            message = result.message
+            floatingMessage = "Timed out"
+            icon = "!"
+        case .needsConfirmation:
+            message = result.message.hasPrefix("Confirm") ? result.message : "Confirm: \(result.message)"
+            floatingMessage = "Confirm"
+            icon = "!"
+        case .failed:
+            message = result.message
+            floatingMessage = "Failed"
+            icon = "!"
+        case .cancelled:
+            message = result.message
+            floatingMessage = "Cancelled"
+            icon = ""
+        }
+        statusBarController?.setStatus(message)
+        indicator.showWarning(floatingMessage, icon: icon, duration: 3.0)
+    }
+
+    /// Streaming RNNT dictation backend (handsfree live text at cursor).
+    private var isStreamingDictationBackend: Bool {
+        selectedBackend.isStreamingDictationBackend
+    }
+
+    private func ensureDictationBackendReady() -> Bool {
+        guard !isDictationTestMode else { return true }
+        guard !dictationBackendReadiness.allowsDictation else { return true }
+        guard let message = dictationBackendReadiness.blockingMessage(
+            backendLabel: selectedBackend.label
+        ) else { return true }
+
+        statusBarController?.setStatus(message)
+        statusBarController?.refresh()
+        switch dictationBackendReadiness {
+        case .preparing:
+            indicator.showLoading(message)
+        case .failed:
+            indicator.showWarning(message, icon: "!")
+        case .ready:
+            break
+        }
+        return false
+    }
+
+    private func handlePrepare() {
+        if shouldRejectDictationForComputerUseActivity() { return }
+        guard ensureDictationBackendReady() else { return }
+        if isMeetingRecording() { return }
+        if blockDictationForMeetingActivityIfNeeded() { return }
+        fputs("[muesli-native] prepare\n", stderr)
+        if dictationLatencyTraceID == nil {
+            beginDictationLatencyTrace(reason: "prepare")
+        }
+        markDictationLatency("prepare_requested")
+        guard !isStreamingDictationBackend else {
+            return
+        }
+        if !dictationAudioSessionManager.hasActiveSession {
+            meetingMonitor.suppressWhileActive()
+            meetingMonitor.refreshState()
+            setState(.preparing)
+            dictationAudioSessionManager.arm(source: "hotkey_prepare")
+        }
+    }
+
+    private func handleArm() {
+        if shouldRejectDictationForComputerUseActivity() { return }
+        guard ensureDictationBackendReady() else { return }
+        if isMeetingRecording() { return }
+        if blockDictationForMeetingActivityIfNeeded() { return }
+        if dictationLatencyTraceID == nil {
+            beginDictationLatencyTrace(reason: "hotkey")
+        }
+        if !isStreamingDictationBackend {
+            setState(.preparing)
+            meetingMonitor.suppressWhileActive()
+            meetingMonitor.refreshState()
+            if !dictationAudioSessionManager.hasActiveSession {
+                dictationAudioSessionManager.arm(source: "hotkey_arm")
+            }
+        }
+    }
+
+    private var defaultDictationOutputMode: DictationOutputMode {
+        config.resolvedOnboardingUseCase.includesVoiceNotes ? .voiceNote : .paste
+    }
+
+    private func beginDictationOutput(mode: DictationOutputMode? = nil) {
+        currentDictationOutputMode = mode ?? defaultDictationOutputMode
+        appState.isVoiceNoteRecording = currentDictationOutputMode == .voiceNote
+    }
+
+    private func resetDictationOutputMode() {
+        currentDictationOutputMode = .paste
+        appState.isVoiceNoteRecording = false
+    }
+
+    private var canPrimeDictationRecorder: Bool {
+        config.hasCompletedOnboarding
+            && hasStarted
+            && config.resolvedOnboardingUseCase.includesPushToTalk
+            && AVCaptureDevice.authorizationStatus(for: .audio) == .authorized
+            && dictationState == .idle
+            && !interactiveAudioSessionOwnership.computerUseIsActive
+            && !isMeetingRecording()
+            && !isStartingMeetingRecording
+            && !isStoppingMeetingRecording
+    }
+
+    private func coolDownDictationRecorder(reason: String) {
+        dictationAudioSessionManager.coolDown(reason: reason)
+    }
+
+    private func syncDictationRecorderWarmup(intent: DictationWarmupIntent, delay: TimeInterval = 0) {
+        dictationAudioSessionManager.refreshRoute(
+            intent: intent,
+            delay: delay,
+            canWarmUp: canPrimeDictationRecorder && !isStreamingDictationBackend
+        )
+    }
+
+    private func beginDictationLatencyTrace(reason: String) {
+        dictationLatencyTraceID = UUID()
+        dictationLatencyTraceStartedAt = Date()
+        markDictationLatency("trace_begin:\(reason)")
+    }
+
+    private func markDictationLatency(_ event: String) {
+        markDictationLatency(event, at: Date())
+    }
+
+    private func markDictationLatency(_ event: String, at date: Date) {
+        guard let traceID = dictationLatencyTraceID,
+              let startedAt = dictationLatencyTraceStartedAt else { return }
+        let elapsedMS = Int(date.timeIntervalSince(startedAt) * 1000)
+        let timestamp = dictationLatencyTimestampFormatter.string(from: date)
+        let routeKind = dictationAudioRoutingController.currentOutputRouteKindForDebug()
+        let routeDescription = dictationAudioRoutingController.currentRouteDebugDescription()
+        let line = "[dictation-latency] ts=\(timestamp) id=\(traceID.uuidString) event=\(event) elapsed_ms=\(elapsedMS) profile=\(dictationLatencyProfile(routeKind: routeKind)) \(routeDescription)"
+        fputs("\(line)\n", stderr)
+        appendDictationLatencyLog(line)
+    }
+
+    private func dictationLatencyProfile(routeKind: AudioOutputRouteKind) -> String {
+        switch routeKind {
+        case .speakerLike:
+            return "speaker"
+        case .headphoneLike:
+            return "headphone"
+        case .unknown:
+            return "unknown"
+        }
+    }
+
+    private func appendDictationLatencyLog(_ line: String) {
+        dictationLatencyLogWriter.append(line)
+    }
+
+    private func finishDictationLatencyTrace(_ event: String) {
+        markDictationLatency(event)
+        dictationLatencyTraceID = nil
+        dictationLatencyTraceStartedAt = nil
+    }
+
+    private func cachedPreferredDictationInputDeviceID() -> AudioObjectID? {
+        dictationAudioRoutingController.cachedPreferredInputDeviceIDForDictation()
+    }
+
+    private var shouldPlayDictationLifecycleSounds: Bool {
+        config.soundEnabled && !dictationAudioRoutingController.isDefaultOutputHeadphoneLike()
+    }
+
+    private func handleComputerUseAudioSessionEvent(_ event: DictationAudioSessionEvent) {
+        switch event {
+        case .armed(let sessionID, _):
+            guard activeComputerUseAudioSessionID == sessionID else { break }
+        case .acquiringAudio(let sessionID):
+            guard activeComputerUseAudioSessionID == sessionID else { break }
+            setState(.preparing)
+        case .streamActive(let sessionID, _):
+            guard activeComputerUseAudioSessionID == sessionID,
+                  computerUseCommandStartedAt != nil else { break }
+            setState(.recording)
+            SoundController.playDictationStart(
+                enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode
+            )
+        case .speechDetected(let sessionID, _):
+            guard activeComputerUseAudioSessionID == sessionID else { break }
+        case .noAudioTimeout(let sessionID, _):
+            guard activeComputerUseAudioSessionID == sessionID else { break }
+            statusBarController?.setStatus("Mic waiting for speech")
+        case .stopped(let eventSessionID, let wavURL):
+            guard pendingComputerUseStopSessionID == eventSessionID else {
+                fputs("[cua] ignoring stale stopped event\n", stderr)
+                if let wavURL {
+                    try? FileManager.default.removeItem(at: wavURL)
+                }
+                break
+            }
+            guard computerUseAudioSessionManager.currentSessionID == nil else {
+                fputs("[cua] ignoring stopped event while a new session is active\n", stderr)
+                if let wavURL {
+                    try? FileManager.default.removeItem(at: wavURL)
+                }
+                break
+            }
+            let startedAt = pendingComputerUseStopStartedAt ?? Date()
+            pendingComputerUseStopSessionID = nil
+            pendingComputerUseStopStartedAt = nil
+            finishComputerUseAudioStop(wavURL: wavURL, startedAt: startedAt)
+        case .audioRestored, .cancelled:
+            break
+        case .failed(let sessionID, let error):
+            guard let sessionID,
+                  activeComputerUseAudioSessionID == sessionID
+                    || pendingComputerUseStopSessionID == sessionID else { break }
+            fputs("[cua] recorder start failed: \(error)\n", stderr)
+            activeComputerUseAudioSessionID = nil
+            computerUseCommandStartedAt = nil
+            pendingComputerUseStopSessionID = nil
+            pendingComputerUseStopStartedAt = nil
+            indicator.isToggleDictation = false
+            computerUseHotkeyMonitor.cancelToggleMode()
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+        case .latency(let event, _):
+            fputs("[cua-audio] \(event)\n", stderr)
+        }
+    }
+
+    private func handleDictationAudioSessionEvent(_ event: DictationAudioSessionEvent) {
+        switch event {
+        case .armed:
+            break
+        case .acquiringAudio:
+            markDictationLatency("acquiring_audio")
+            activateDictationPreparingIndicator()
+        case .streamActive(_, let capturedAt):
+            handleDictationStreamActive(capturedAt: capturedAt)
+        case .speechDetected(_, let capturedAt):
+            handleDictationSpeechDetected(capturedAt: capturedAt)
+        case .noAudioTimeout:
+            statusBarController?.setStatus("Mic waiting for speech")
+        case .stopped(let eventSessionID, let wavURL):
+            guard pendingDictationStopSessionID == eventSessionID else {
+                fputs("[muesli-native] ignoring stale stopped event\n", stderr)
+                if let wavURL {
+                    try? FileManager.default.removeItem(at: wavURL)
+                }
+                break
+            }
+            guard dictationAudioSessionManager.currentSessionID == nil else {
+                fputs("[muesli-native] ignoring stopped event while a new session is active\n", stderr)
+                if let wavURL {
+                    try? FileManager.default.removeItem(at: wavURL)
+                }
+                break
+            }
+            let startedAt = pendingDictationStopStartedAt ?? dictationStartedAt ?? Date()
+            pendingDictationStopSessionID = nil
+            pendingDictationStopStartedAt = nil
+            finishStandardDictationStop(wavURL: wavURL, startedAt: startedAt)
+        case .audioRestored(let eventSessionID):
+            guard pendingReleaseSoundSessionID == eventSessionID else { break }
+            pendingReleaseSoundSessionID = nil
+            guard dictationAudioSessionManager.currentSessionID == nil else { break }
+            // Reuse the insert cue as the hotkey-release cue once ducked audio has
+            // been restored; waiting for transcription would make release feedback lag.
+            SoundController.playDictationInsert(enabled: shouldPlayDictationLifecycleSounds)
+        case .cancelled:
+            break
+        case .failed(_, let error):
+            fputs("[muesli-native] recorder start failed: \(error)\n", stderr)
+            if !isDictationTestMode {
+                recordDiagnosticIncident(
+                    kind: .dictationAudioFailed,
+                    stage: .dictationAudioSession,
+                    backend: selectedBackend,
+                    error: error
+                )
+            }
+            resetDictationOutputMode()
+            dictationStartedAt = nil
+            pendingDictationStopSessionID = nil
+            pendingDictationStopStartedAt = nil
+            pendingReleaseSoundSessionID = nil
+            clearCapturedDictationSessionContext()
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            meetingMonitor.refreshState()
+            finishDictationLatencyTrace("audio_session_failed")
+        case .latency(let event, let date):
+            markDictationLatency(event, at: date)
+        }
+    }
+
+    private func activateDictationPreparingIndicator() {
+        setState(.preparing)
+        if !isDictationTestMode {
+            indicator.powerProvider = { [weak self] in
+                self?.dictationAudioSessionManager.currentPower() ?? -160
+            }
+        }
+    }
+
+    private func activateDictationRecordingIndicator() {
+        if hotkeyMonitor.isToggleRecording {
+            setState(.recording)
+            indicator.setToggleDictation(true, config: config)
+            indicator.setRecordingWaveformLevel(config: config)
+        } else {
+            setState(.recording)
+            indicator.setRecordingWaveformLevel(config: config)
+        }
+        if !isDictationTestMode {
+            indicator.powerProvider = { [weak self] in
+                self?.dictationAudioSessionManager.currentPower() ?? -160
+            }
+        }
+    }
+
+    private func handleDictationStreamActive(capturedAt: Date) {
+        markDictationLatency("ui_stream_active_handling_begin")
+        markDictationLatency("ui_stream_active_received", at: capturedAt)
+        if dictationStartedAt == nil {
+            dictationStartedAt = capturedAt
+        }
+        capturedDictationContext = nil
+        activateDictationRecordingIndicator()
+        markDictationLatency("sound_start_requested:stream-active")
+        SoundController.playDictationStart(enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode)
+        markDictationLatency("ui_stream_active")
+        logDictationPowerSample(label: "ui_power_sample_350ms", delay: 0.35)
+        logDictationPowerSample(label: "ui_power_sample_1000ms", delay: 1.0)
+        if isDictationTestMode {
+            dictationTestRecordingStarted?()
+        }
+        if shouldCaptureDictationContext {
+            captureDictationContextAsync()
+        }
+    }
+
+    private func handleDictationSpeechDetected(capturedAt: Date) {
+        markDictationLatency("ui_speech_active", at: capturedAt)
+    }
+
+    private func logDictationPowerSample(label: String, delay: TimeInterval) {
+        let traceID = dictationLatencyTraceID
+        DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self, traceID] in
+            guard let self,
+                  self.dictationLatencyTraceID == traceID,
+                  self.dictationState == .recording else { return }
+            let power = Int(self.dictationAudioSessionManager.currentPower().rounded())
+            self.markDictationLatency("\(label)_db:\(power)")
+        }
+    }
+
+    private var shouldCaptureDictationContext: Bool {
+        config.enableScreenContext && config.enablePostProcessor && !isDictationTestMode
+    }
+
+    @MainActor
+    private func shouldContinueDictationOCRContextCapture(traceID: UUID?) -> Bool {
+        dictationLatencyTraceID == traceID
+            && shouldCaptureDictationContext
+            && dictationState == .recording
+            && !isMeetingRecording()
+    }
+
+    private func captureDictationContextAsync() {
+        guard shouldCaptureDictationContext else { return }
+        let traceID = dictationLatencyTraceID
+        let includeScreenOCR = config.enableDictationOCRContext
+            && !isMeetingRecording()
+            && CGPreflightScreenCaptureAccess()
+        markDictationLatency("context_capture_enqueue")
+        Task.detached(priority: .utility) { [weak self, traceID, includeScreenOCR] in
+            guard AXIsProcessTrusted() else { return }
+            let context = await DictationContextCapture.capture(
+                includeScreenOCR: includeScreenOCR,
+                shouldCaptureScreenOCR: { [weak self] in
+                    await self?.shouldContinueDictationOCRContextCapture(traceID: traceID) ?? false
+                }
+            )
+            await MainActor.run { [weak self, traceID] in
+                guard let self,
+                      self.dictationLatencyTraceID == traceID,
+                      self.shouldCaptureDictationContext,
+                      self.dictationState == .recording else { return }
+                self.capturedDictationContext = context
+                self.markDictationLatency("context_capture_ready")
+            }
+        }
+    }
+
+    private func clearCapturedDictationSessionContext() {
+        capturedDictationContext = nil
+        capturedDictationCorrectionTargetApp = nil
+    }
+
+    private func captureDictationCorrectionTargetApp() {
+        capturedDictationCorrectionTargetApp = DictationCorrectionTargetApp(
+            app: NSWorkspace.shared.frontmostApplication == NSRunningApplication.current
+                ? lastExternalApp
+                : NSWorkspace.shared.frontmostApplication
+        )
+    }
+
+    private func handleStart() {
+        if shouldRejectDictationForComputerUseActivity() { return }
+        guard ensureDictationBackendReady() else { return }
+        if isMeetingRecording() { return }
+        if blockDictationForMeetingActivityIfNeeded() { return }
+
+        // Nemotron backends support hold-to-talk (record → transcribe on release) in
+        // addition to double-tap handsfree streaming. The hold path uses the normal
+        // record-then-transcribe pipeline below; double-tap streaming is handled in
+        // handleToggleStart. Prepare/arm pre-warm is intentionally skipped for these
+        // backends (see isStreamingDictationBackend) so the double-tap detection window
+        // stays clean; beginRecording cold-starts here just like the toggle path.
+        fputs("[muesli-native] recording start\n", stderr)
+        meetingMonitor.suppressWhileActive()
+        beginDictationOutput()
+        dictationStartedAt = nil
+        clearCapturedDictationSessionContext()
+        captureDictationCorrectionTargetApp()
+        setState(.preparing)
+        dictationAudioSessionManager.beginRecording(
+            mode: "hold-start",
+            duckingEnabled: config.muteSystemAudioDuringDictation,
+            mediaPauseEnabled: config.pauseMediaDuringDictation
+        )
+    }
+
+    @available(macOS 15, *)
+    private func startNemotronStreamingAsync(
+        sessionID: UUID
+    ) {
+        Task {
+            let transcriber: Nemotron35StreamingTranscriber
+            do {
+                await transcriptionCoordinator.setNemotron35PromptId(config.resolvedNemotron35Language.promptId)
+                transcriber = try await transcriptionCoordinator.getLoadedNemotron35Transcriber()
+            } catch {
+                await MainActor.run {
+                    self.handleNemotronStreamingRuntimeFailure(error: error, sessionID: sessionID)
+                }
+                return
+            }
+            fputs("[muesli-native] got Nemotron 3.5 transcriber\n", stderr)
+            let chunkSamples = transcriber.chunkSamples
+            let makeController: @MainActor (AudioObjectID?) -> StreamingDictationController = { preferredID in
+                StreamingDictationController(
+                    transcriber: transcriber,
+                    preferredInputDeviceID: preferredID,
+                    chunkSamples: chunkSamples
+                )
+            }
+
+            await MainActor.run {
+                guard self.isNemotron35Streaming, self.nemotron35StreamingSessionID == sessionID else {
+                    fputs("[muesli-native] Nemotron session cancelled before transcriber ready\n", stderr)
+                    return
+                }
+                let currentPreferredInputDeviceID =
+                    self.dictationAudioRoutingController.cachedPreferredInputDeviceIDForDictation()
+                let controller = makeController(currentPreferredInputDeviceID)
+                controller.onPartialText = { [weak self] fullText in
+                    guard let self else { return }
+                    DispatchQueue.main.async {
+                        guard self.isNemotron35Streaming, self.nemotron35StreamingSessionID == sessionID else { return }
+                        let delta = String(fullText.dropFirst(self.previousStreamText.count))
+                        fputs("[muesli-native] streaming partial: +\"\(delta)\" (total \(fullText.count) chars)\n", stderr)
+                        if !delta.isEmpty {
+                            self.previousStreamText = fullText
+                            if self.currentDictationOutputMode != .voiceNote {
+                                PasteController.typeText(delta)
+                            }
+                        }
+                    }
+                }
+                controller.onFailure = { [weak self] error in
+                    DispatchQueue.main.async {
+                        self?.handleNemotronStreamingRuntimeFailure(error: error, sessionID: sessionID)
+                    }
+                }
+                self._streamingDictationController = controller
+                guard controller.start() else {
+                    self.handleNemotronStreamingStartFailure()
+                    return
+                }
+                self.activateDictationRecordingIndicator()
+                self.indicator.powerProvider = { [weak controller] in
+                    controller?.currentPower() ?? -160
+                }
+                fputs("[muesli-native] Nemotron streaming controller started\n", stderr)
+            }
+        }
+    }
+
+    @MainActor
+    private func handleNemotronStreamingStartFailure() {
+        fputs("[muesli-native] Nemotron streaming controller failed to start\n", stderr)
+        if !isDictationTestMode {
+            recordDiagnosticIncident(
+                kind: .streamingDictationStartFailed,
+                stage: .nemotronStreamingStart,
+                backend: selectedBackend,
+                error: nil
+            )
+        }
+        isNemotron35Streaming = false
+        _streamingDictationController = nil
+        nemotron35StreamingSessionID = nil
+        previousStreamText = ""
+        dictationStartedAt = nil
+        clearCapturedDictationSessionContext()
+        dictationAudioSessionManager.endExternalSession(reason: "nemotron-start-failed")
+        indicator.setToggleDictation(false, config: config)
+        resetDictationOutputMode()
+        setState(.idle)
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        finishDictationLatencyTrace("nemotron_start_failed")
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.backendRecovery))
+    }
+
+    @MainActor
+    private func handleNemotronStreamingRuntimeFailure(error: Error, sessionID: UUID) {
+        guard isNemotron35Streaming, nemotron35StreamingSessionID == sessionID else { return }
+        fputs("[muesli-native] Nemotron streaming failed: \(error)\n", stderr)
+        if !isDictationTestMode {
+            recordDiagnosticIncident(
+                kind: .streamingDictationRuntimeFailed,
+                stage: .nemotronStreamingRuntime,
+                backend: selectedBackend,
+                error: error
+            )
+        }
+        isNemotron35Streaming = false
+        _streamingDictationController = nil
+        nemotron35StreamingSessionID = nil
+        previousStreamText = ""
+        dictationStartedAt = nil
+        clearCapturedDictationSessionContext()
+        dictationAudioSessionManager.endExternalSession(reason: "nemotron-runtime-failed")
+        indicator.setToggleDictation(false, config: config)
+        resetDictationOutputMode()
+        setState(.idle)
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        finishDictationLatencyTrace("nemotron_runtime_failed")
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.backendRecovery))
+    }
+
+    private func handleCancel() {
+        if isMeetingRecording() { return }
+        if shouldIgnoreDictationCleanupForComputerUseActivity() { return }
+        fputs("[muesli-native] cancel\n", stderr)
+        resetDictationOutputMode()
+
+        if isNemotron35Streaming {
+            isNemotron35Streaming = false
+            if #available(macOS 15, *), let sdc = _streamingDictationController as? StreamingDictationController {
+                sdc.cancel()
+            }
+            _streamingDictationController = nil
+            nemotron35StreamingSessionID = nil
+            previousStreamText = ""
+        }
+
+        dictationAudioSessionManager.cancel(reason: "user-cancel")
+        clearCapturedDictationSessionContext()
+        dictationStartedAt = nil
+        pendingDictationStopSessionID = nil
+        pendingDictationStopStartedAt = nil
+        pendingReleaseSoundSessionID = nil
+        setState(.idle)
+        meetingMonitor.resumeAfterCooldown()
+        meetingMonitor.refreshState()
+        finishDictationLatencyTrace("cancelled")
+        syncDictationRecorderWarmup(intent: .postDictation(.cancel))
+    }
+
+    private func handleToggleStart(outputMode: DictationOutputMode? = nil) {
+        if shouldRejectDictationForComputerUseActivity() { return }
+        guard ensureDictationBackendReady() else { return }
+        if isMeetingRecording() { return }
+        if blockDictationForMeetingActivityIfNeeded() { return }
+        fputs("[muesli-native] toggle dictation start\n", stderr)
+        if dictationLatencyTraceID == nil {
+            beginDictationLatencyTrace(reason: "toggle")
+        }
+        markDictationLatency("toggle_start")
+        meetingMonitor.suppressWhileActive()
+        beginDictationOutput(mode: outputMode)
+        dictationStartedAt = nil
+        clearCapturedDictationSessionContext()
+        captureDictationCorrectionTargetApp()
+        setState(.preparing)
+
+        // Nemotron streaming: live text at cursor in handsfree mode too
+        if isStreamingDictationBackend {
+            if #available(macOS 15, *) {
+                let sessionID = UUID()
+                isNemotron35Streaming = true
+                nemotron35StreamingSessionID = sessionID
+                previousStreamText = ""
+                dictationStartedAt = Date()
+                markDictationLatency("sound_start_requested:nemotron-toggle")
+                SoundController.playDictationStart(enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode)
+                dictationAudioSessionManager.beginExternalSession(
+                    source: "nemotron-toggle",
+                    duckingEnabled: config.muteSystemAudioDuringDictation,
+                    mediaPauseEnabled: config.pauseMediaDuringDictation
+                )
+                meetingMonitor.refreshState()
+                fputs("[muesli-native] Nemotron streaming toggle mode active\n", stderr)
+                startNemotronStreamingAsync(
+                    sessionID: sessionID
+                )
+                return
+            }
+        }
+
+        dictationAudioSessionManager.beginRecording(
+            mode: "toggle",
+            duckingEnabled: config.muteSystemAudioDuringDictation,
+            mediaPauseEnabled: config.pauseMediaDuringDictation
+        )
+    }
+
+    private func handleToggleStop() {
+        fputs("[muesli-native] toggle dictation stop\n", stderr)
+        indicator.isToggleDictation = false
+        handleStop()
+    }
+
+    func toggleVoiceNoteRecording() {
+        if dictationStartedAt != nil || dictationAudioSessionManager.hasActiveSession || isNemotron35Streaming {
+            handleToggleStop()
+        } else if dictationState == .idle {
+            handleToggleStart(outputMode: .voiceNote)
+        }
+    }
+
+    private func handleStop() {
+        if isMeetingRecording() {
+            cancelDictationAudioSessionForMeetingRecordingIfNeeded()
+            return
+        }
+        if shouldIgnoreDictationCleanupForComputerUseActivity() { return }
+        fputs("[muesli-native] stop\n", stderr)
+        let startedAt = dictationStartedAt ?? Date()
+        dictationStartedAt = nil
+
+        // Nemotron streaming: text already typed — just finalize and store
+        if isNemotron35Streaming {
+            let sessionID = nemotron35StreamingSessionID
+            if #available(macOS 15, *), let controller = _streamingDictationController as? StreamingDictationController {
+                controller.stop { [weak self] finalText in
+                    DispatchQueue.main.async {
+                        self?.finishNemotronStreamingStop(
+                            finalText: finalText,
+                            startedAt: startedAt,
+                            sessionID: sessionID
+                        )
+                    }
+                }
+            } else {
+                fputs("[muesli-native] Nemotron streaming stop, controller not ready (short press)\n", stderr)
+                finishNemotronStreamingStop(
+                    finalText: "",
+                    startedAt: startedAt,
+                    sessionID: sessionID
+                )
+            }
+            dictationAudioSessionManager.endExternalSession(reason: "nemotron-stop")
+            setState(.transcribing)
+            return
+        }
+
+        markDictationLatency("sound_release_requested:stop")
+        pendingDictationStopSessionID = dictationAudioSessionManager.currentSessionID
+        pendingReleaseSoundSessionID = shouldPlayDictationLifecycleSounds && !isDictationTestMode
+            ? pendingDictationStopSessionID
+            : nil
+        pendingDictationStopStartedAt = startedAt
+        dictationAudioSessionManager.stop()
+    }
+
+    private func cancelDictationAudioSessionForMeetingRecordingIfNeeded() {
+        let hasComputerUseActivity = interactiveAudioSessionOwnership.computerUseIsActive
+        guard dictationAudioSessionManager.hasActiveSession
+            || isNemotron35Streaming
+            || hasComputerUseActivity else { return }
+        fputs("[muesli-native] cancelling dictation audio session because meeting is active\n", stderr)
+
+        if hasComputerUseActivity {
+            handleComputerUseCancel()
+        }
+
+        if isNemotron35Streaming {
+            isNemotron35Streaming = false
+            if #available(macOS 15, *), let controller = _streamingDictationController as? StreamingDictationController {
+                controller.cancel()
+            }
+            _streamingDictationController = nil
+            nemotron35StreamingSessionID = nil
+            previousStreamText = ""
+            indicator.setToggleDictation(false, config: config)
+            dictationAudioSessionManager.endExternalSession(reason: "meeting-active")
+        } else if dictationAudioSessionManager.hasActiveSession {
+            dictationAudioSessionManager.cancel(reason: "meeting-active")
+        }
+
+        dictationStartedAt = nil
+        clearCapturedDictationSessionContext()
+        pendingDictationStopSessionID = nil
+        pendingDictationStopStartedAt = nil
+        pendingReleaseSoundSessionID = nil
+        resetDictationOutputMode()
+        setState(.idle)
+        if activeMeetingID != nil || isStartingMeetingRecording || isMeetingRecording() {
+            meetingMonitor.suppressWhileActive()
+        } else {
+            meetingMonitor.resumeAfterCooldown()
+        }
+        meetingMonitor.refreshState()
+        finishDictationLatencyTrace("meeting_active_cancel")
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
+    }
+
+    private func finishNemotronStreamingStop(
+        finalText: String,
+        startedAt: Date,
+        sessionID: UUID?
+    ) {
+        guard isNemotron35Streaming, nemotron35StreamingSessionID == sessionID else {
+            fputs("[muesli-native] ignoring stale Nemotron stop completion\n", stderr)
+            return
+        }
+        isNemotron35Streaming = false
+        _streamingDictationController = nil
+        nemotron35StreamingSessionID = nil
+        previousStreamText = ""
+        let duration = max(Date().timeIntervalSince(startedAt), 0)
+        fputs("[muesli-native] Nemotron streaming stop, got \(finalText.count) chars\n", stderr)
+        let cleaned = FillerWordFilter.apply(finalText)
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !config.maraudersMapUnlocked { checkMaraudersMapActivation(cleaned) }
+
+        if !cleaned.isEmpty {
+            _ = try? dictationStore.insertDictation(
+                text: cleaned,
+                durationSeconds: duration,
+                startedAt: startedAt,
+                endedAt: Date()
+            )
+            scheduleICloudSyncAfterLocalChange()
+            performRetentionCleanup()
+        }
+
+        statusBarController?.refresh()
+        historyWindowController?.reload()
+        syncAppState()
+        clearCapturedDictationSessionContext()
+        resetDictationOutputMode()
+        setState(.idle)
+        meetingMonitor.resumeAfterCooldown()
+        fputs("[muesli-native] Nemotron streaming done (\(String(format: "%.1f", duration))s)\n", stderr)
+        finishDictationLatencyTrace("nemotron_stop")
+        syncDictationRecorderWarmup(intent: .idlePrewarm(.backendRecovery))
+    }
+
+    private func finishStandardDictationStop(wavURL stoppedWavURL: URL?, startedAt: Date) {
+        markDictationLatency("stop_finished")
+        guard let wavURL = stoppedWavURL else {
+            fputs("[muesli-native] stop without wav\n", stderr)
+            clearCapturedDictationSessionContext()
+            resetDictationOutputMode()
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            finishDictationLatencyTrace("stop_without_wav")
+            syncDictationRecorderWarmup(intent: .postDictation(.stopWithoutWav))
+            return
+        }
+        let duration = max(Date().timeIntervalSince(startedAt), 0)
+        if duration < 0.3 {
+            fputs("[muesli-native] discarded short recording\n", stderr)
+            try? FileManager.default.removeItem(at: wavURL)
+            if isDictationTestMode {
+                dictationTestCallback?("")
+            }
+            clearCapturedDictationSessionContext()
+            resetDictationOutputMode()
+            setState(.idle)
+            meetingMonitor.resumeAfterCooldown()
+            finishDictationLatencyTrace("short_recording")
+            syncDictationRecorderWarmup(intent: .postDictation(.shortRecording))
+            return
+        }
+
+        setState(.transcribing)
+        finishDictationLatencyTrace("ready_for_transcription")
+        syncDictationRecorderWarmup(intent: .postDictation(.dictationStop))
+        let isTestMode = isDictationTestMode
+        let outputMode = currentDictationOutputMode
+        let transcriptionBackend = isTestMode ? (dictationTestBackend ?? selectedBackend) : selectedBackend
+        let transcriptionLanguage = isTestMode ? (dictationTestCohereLanguage ?? config.resolvedCohereLanguage) : config.resolvedCohereLanguage
+        let indicTranscriptionLanguage = config.resolvedIndicASRLanguage
+        let capturedContext = capturedDictationContext
+        let promptContext = capturedContext.map { DictationContextCapture.formatForPrompt($0) }
+        let correctionTargetApp = capturedDictationCorrectionTargetApp
+        let storageContext = capturedContext.map { DictationContextCapture.formatForStorage($0) }
+            ?? correctionTargetApp?.appContext
+            ?? ""
+        let task = Task { [weak self] in
+            guard let self else { return }
+            defer {
+                try? FileManager.default.removeItem(at: wavURL)
+            }
+
+            do {
+                let ppOption = self.runtimePostProcessorOption()
+                await self.configureTranscriptCleanupForRuntime(option: ppOption)
+                let enableTranscriptCleanup = self.canRunTranscriptCleanup(option: ppOption)
+                let result = try await self.transcriptionCoordinator.transcribeDictation(
+                    at: wavURL,
+                    backend: transcriptionBackend,
+                    cohereLanguage: transcriptionLanguage,
+                    indicASRLanguage: indicTranscriptionLanguage,
+                    enablePostProcessor: enableTranscriptCleanup,
+                    customWords: self.serializedCustomWords(),
+                    appContext: promptContext
+                )
+                // Drop result if test was cancelled (user navigated away)
+                try Task.checkCancellation()
+                let text = result.text.trimmingCharacters(in: .whitespacesAndNewlines)
+
+                // Test mode: route result to callback, skip history/paste
+                if isTestMode {
+                    await MainActor.run {
+                        self.dictationTestCallback?(text)
+                        self.clearCapturedDictationSessionContext()
+                        self.resetDictationOutputMode()
+                        self.setState(.idle)
+                        self.meetingMonitor.resumeAfterCooldown()
+                        self.syncDictationRecorderWarmup(intent: .postDictation(.transcriptionComplete))
+                    }
+                    return
+                }
+
+                if !self.config.maraudersMapUnlocked {
+                    await MainActor.run { self.checkMaraudersMapActivation(text) }
+                }
+                guard !text.isEmpty else {
+                    await MainActor.run {
+                        self.clearCapturedDictationSessionContext()
+                        self.resetDictationOutputMode()
+                        self.setState(.idle)
+                        self.meetingMonitor.resumeAfterCooldown()
+                        self.syncDictationRecorderWarmup(intent: .postDictation(.transcriptionComplete))
+                    }
+                    return
+                }
+                _ = try? self.dictationStore.insertDictation(
+                    text: text,
+                    durationSeconds: duration,
+                    appContext: storageContext,
+                    startedAt: startedAt,
+                    endedAt: Date()
+                )
+                await MainActor.run {
+                    self.scheduleICloudSyncAfterLocalChange()
+                    // Dictation must not trigger meeting-recording reconciliation:
+                    // it hashes raw meeting audio bundles on the main thread and
+                    // would delay the paste. Dictation history retention only.
+                    self.performDictationRetentionCleanup()
+                    self.clearCapturedDictationSessionContext()
+                    self.statusBarController?.refresh()
+                    self.historyWindowController?.reload()
+                    self.syncAppState()
+                    if outputMode != .voiceNote {
+                        PasteController.paste(text: text)
+                        if self.config.enableDictionaryCorrectionPrompts {
+                            // Dictionary correction prompts are an explicit opt-in
+                            // screen-context feature: they briefly read focused app
+                            // text via Accessibility after dictation, then stop when
+                            // the bounded edit monitor session ends.
+                            self.dictationCorrectionMonitor.start(
+                                originalText: text,
+                                appContext: storageContext,
+                                targetApp: correctionTargetApp
+                            ) { [weak self] suggestion in
+                                self?.addDictionarySuggestion(suggestion)
+                            }
+                        }
+                    }
+                    self.resetDictationOutputMode()
+                    self.setState(.idle)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.syncDictationRecorderWarmup(intent: .postDictation(.transcriptionComplete))
+                    TelemetryDeck.signal("dictation.completed", parameters: [
+                        "backend": self.selectedBackend.backend,
+                        "paste_method": outputMode.pasteMethod,
+                    ])
+                }
+            } catch is CancellationError {
+                fputs("[muesli-native] test dictation cancelled\n", stderr)
+                await MainActor.run {
+                    self.clearCapturedDictationSessionContext()
+                    self.resetDictationOutputMode()
+                    self.setState(.idle)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.syncDictationRecorderWarmup(intent: .postDictation(.transcriptionCancelled))
+                }
+            } catch {
+                fputs("[muesli-native] transcription failed: \(error)\n", stderr)
+                await MainActor.run {
+                    if self.isDictationTestMode {
+                        self.dictationTestFailureCallback?(self.userFacingDictationTestError(error))
+                    } else {
+                        self.recordDiagnosticIncident(
+                            kind: .dictationTranscriptionFailed,
+                            stage: .standardDictationTranscribe,
+                            backend: transcriptionBackend,
+                            error: error
+                        )
+                    }
+                    self.clearCapturedDictationSessionContext()
+                    self.resetDictationOutputMode()
+                    self.setState(.idle)
+                    self.meetingMonitor.resumeAfterCooldown()
+                    self.syncDictationRecorderWarmup(intent: .postDictation(.transcriptionFailed))
+                }
+            }
+        }
+        if isTestMode { dictationTestTask = task }
+    }
+
+    private func userFacingDictationTestError(_ error: Error) -> String {
+        let nsError = error as NSError
+        if nsError.domain == "MuesliTranscriptionRuntime" {
+            switch nsError.code {
+            case 1:
+                return "Nemotron requires macOS 15 or later. Choose another model to test dictation."
+            case 2:
+                return "Qwen3 ASR requires macOS 15 or later. Choose another model to test dictation."
+            case 4:
+                return "Cohere Transcribe requires macOS 15 or later. Choose another model to test dictation."
+            default:
+                return "The selected model is not available. Choose another model and try again."
+            }
+        }
+
+        let rawMessage = error.localizedDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+        let lowercasedMessage = rawMessage.lowercased()
+
+        if lowercasedMessage.contains("not loaded") || lowercasedMessage.contains("loadmodels") {
+            return "The model was not ready yet. We are preparing it again, then try once more."
+        }
+        if lowercasedMessage.contains("network") || lowercasedMessage.contains("internet") || lowercasedMessage.contains("timed out") {
+            return "The model could not finish downloading. Check your connection and retry."
+        }
+        if lowercasedMessage.contains("permission") || lowercasedMessage.contains("microphone") {
+            return "Homan could not access the microphone. Check Microphone permission and try again."
+        }
+        return "Dictation could not start. Try again in a moment."
+    }
+
+    // MARK: - Marauder's Map
+
+    private func checkMaraudersMapActivation(_ text: String) {
+        guard !config.maraudersMapUnlocked else { return }
+        guard MaraudersMapDetector.containsActivationPhrase(text) else { return }
+
+        fputs("[muesli-native] Marauder's Map unlocked!\n", stderr)
+        updateConfig { $0.maraudersMapUnlocked = true }
+        SoundController.playMaraudersMapUnlock()
+        indicator.showWarning("Mischief Managed", icon: "\u{26A1}", duration: 3.0)
+        startMaraudersMapMonitoring()
+    }
+
+    private func startMaraudersMapMonitoring() {
+        guard config.maraudersMapUnlocked else { return }
+
+        let countdown = MaraudersMapCountdownController()
+        self.maraudersMapCountdown = countdown
+
+        countdown.startMonitoring(
+            eventProvider: { [weak self] in
+                guard let self else { return nil }
+                let now = Date()
+                let hidden = self.appState.hiddenCalendarEventIDs
+                guard let event = (self.appState.upcomingCalendarEvents
+                    .filter {
+                        ScheduledMeetingNotificationPolicy.isJoinableMeeting($0, hiddenEventIDs: hidden)
+                            && $0.startDate > now
+                    }
+                    .min(by: { $0.startDate < $1.startDate })) else { return nil }
+                return (id: event.id, title: event.title, startDate: event.startDate)
+            },
+            audioClipID: config.maraudersMapAudioClip,
+            customAudioPath: config.maraudersMapCustomAudioPath,
+            onStatusBarUpdate: { [weak self] text in
+                self?.statusBarController?.setCountdownOverride(text)
+            },
+            onCountdownFinished: { [weak self] info in
+                guard let self, !self.isMeetingRecording() else { return }
+                // Cancel any scheduled "starting now" timer for this event.
+                // Match by event ID prefix so deleted/cancelled events (no longer
+                // in upcomingCalendarEvents) still get their timers cancelled.
+                let prefix = "\(info.id)|"
+                let matchingTimerKeys = self.meetingStartingNowTimers.keys.filter { $0.hasPrefix(prefix) }
+                for key in matchingTimerKeys {
+                    guard let timer = self.meetingStartingNowTimers[key] else { continue }
+                    timer.invalidate()
+                    self.meetingStartingNowTimers.removeValue(forKey: key)
+                }
+                guard let event = ScheduledMeetingNotificationPolicy.startingNowCandidate(
+                    from: self.appState.upcomingCalendarEvents,
+                    eventID: info.id,
+                    startDate: info.startDate,
+                    hiddenEventIDs: self.appState.hiddenCalendarEventIDs
+                ) else { return }
+                // Reuse the same notification method as the timer path
+                self.showMeetingStartingNowNotification(
+                    title: event.title,
+                    calendarOccurrence: event.resolvedCalendarOccurrence,
+                    meetingURL: event.meetingURL,
+                    endDate: event.endDate
+                )
+            }
+        )
+    }
+
+    func updateMaraudersMapAudioClip() {
+        maraudersMapCountdown?.updateAudioClip(config.maraudersMapAudioClip, customPath: config.maraudersMapCustomAudioPath)
+    }
+
+    func resetMaraudersMap() {
+        maraudersMapCountdown?.stopMonitoring()
+        maraudersMapCountdown = nil
+        updateConfig {
+            $0.maraudersMapUnlocked = false
+            $0.maraudersMapAudioClip = "bbc_world_news"
+            $0.maraudersMapCustomAudioPath = nil
+        }
+    }
+
+    private func handleUpcomingMeeting(_ event: UpcomingMeetingEvent) {
+        // Look up end date and meeting URL from unified calendar events
+        let calendarEvent = appState.upcomingCalendarEvents
+            .first(where: { $0.id == event.id && $0.startDate == event.startDate })
+        let calendarEndDate = calendarEvent?.endDate
+        let meetingURL = event.meetingURL ?? calendarEvent?.meetingURL
+        let calendarOccurrence = event.calendarOccurrence ?? calendarEvent?.resolvedCalendarOccurrence
+        let autoStopSource = meetingURL.flatMap { MeetingAutoStopSource(meetingURL: $0) }
+
+        // Show notification panel for calendar events (if not auto-recording)
+        guard config.showScheduledMeetingNotifications,
+              !isMeetingRecording(),
+              !isStartingMeetingRecording else {
+            return
+        }
+        isShowingCalendarNotification = true
+
+        let minutesUntil = Int(ceil(event.startDate.timeIntervalSinceNow / 60))
+        let timeLabel: String
+        if minutesUntil > 0 {
+            timeLabel = "starts in \(minutesUntil) min"
+        } else if minutesUntil == 0 {
+            timeLabel = "starting now"
+        } else {
+            timeLabel = "started \(abs(minutesUntil)) min ago"
+        }
+
+        let title = event.title
+        let notificationTitle = minutesUntil <= 0 ? "Meeting starting now" : "Upcoming meeting"
+        meetingNotification.show(
+            title: notificationTitle,
+            subtitle: "\(title) · \(timeLabel)",
+            meetingURL: meetingURL,
+            onStartRecording: { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.startMeetingRecordingFromEntryPoint(
+                    title: title,
+                    calendarOccurrence: calendarOccurrence,
+                    endDate: calendarEndDate,
+                    autoStopSource: autoStopSource,
+                    presentation: .backgroundPill,
+                    startOrigin: .scheduledMeetingPrompt
+                )
+            },
+            onJoinAndRecord: meetingURL != nil ? { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.joinAndRecord(
+                    title: title,
+                    meetingURL: meetingURL!,
+                    endDate: calendarEndDate,
+                    calendarOccurrence: calendarOccurrence,
+                    presentation: .backgroundPill
+                )
+            } : nil,
+            onJoinOnly: meetingURL != nil ? { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                self.joinOnly(meetingURL: meetingURL!, endDate: calendarEndDate)
+            } : nil,
+            onDismiss: { [weak self] in
+                guard let self else { return }
+                self.isShowingCalendarNotification = false
+                let remaining = calendarEndDate.map { max($0.timeIntervalSinceNow, 120) } ?? 120
+                self.meetingMonitor.suppress(for: remaining)
+                self.meetingMonitor.refreshState()
+            },
+            onClose: { [weak self] in
+                self?.isShowingCalendarNotification = false
+                self?.showPendingMeetingCompletionNotificationIfPossible()
+            }
+        )
+    }
+
+    private func scheduleMeetingEndNotification(endDate: Date?, title: String) {
+        meetingEndTimer?.invalidate()
+        meetingEndTimer = nil
+
+        guard let endDate else { return }
+
+        let delay = endDate.timeIntervalSinceNow
+        guard delay > 0 else {
+            showMeetingEndNotification(title: title)
+            return
+        }
+
+        meetingEndTimer = Timer.scheduledTimer(withTimeInterval: delay, repeats: false) { [weak self] _ in
+            DispatchQueue.main.async { [weak self] in
+                self?.showMeetingEndNotification(title: title)
+            }
+        }
+    }
+
+    private func showMeetingEndNotification(title: String) {
+        guard isMeetingRecording() else { return }
+        meetingNotification.show(
+            title: "Meeting ended",
+            subtitle: "\(title) · scheduled time is over",
+            actionLabel: "Stop Recording",
+            dismissAfter: 45,
+            onStartRecording: { [weak self] in
+                self?.stopMeetingRecording()
+            },
+            onDismiss: nil
+        )
+    }
+
+    func serializedCustomWords() -> [[String: Any]] {
+        config.customWords.map { word in
+            var dict: [String: Any] = ["word": word.word]
+            if let replacement = word.replacement {
+                dict["replacement"] = replacement
+            }
+            dict["matchingThreshold"] = word.matchingThreshold
+            return dict
+        }
+    }
+}
+
+func selectCurrentOrNearbyCachedCalendarEvent(
+    from events: [UnifiedCalendarEvent],
+    now: Date = Date()
+) -> CalendarEventContext? {
+    let searchEnd = now.addingTimeInterval(5 * 60)
+    let candidates = events
+        .filter { event in
+            !event.isAllDay && event.endDate > now && event.startDate < searchEnd
+        }
+        .sorted { $0.startDate < $1.startDate }
+
+    if let active = candidates.first(where: { $0.startDate <= now && $0.endDate > now }) {
+        return CalendarEventContext(id: active.id, title: active.title)
+    }
+
+    return candidates.first(where: { $0.startDate > now })
+        .map { CalendarEventContext(id: $0.id, title: $0.title) }
+}
