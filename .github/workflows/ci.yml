@@ -1,0 +1,164 @@
+name: CI
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # Detect which files changed. This gates expensive native CI only; security
+  # checks live in security.yml and are intentionally not path-filtered here.
+  changes:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      docs_only: ${{ steps.classify.outputs.docs_only }}
+      app_source: ${{ steps.classify.outputs.app_source }}
+      release_surface: ${{ steps.classify.outputs.release_surface }}
+      workflow: ${{ steps.classify.outputs.workflow }}
+      ci_config: ${{ steps.classify.outputs.ci_config }}
+      site_or_metadata: ${{ steps.classify.outputs.site_or_metadata }}
+      repo_policy: ${{ steps.classify.outputs.repo_policy }}
+      unknown: ${{ steps.classify.outputs.unknown }}
+      source_or_release: ${{ steps.classify.outputs.source_or_release }}
+      full_ci: ${{ steps.classify.outputs.full_ci }}
+      workflow_ci: ${{ steps.classify.outputs.workflow_ci }}
+      review_worthy: ${{ steps.classify.outputs.review_worthy }}
+      native_or_packaging: ${{ steps.classify.outputs.native_or_packaging }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Classify changed files
+        id: classify
+        run: |
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            if ! FILES=$(git diff --name-only "${{ github.event.pull_request.base.sha }}" "${{ github.event.pull_request.head.sha }}"); then
+              FILES=""
+            fi
+          elif [ "${{ github.event_name }}" = "push" ]; then
+            if [ "${{ github.event.before }}" = "0000000000000000000000000000000000000000" ]; then
+              FILES=""
+            elif ! FILES=$(git diff --name-only "${{ github.event.before }}" "${{ github.sha }}"); then
+              FILES=""
+            fi
+          else
+            FILES=$(git diff --name-only HEAD^ HEAD 2>/dev/null || true)
+          fi
+
+          echo "Changed files:"
+          printf '%s\n' "$FILES"
+          printf '%s\n' "$FILES" | ./scripts/classify_changed_files.sh
+
+  classifier-tests:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Test changed-file classifier
+        run: ./scripts/test_classify_changed_files.sh
+
+      - name: Test CI test shard assignments
+        run: ./scripts/test_ci_test_shards.sh
+
+  # Release build — validate the app product compiles in release mode
+  build_release:
+    needs: changes
+    if: needs.changes.outputs.full_ci == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Build (release)
+        run: swift build --package-path native/MuesliNative -c release --product MuesliNativeApp
+
+  # Swift tests — sharded by domain to reduce end-to-end wall time
+  test_shards:
+    needs: changes
+    if: needs.changes.outputs.full_ci == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [core, dictation-transcription, meetings]
+    name: test (${{ matrix.shard }})
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Run test shard
+        run: bash ./scripts/run_ci_test_shard.sh "${{ matrix.shard }}"
+
+  # Packaged CLI smoke test — verify the app bundle contains homan-cli
+  cli-smoke:
+    needs: changes
+    if: needs.changes.outputs.full_ci == 'true'
+    runs-on: macos-15
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify packaged CLI bundle
+        run: ./scripts/test_packaged_cli.sh
+
+  # Sparkle appcast/update metadata smoke test — catches broken release URLs,
+  # missing signatures, accidental delta entries, and malformed appcast XML.
+  update-flow:
+    needs: changes
+    if: needs.changes.outputs.full_ci == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Verify Sparkle update metadata
+        run: ./scripts/verify_update_flow.sh --skip-dmg
+
+  # Gate job — always runs, always reports a status
+  # This is the only required check in branch protection
+  ci-gate:
+    if: always()
+    needs: [changes, classifier-tests, build_release, test_shards, cli-smoke, update-flow]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check result
+        run: |
+          if [[ "${{ needs.changes.result }}" == "success" ]] && \
+             [[ "${{ needs.classifier-tests.result }}" == "success" ]] && \
+             [[ "${{ needs.build_release.result }}" =~ ^(success|skipped)$ ]] && \
+             [[ "${{ needs.test_shards.result }}" =~ ^(success|skipped)$ ]] && \
+             [[ "${{ needs.cli-smoke.result }}" =~ ^(success|skipped)$ ]] && \
+             [[ "${{ needs.update-flow.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "CI passed (changes: ${{ needs.changes.result }}, classifier-tests: ${{ needs.classifier-tests.result }}, build_release: ${{ needs.build_release.result }}, test_shards: ${{ needs.test_shards.result }}, cli-smoke: ${{ needs.cli-smoke.result }}, update-flow: ${{ needs.update-flow.result }})"
+          else
+            echo "CI failed (changes: ${{ needs.changes.result }}, classifier-tests: ${{ needs.classifier-tests.result }}, build_release: ${{ needs.build_release.result }}, test_shards: ${{ needs.test_shards.result }}, cli-smoke: ${{ needs.cli-smoke.result }}, update-flow: ${{ needs.update-flow.result }})"
+            exit 1
+          fi

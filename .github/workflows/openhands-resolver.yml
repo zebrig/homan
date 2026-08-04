@@ -1,0 +1,487 @@
+name: Resolve with OpenHands
+
+on:
+  issues:
+    types: [labeled]
+  pull_request:
+    types: [labeled]
+  issue_comment:
+    types: [created]
+  pull_request_review_comment:
+    types: [created]
+
+jobs:
+  resolve-with-openhands:
+    if: |
+      github.actor == 'pHequals7' &&
+      (
+        (
+          github.event_name == 'issues' &&
+          github.event.label.name == 'fix-me'
+        ) ||
+        (
+          github.event_name == 'pull_request' &&
+          github.event.label.name == 'fix-me' &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        ) ||
+        (
+          github.event_name == 'issue_comment' &&
+          startsWith(github.event.comment.body, vars.OPENHANDS_MACRO || '@openhands-agent')
+        ) ||
+        (
+          github.event_name == 'pull_request_review_comment' &&
+          startsWith(github.event.comment.body, vars.OPENHANDS_MACRO || '@openhands-agent') &&
+          github.event.pull_request.head.repo.full_name == github.repository
+        )
+      )
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+
+    env:
+      LLM_MODEL: ${{ vars.LLM_MODEL }}
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      PAT_TOKEN: ${{ secrets.PAT_TOKEN }}
+      PAT_USERNAME: ${{ secrets.PAT_USERNAME }}
+      OPENHANDS_MAX_ITER: ${{ vars.OPENHANDS_MAX_ITER || '20' }}
+      OPENHANDS_BASE_CONTAINER_IMAGE: ${{ vars.OPENHANDS_BASE_CONTAINER_IMAGE }}
+      TARGET_BRANCH: ${{ vars.TARGET_BRANCH || 'main' }}
+
+    steps:
+      - name: Resolve event context
+        id: context
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const eventName = context.eventName;
+            const payload = context.payload;
+            let issueNumber;
+            let issueType = 'issue';
+            let commentId = 'none';
+            let commentBody = '';
+
+            if (eventName === 'pull_request') {
+              issueNumber = payload.pull_request.number;
+              issueType = 'pr';
+            } else if (eventName === 'pull_request_review_comment') {
+              issueNumber = payload.pull_request.number;
+              issueType = 'pr';
+              commentId = String(payload.comment.id);
+              commentBody = payload.comment.body || '';
+            } else if (eventName === 'issue_comment') {
+              issueNumber = payload.issue.number;
+              issueType = payload.issue.pull_request ? 'pr' : 'issue';
+              commentId = String(payload.comment.id);
+              commentBody = payload.comment.body || '';
+              if (issueType === 'pr') {
+                const { data: pullRequest } = await github.rest.pulls.get({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  pull_number: issueNumber,
+                });
+                if (pullRequest.head.repo.full_name !== `${context.repo.owner}/${context.repo.repo}`) {
+                  throw new Error('OpenHands PR comments are supported only for same-repository PRs.');
+                }
+              }
+            } else if (eventName === 'issues') {
+              issueNumber = payload.issue.number;
+              issueType = 'issue';
+            } else {
+              throw new Error(`Unsupported event: ${eventName}`);
+            }
+
+            const requestedBlockingReviewFix = issueType === 'pr' && (
+              /p0\s*(?:\/|and|&|\+)?\s*p1/i.test(commentBody) ||
+              /p1\s*(?:\/|and|&|\+)?\s*p0/i.test(commentBody) ||
+              /p0p1/i.test(commentBody) ||
+              /\b(?:fix|address|resolve|handle)\b.{0,80}\bp[01]s?\b/is.test(commentBody)
+            );
+
+            const defaultMaxIterations = process.env.OPENHANDS_MAX_ITER || '20';
+            let maxIterations = defaultMaxIterations;
+            let maxIterationsError = '';
+            const maxIterMatch = commentBody.match(/\bmax-iter(?:ations)?\s*=\s*([^\s]+)/i);
+            if (maxIterMatch) {
+              const rawMaxIterations = maxIterMatch[1].trim();
+              if (!/^\d+$/.test(rawMaxIterations)) {
+                maxIterationsError = `Invalid max-iter value "${rawMaxIterations}". Use an integer from 1 to 100.`;
+              } else {
+                const parsedMaxIterations = Number(rawMaxIterations);
+                if (parsedMaxIterations < 1 || parsedMaxIterations > 100) {
+                  maxIterationsError = `Invalid max-iter value "${rawMaxIterations}". Use an integer from 1 to 100.`;
+                } else {
+                  maxIterations = String(parsedMaxIterations);
+                }
+              }
+            } else if (!/^\d+$/.test(defaultMaxIterations) || Number(defaultMaxIterations) < 1 || Number(defaultMaxIterations) > 100) {
+              maxIterationsError = `Invalid OPENHANDS_MAX_ITER value "${defaultMaxIterations}". Use an integer from 1 to 100.`;
+            }
+
+            core.setOutput('issue_number', String(issueNumber));
+            core.setOutput('issue_type', issueType);
+            core.setOutput('comment_id', commentId);
+            core.setOutput('smoke_only', String(/smoke test only/i.test(commentBody)));
+            core.setOutput('requested_blocking_review_fix', String(requestedBlockingReviewFix));
+            core.setOutput('max_iterations', maxIterations);
+            core.setOutput('max_iterations_error', maxIterationsError);
+
+      - name: React to trigger comment
+        if: steps.context.outputs.comment_id != 'none'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMENT_ID: ${{ steps.context.outputs.comment_id }}
+        run: |
+          gh api \
+            --method POST \
+            -H "Accept: application/vnd.github+json" \
+            "repos/${GITHUB_REPOSITORY}/issues/comments/${COMMENT_ID}/reactions" \
+            -f content="eyes" || true
+
+      - name: Reject invalid trigger options
+        if: steps.context.outputs.smoke_only != 'true' && steps.context.outputs.max_iterations_error != ''
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          MAX_ITERATIONS_ERROR: ${{ steps.context.outputs.max_iterations_error }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="OpenHands did not run. ${MAX_ITERATIONS_ERROR} Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          exit 1
+
+      - name: Check PR blocking review findings
+        id: review_gate
+        if: steps.context.outputs.smoke_only != 'true' && steps.context.outputs.requested_blocking_review_fix == 'true'
+        continue-on-error: true
+        uses: actions/github-script@v7
+        env:
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        with:
+          script: |
+            const issueNumber = Number(process.env.ISSUE_NUMBER);
+            const owner = context.repo.owner;
+            const repo = context.repo.repo;
+            const botAuthorPattern = /^(claude|greptile)(?:$|-|\[bot\])/i;
+
+            const issueComments = await github.paginate(github.rest.issues.listComments, {
+              owner,
+              repo,
+              issue_number: issueNumber,
+              per_page: 100,
+            });
+            const reviews = await github.paginate(github.rest.pulls.listReviews, {
+              owner,
+              repo,
+              pull_number: issueNumber,
+              per_page: 100,
+            });
+            const reviewComments = await github.paginate(github.rest.pulls.listReviewComments, {
+              owner,
+              repo,
+              pull_number: issueNumber,
+              per_page: 100,
+            });
+
+            const reviewSources = [
+              ...issueComments.map((item) => ({ kind: 'PR comment', author: item.user?.login || '', body: item.body || '', url: item.html_url || '' })),
+              ...reviews.map((item) => ({ kind: 'PR review', author: item.user?.login || '', body: item.body || '', url: item.html_url || '' })),
+              ...reviewComments.map((item) => ({ kind: 'inline review comment', author: item.user?.login || '', body: item.body || '', url: item.html_url || '' })),
+            ].filter((item) => botAuthorPattern.test(item.author));
+
+            function hasBlockingFinding(body) {
+              // Greptile uses severity badge images on inline findings; preserve that signal before stripping HTML.
+              const bodyWithBadges = body.replace(/<img[^>]*badges\/(p[01])\.svg[^>]*>/gi, ' $1-badge ');
+              const lines = bodyWithBadges
+                .replace(/<[^>]*>/g, ' ')
+                .split(/\r?\n/);
+              let inCodeFence = false;
+
+              for (const line of lines) {
+                const text = line.trim();
+                if (/^(?:```|~~~)/.test(text)) {
+                  inCodeFence = !inCodeFence;
+                  continue;
+                }
+                if (inCodeFence || !text) {
+                  continue;
+                }
+
+                const lower = text.toLowerCase();
+                if (
+                  /\b(?:no|zero)\s+(?:new\s+)?p0\s*(?:\/|or|and|,)?\s*p1\b/.test(lower) ||
+                  /\bp0\s*(?:\/|or|and|,)?\s*p1\s*(?:issues|findings)?\s*(?:found)?\s*[:=-]?\s*(?:0|none|—|-)\b/.test(lower) ||
+                  /\|\s*p0\s*\/\s*p1\s*\|\s*0\s*\|/.test(lower) ||
+                  /\bp[01]\s*(?:\*{1,2})?\s*(?::|=|—|–|-)\s*(?:(?:0|none|n\/a)\b|[—–-](?:\s|$))/i.test(lower)
+                ) {
+                  continue;
+                }
+
+                if (
+                  /^(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*\*)?\[?\s*p[01]\s*\]?(?:\*\*)?\s*(?::|-|—|–|\|)/i.test(text) ||
+                  /^(?:#{1,6}\s*)?(?:[-*]\s*)?(?:\*\*)?\[?\s*p[01]\s*\]?(?:\*\*)?\s+(?:issue|finding|bug|blocker|critical|high)\b/i.test(text) ||
+                  /\b(?:priority|severity)\s*[:=-]\s*p[01]\b/i.test(text)
+                ) {
+                  return true;
+                }
+              }
+
+              return false;
+            }
+
+            if (reviewSources.length === 0) {
+              core.setOutput('blocking_source_count', '0');
+              core.setOutput('should_skip', 'false');
+              core.notice('No Claude/Greptile reviews found; proceeding because the PR review gate cannot evaluate yet.');
+            } else {
+              const blockingSources = reviewSources.filter((item) => hasBlockingFinding(item.body));
+              core.setOutput('blocking_source_count', String(blockingSources.length));
+              core.setOutput('should_skip', String(blockingSources.length === 0));
+
+              if (blockingSources.length === 0) {
+                core.notice(`No P0/P1 findings found in ${reviewSources.length} Claude/Greptile review source(s).`);
+              } else {
+                core.notice(`Found ${blockingSources.length} Claude/Greptile review source(s) with P0/P1 findings.`);
+              }
+            }
+
+      - name: Comment on PR review gate failure
+        if: steps.review_gate.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="OpenHands did not run because the PR review gate failed while reading Claude/Greptile review comments. Check the workflow logs, then retry the trigger comment. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          exit 1
+
+      - name: Comment on skipped PR review request
+        if: steps.review_gate.outputs.should_skip == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="OpenHands did not run because no current P0/P1 findings were found in Claude/Greptile PR review comments. Re-trigger with a specific P2/minor request if you want optional findings handled. Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Check required configuration
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        run: |
+          required_vars=(LLM_MODEL LLM_API_KEY PAT_TOKEN PAT_USERNAME)
+          for var in "${required_vars[@]}"; do
+            if [ -z "${!var}" ]; then
+              echo "Error: required configuration $var is not set."
+              exit 1
+            fi
+          done
+
+      - name: Check out repository
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        uses: actions/checkout@v4
+
+      - name: Preflight PAT publishing credentials
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        run: |
+          pat_login="$(GH_TOKEN="${PAT_TOKEN}" gh api user --jq .login)"
+          if [ "${pat_login}" = "${PAT_USERNAME}" ]; then
+            echo "PAT login matches PAT_USERNAME."
+          else
+            echo "Error: PAT login does not match PAT_USERNAME."
+            exit 1
+          fi
+
+          echo "Effective repository permissions for PAT:"
+          GH_TOKEN="${PAT_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions
+
+          if [ "$(GH_TOKEN="${PAT_TOKEN}" gh api "repos/${GITHUB_REPOSITORY}" --jq .permissions.push)" != "true" ]; then
+            echo "Error: PAT does not have push permission on ${GITHUB_REPOSITORY}."
+            exit 1
+          fi
+
+          probe_dir="$(mktemp -d)"
+          probe_branch="openhands-auth-probe-${GITHUB_RUN_ID}"
+          git -C "${probe_dir}" init
+          git -C "${probe_dir}" config user.name "openhands-agent"
+          git -C "${probe_dir}" config user.email "openhands-agent@users.noreply.github.com"
+          git -C "${probe_dir}" commit --allow-empty -m "OpenHands auth probe"
+          if ! git -C "${probe_dir}" push --dry-run "https://${PAT_USERNAME}:${PAT_TOKEN}@github.com/${GITHUB_REPOSITORY}.git" "HEAD:refs/heads/${probe_branch}"; then
+            echo "Error: PAT failed an HTTPS git push dry run."
+            exit 1
+          fi
+          echo "PAT HTTPS git push dry run succeeded."
+
+      - name: Set up Python
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Cache pip dependencies
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        uses: actions/cache@v4
+        with:
+          path: ${{ env.pythonLocation }}/lib/python3.12/site-packages
+          key: ${{ runner.os }}-pip-openhands-ai-1.6.0
+
+      - name: Install OpenHands resolver runtime
+        if: steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install "openhands-ai==1.6.0"
+          python - <<'PY'
+          import importlib.metadata as metadata
+
+          compromised_litellm_versions = {"1.82.7", "1.82.8"}
+          litellm_version = metadata.version("litellm")
+          if litellm_version in compromised_litellm_versions:
+              raise SystemExit(f"Refusing compromised litellm version {litellm_version}")
+
+          print("openhands-ai", metadata.version("openhands-ai"))
+          print("litellm", litellm_version)
+          PY
+
+      - name: Smoke test
+        if: steps.context.outputs.smoke_only == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+        run: |
+          if [ ! -f ".openhands/microagents/repo.md" ]; then
+            echo "Expected .openhands/microagents/repo.md to exist."
+            exit 1
+          fi
+          LITELLM_VERSION="$(python - <<'PY'
+          import importlib.metadata as metadata
+          print(metadata.version("litellm"))
+          PY
+          )"
+          OPENHANDS_VERSION="$(python - <<'PY'
+          import importlib.metadata as metadata
+          print(metadata.version("openhands-ai"))
+          PY
+          )"
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="OpenHands smoke test succeeded. Repository instructions are present at \`.openhands/microagents/repo.md\`. Installed versions: \`openhands-ai ${OPENHANDS_VERSION}\`, \`litellm ${LITELLM_VERSION}\`. No code was edited."
+
+      - name: Resolve issue or PR
+        id: resolve
+        if: steps.context.outputs.smoke_only != 'true' && steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        continue-on-error: true
+        env:
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          ISSUE_TYPE: ${{ steps.context.outputs.issue_type }}
+          COMMENT_ID: ${{ steps.context.outputs.comment_id }}
+          MAX_ITERATIONS: ${{ steps.context.outputs.max_iterations }}
+        run: |
+          args=(
+            python -m openhands.resolver.resolve_issue
+            --selected-repo "${GITHUB_REPOSITORY}"
+            --issue-number "${ISSUE_NUMBER}"
+            --issue-type "${ISSUE_TYPE}"
+            --max-iterations "${MAX_ITERATIONS}"
+            --token "${PAT_TOKEN}"
+            --username "${PAT_USERNAME}"
+            --llm-model "${LLM_MODEL}"
+            --llm-api-key "${LLM_API_KEY}"
+            --output-dir output
+          )
+          if [ "${COMMENT_ID}" != "none" ]; then
+            args+=(--comment-id "${COMMENT_ID}")
+          fi
+          if [ -f ".openhands/microagents/repo.md" ]; then
+            args+=(--repo-instruction-file ".openhands/microagents/repo.md")
+          else
+            echo "Warning: .openhands/microagents/repo.md not found; running without repository instructions."
+          fi
+          if [ -n "${LLM_BASE_URL}" ]; then
+            args+=(--llm-base-url "${LLM_BASE_URL}")
+          fi
+          if [ -n "${OPENHANDS_BASE_CONTAINER_IMAGE}" ]; then
+            args+=(--base-container-image "${OPENHANDS_BASE_CONTAINER_IMAGE}")
+          fi
+          "${args[@]}"
+
+      - name: Check resolver result
+        id: result
+        if: steps.context.outputs.smoke_only != 'true' && steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true' && hashFiles('output/output.jsonl') != ''
+        run: |
+          if grep -qE '"success"[[:space:]]*:[[:space:]]*true' output/output.jsonl; then
+            echo "success=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "success=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish resolver changes
+        id: publish
+        if: steps.context.outputs.smoke_only != 'true' && steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true' && hashFiles('output/output.jsonl') != ''
+        continue-on-error: true
+        env:
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          RESULT_SUCCESS: ${{ steps.result.outputs.success }}
+        run: |
+          args=(
+            python -m openhands.resolver.send_pull_request
+            --selected-repo "${GITHUB_REPOSITORY}"
+            --issue-number "${ISSUE_NUMBER}"
+            --output-dir output
+            --token "${PAT_TOKEN}"
+            --username "${PAT_USERNAME}"
+            --llm-model "${LLM_MODEL}"
+            --llm-api-key "${LLM_API_KEY}"
+            --target-branch "${TARGET_BRANCH}"
+            --git-user-name "openhands-agent"
+            --git-user-email "openhands-agent@users.noreply.github.com"
+          )
+          if [ -n "${LLM_BASE_URL}" ]; then
+            args+=(--llm-base-url "${LLM_BASE_URL}")
+          fi
+
+          if [ "${RESULT_SUCCESS}" = "true" ]; then
+            args+=(--pr-type draft)
+          else
+            args+=(--pr-type branch --send-on-failure)
+          fi
+
+          max_attempts=3
+          for attempt in $(seq 1 "${max_attempts}"); do
+            echo "OpenHands publish attempt ${attempt}/${max_attempts}"
+            if "${args[@]}"; then
+              exit 0
+            fi
+            if [ "${attempt}" -lt "${max_attempts}" ]; then
+              sleep_seconds=$((attempt * 15))
+              echo "Publish failed; retrying in ${sleep_seconds}s."
+              sleep "${sleep_seconds}"
+            fi
+          done
+          exit 1
+
+      - name: Comment on resolver result
+        if: always() && steps.context.outputs.smoke_only != 'true' && steps.context.outputs.max_iterations_error == '' && steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          ISSUE_NUMBER: ${{ steps.context.outputs.issue_number }}
+          RESOLVE_OUTCOME: ${{ steps.resolve.outcome }}
+          PUBLISH_OUTCOME: ${{ steps.publish.outcome }}
+          RESULT_SUCCESS: ${{ steps.result.outputs.success }}
+        run: |
+          if [ "${RESOLVE_OUTCOME}" = "success" ] && [ "${PUBLISH_OUTCOME}" = "success" ]; then
+            if [ "${RESULT_SUCCESS}" = "true" ]; then
+              status="OpenHands finished and published resolver changes."
+            else
+              status="OpenHands finished without a successful resolver result; failure output was published when available."
+            fi
+          else
+            status="OpenHands encountered an error. Resolve step: ${RESOLVE_OUTCOME:-skipped}; publish step: ${PUBLISH_OUTCOME:-skipped}."
+          fi
+          gh api "repos/${GITHUB_REPOSITORY}/issues/${ISSUE_NUMBER}/comments" \
+            -f body="${status} Run: ${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+      - name: Upload resolver output
+        if: always() && steps.context.outputs.smoke_only != 'true' && steps.review_gate.outcome != 'failure' && steps.review_gate.outputs.should_skip != 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: resolver-output
+          path: output/
+          if-no-files-found: ignore

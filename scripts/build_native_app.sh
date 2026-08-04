@@ -1,0 +1,593 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+source "$ROOT/scripts/muesli_spm_cache.sh"
+PACKAGE_DIR="$ROOT/native/MuesliNative"
+DIST_DIR="$ROOT/dist-native"
+INSTALL_DIR="${MUESLI_INSTALL_DIR:-/Applications}"
+BUILD_CONFIG="${1:-release}"
+APP_BINARY="MuesliNativeApp"
+CLI_BINARY="homan-cli"
+APP_NAME="${MUESLI_APP_NAME:-Homan}"
+APP_DISPLAY_NAME="${MUESLI_DISPLAY_NAME:-$APP_NAME}"
+APP_BUNDLE_NAME="${MUESLI_APP_BUNDLE_NAME:-$APP_NAME.app}"
+APP_EXECUTABLE_NAME="${MUESLI_EXECUTABLE_NAME:-Homan}"
+APP_SUPPORT_DIR_NAME="${MUESLI_SUPPORT_DIR_NAME:-$APP_DISPLAY_NAME}"
+BUNDLE_ID="${MUESLI_BUNDLE_ID:-com.zebrig.homan}"
+TELEMETRYDECK_APP_ID="${MUESLI_TELEMETRYDECK_APP_ID:-}"
+TELEMETRY_CHANNEL="${MUESLI_TELEMETRY_CHANNEL:-unconfigured}"
+ATS_INSECURE_HTTP_HOSTS="${MUESLI_ATS_INSECURE_HTTP_HOSTS:-}"
+DEFAULT_APP_VERSION="0.8.0"
+APP_VERSION="${MUESLI_BUILD_VERSION:-$DEFAULT_APP_VERSION}"
+APP_BUNDLE_VERSION="${MUESLI_BUNDLE_VERSION:-$APP_VERSION}"
+APP_SHORT_VERSION="${MUESLI_SHORT_VERSION:-$APP_VERSION}"
+# Fail-closed: Homan has no appcast yet. Leave SUFeedURL empty so the Sparkle
+# updater is disabled instead of accidentally checking the upstream Muesli feed.
+# Set MUESLI_SPARKLE_FEED_URL (+ MUESLI_SPARKLE_EDKEY) once a Homan feed exists.
+SPARKLE_FEED_URL="${MUESLI_SPARKLE_FEED_URL-}"
+SPARKLE_EDKEY="${MUESLI_SPARKLE_EDKEY-}"
+STAGED_APP_DIR="$DIST_DIR/$APP_BUNDLE_NAME"
+APP_DIR="$INSTALL_DIR/$APP_BUNDLE_NAME"
+DEFAULT_SIGN_IDENTITY="Developer ID Application: Pranav Hari Guruvayurappan (58W55QJ567)"
+SIGN_IDENTITY="${MUESLI_SIGN_IDENTITY:-$DEFAULT_SIGN_IDENTITY}"
+SKIP_SIGN="${MUESLI_SKIP_SIGN:-0}"
+PROVISIONING_PROFILE="${MUESLI_PROVISIONING_PROFILE:-}"
+CODESIGN_TIMESTAMP="${MUESLI_CODESIGN_TIMESTAMP:---timestamp}"
+if [[ "$CODESIGN_TIMESTAMP" == "none" ]]; then
+  CODESIGN_TIMESTAMP="--timestamp=none"
+fi
+BUNDLE_THIN_ARCH="${MUESLI_BUNDLE_THIN_ARCH:-arm64}"
+LOCALVQE_LIB_DIR="${MUESLI_LOCALVQE_LIB_DIR:-$ROOT/native/MuesliNative/LocalVQE/lib}"
+LOCALVQE_RUNTIME_REF="f53063c9eb2a85f96479867d1dd911dc3bf6319b"
+LOCALVQE_GTCRN_MODEL_PATH="${MUESLI_LOCALVQE_GTCRN_MODEL_PATH:-$ROOT/native/MuesliNative/LocalVQE/models/localvqe-pi-v1-49k-f32.gguf}"
+LOCALVQE_GTCRN_MODEL_SHA256="0e0c82a8e9703e818b64dedd0fc306394cf5bbb59fcec1ccca82099d352d0c26"
+LOCALVQE_V12_MODEL_PATH="${MUESLI_LOCALVQE_V12_MODEL_PATH:-${MUESLI_LOCALVQE_MODEL_PATH:-$ROOT/native/MuesliNative/LocalVQE/models/localvqe-v1.2-1.3M-f32.gguf}}"
+LOCALVQE_V12_MODEL_SHA256="4856ecf5f522b23fb2bc5caeac81f323c0ef1c4c156a9c7d40a6adbe092ba9ce"
+REQUIRE_LOCALVQE="${MUESLI_REQUIRE_LOCALVQE:-1}"
+BUILD_LOCALVQE_IF_MISSING="${MUESLI_BUILD_LOCALVQE_IF_MISSING:-1}"
+
+localvqe_runtime_ready() {
+  local file_name
+  local required_runtime_files=(
+    "liblocalvqe.dylib"
+    "liblocalvqe.0.dylib"
+    "liblocalvqe.0.1.0.dylib"
+  )
+  [[ -d "$LOCALVQE_LIB_DIR" ]] || return 1
+  [[ -f "$LOCALVQE_LIB_DIR/.muesli-localvqe-runtime-ref" ]] || return 1
+  [[ "$(tr -d '[:space:]' < "$LOCALVQE_LIB_DIR/.muesli-localvqe-runtime-ref")" == "$LOCALVQE_RUNTIME_REF" ]] || return 1
+  for file_name in "${required_runtime_files[@]}"; do
+    [[ -e "$LOCALVQE_LIB_DIR/$file_name" ]] || return 1
+  done
+  while IFS= read -r library; do
+    if otool -l "$library" | awk '/LC_RPATH/{getline; getline; print $2}' | grep -q '^/'; then
+      return 1
+    fi
+  done < <(find "$LOCALVQE_LIB_DIR" -maxdepth 1 \( -name "liblocalvqe*.dylib" -o -name "libggml*.dylib" -o -name "libggml*.so" \) -type f)
+}
+
+case "$REQUIRE_LOCALVQE" in
+  0|1) ;;
+  *)
+    echo "Invalid MUESLI_REQUIRE_LOCALVQE: expected 0 or 1." >&2
+    exit 2
+    ;;
+esac
+case "$BUILD_LOCALVQE_IF_MISSING" in
+  0|1) ;;
+  *)
+    echo "Invalid MUESLI_BUILD_LOCALVQE_IF_MISSING: expected 0 or 1." >&2
+    exit 2
+    ;;
+esac
+
+if [[ "$REQUIRE_LOCALVQE" == "1" ]] && ! localvqe_runtime_ready; then
+  if [[ "$BUILD_LOCALVQE_IF_MISSING" == "1" ]]; then
+    echo "LocalVQE runtime is missing or incomplete; building the pinned runtime..."
+    MUESLI_LOCALVQE_LIB_DIR="$LOCALVQE_LIB_DIR" "$ROOT/scripts/build_localvqe.sh"
+  else
+    echo "LocalVQE runtime is missing or incomplete in $LOCALVQE_LIB_DIR." >&2
+    echo "Run ./scripts/build_localvqe.sh or set MUESLI_BUILD_LOCALVQE_IF_MISSING=1." >&2
+    exit 1
+  fi
+fi
+if [[ "$REQUIRE_LOCALVQE" == "1" ]] && ! localvqe_runtime_ready; then
+  echo "LocalVQE runtime remains incomplete after build: $LOCALVQE_LIB_DIR" >&2
+  exit 1
+fi
+if [[ "$REQUIRE_LOCALVQE" == "1" ]]; then
+  verify_localvqe_model() {
+    local model_path="$1"
+    local expected_sha256="$2"
+    if [[ ! -f "$model_path" ]]; then
+      echo "Required LocalVQE model is missing: $model_path" >&2
+      exit 1
+    fi
+    local actual_sha256
+    actual_sha256="$(shasum -a 256 "$model_path" | awk '{print $1}')"
+    if [[ "$actual_sha256" != "$expected_sha256" ]]; then
+      echo "LocalVQE model checksum mismatch at $model_path." >&2
+      echo "Expected: $expected_sha256" >&2
+      echo "Actual:   $actual_sha256" >&2
+      exit 1
+    fi
+  }
+  verify_localvqe_model "$LOCALVQE_GTCRN_MODEL_PATH" "$LOCALVQE_GTCRN_MODEL_SHA256"
+  verify_localvqe_model "$LOCALVQE_V12_MODEL_PATH" "$LOCALVQE_V12_MODEL_SHA256"
+fi
+
+thin_macho_to_bundle_arch() {
+  local binary="$1"
+  [[ -n "$BUNDLE_THIN_ARCH" ]] || return 0
+  [[ -f "$binary" ]] || return 0
+
+  local info
+  info="$(lipo -info "$binary" 2>/dev/null || true)"
+  [[ "$info" == *"Architectures in the fat file"* ]] || return 0
+  [[ "$info" == *" $BUNDLE_THIN_ARCH"* ]] || {
+    echo "Warning: $binary does not contain $BUNDLE_THIN_ARCH; leaving universal binary unchanged." >&2
+    return 0
+  }
+
+  local tmp="${binary}.thin"
+  lipo "$binary" -thin "$BUNDLE_THIN_ARCH" -output "$tmp"
+  chmod +x "$tmp"
+  mv "$tmp" "$binary"
+}
+
+if [[ -n "$TELEMETRYDECK_APP_ID" && ! "$TELEMETRYDECK_APP_ID" =~ ^[0-9A-Fa-f]{8}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{4}-[0-9A-Fa-f]{12}$ ]]; then
+  echo "Invalid MUESLI_TELEMETRYDECK_APP_ID: expected a UUID." >&2
+  exit 2
+fi
+case "$TELEMETRY_CHANNEL" in
+  production|preprod|dev|canary|unconfigured) ;;
+  *)
+    echo "Invalid MUESLI_TELEMETRY_CHANNEL: $TELEMETRY_CHANNEL" >&2
+    exit 2
+    ;;
+esac
+if [[ -n "$TELEMETRYDECK_APP_ID" && "$TELEMETRY_CHANNEL" == "unconfigured" ]]; then
+  echo "MUESLI_TELEMETRY_CHANNEL is required when telemetry is enabled." >&2
+  exit 2
+fi
+if [[ -z "$TELEMETRYDECK_APP_ID" && "$TELEMETRY_CHANNEL" != "unconfigured" ]]; then
+  echo "MUESLI_TELEMETRYDECK_APP_ID is required for channel $TELEMETRY_CHANNEL." >&2
+  exit 2
+fi
+
+ATS_INSECURE_HTTP_HOST_ARRAY=()
+if [[ -n "$ATS_INSECURE_HTTP_HOSTS" ]]; then
+  IFS=',' read -r -a ATS_INSECURE_HTTP_HOST_ARRAY <<< "$ATS_INSECURE_HTTP_HOSTS"
+  for index in "${!ATS_INSECURE_HTTP_HOST_ARRAY[@]}"; do
+    host="${ATS_INSECURE_HTTP_HOST_ARRAY[$index]}"
+    host="$(printf '%s' "$host" | tr -d '[:space:]' | tr '[:upper:]' '[:lower:]')"
+    if [[ -z "$host" || ! "$host" =~ ^[a-z0-9][a-z0-9.-]*[a-z0-9]$ || "$host" == *..* ]]; then
+      echo "Invalid MUESLI_ATS_INSECURE_HTTP_HOSTS entry: '$host'." >&2
+      echo "Use a comma-separated list of DNS names or IPv4 addresses without ports." >&2
+      exit 2
+    fi
+    ATS_INSECURE_HTTP_HOST_ARRAY[$index]="$host"
+  done
+fi
+
+SWIFT_BUILD_ARGS=(--package-path "$PACKAGE_DIR" -c "$BUILD_CONFIG")
+if ! muesli_spm_scratch_disabled; then
+  DEFAULT_SCRATCH_CHANNEL="release"
+  if [[ "$BUILD_CONFIG" == "debug" ]]; then
+    DEFAULT_SCRATCH_CHANNEL="$(muesli_worktree_spm_scratch_channel dev "$ROOT")"
+  fi
+  SWIFTPM_SCRATCH_PATH="$(muesli_resolve_spm_scratch_path "$DEFAULT_SCRATCH_CHANNEL")"
+  mkdir -p "$SWIFTPM_SCRATCH_PATH"
+  SWIFT_BUILD_ARGS+=(--scratch-path "$SWIFTPM_SCRATCH_PATH")
+  echo "Using SwiftPM scratch path: $SWIFTPM_SCRATCH_PATH"
+fi
+
+mkdir -p "$DIST_DIR"
+
+set +e
+swift build "${SWIFT_BUILD_ARGS[@]}" --product "$APP_BINARY"
+status=$?
+set -e
+
+if [[ $status -ne 0 ]]; then
+  echo "Swift build failed." >&2
+  exit $status
+fi
+
+set +e
+swift build "${SWIFT_BUILD_ARGS[@]}" --product "$CLI_BINARY"
+status=$?
+set -e
+
+if [[ $status -ne 0 ]]; then
+  echo "Swift CLI build failed." >&2
+  exit $status
+fi
+
+BIN_DIR="$(swift build "${SWIFT_BUILD_ARGS[@]}" --show-bin-path)"
+APP_BIN="$BIN_DIR/$APP_BINARY"
+CLI_BIN="$BIN_DIR/$CLI_BINARY"
+
+rm -rf "$STAGED_APP_DIR"
+mkdir -p "$STAGED_APP_DIR/Contents/MacOS" "$STAGED_APP_DIR/Contents/Frameworks" "$STAGED_APP_DIR/Contents/Resources"
+
+cp "$APP_BIN" "$STAGED_APP_DIR/Contents/MacOS/$APP_EXECUTABLE_NAME"
+chmod +x "$STAGED_APP_DIR/Contents/MacOS/$APP_EXECUTABLE_NAME"
+cp "$CLI_BIN" "$STAGED_APP_DIR/Contents/MacOS/$CLI_BINARY"
+chmod +x "$STAGED_APP_DIR/Contents/MacOS/$CLI_BINARY"
+
+# Bundle SwiftPM-linked frameworks (rpath is @loader_path, so they go next to the binary)
+for framework in "$BIN_DIR"/*.framework; do
+  [[ -d "$framework" ]] || continue
+  ditto "$framework" "$STAGED_APP_DIR/Contents/MacOS/$(basename "$framework")"
+done
+
+# Bundle SwiftPM-linked loose dynamic libraries, including binary targets that
+# ship as dylibs instead of frameworks.
+for dylib in "$BIN_DIR"/*.dylib; do
+  [[ -f "$dylib" ]] || continue
+  target="$STAGED_APP_DIR/Contents/MacOS/$(basename "$dylib")"
+  cp -RL "$dylib" "$target"
+  thin_macho_to_bundle_arch "$target"
+done
+
+# Bundle SPM resource bundles (CoreML models, privacy manifests, etc.)
+for bundle in "$BIN_DIR"/*.bundle; do
+  [[ -d "$bundle" ]] || continue
+  ditto "$bundle" "$STAGED_APP_DIR/Contents/Resources/$(basename "$bundle")"
+done
+
+# Bundle the pinned, self-contained LocalVQE runtime.
+if [[ -d "$LOCALVQE_LIB_DIR" ]]; then
+  find "$LOCALVQE_LIB_DIR" -maxdepth 1 \( -name "liblocalvqe*.dylib" -o -name "libggml*.dylib" -o -name "libggml*.so" \) \( -type f -o -type l \) | while read -r dylib; do
+    target="$STAGED_APP_DIR/Contents/Frameworks/$(basename "$dylib")"
+    if [[ -L "$dylib" ]]; then
+      cp -P "$dylib" "$target"
+    else
+      cp "$dylib" "$target"
+      thin_macho_to_bundle_arch "$target"
+    fi
+  done
+fi
+if [[ -f "$LOCALVQE_GTCRN_MODEL_PATH" && -f "$LOCALVQE_V12_MODEL_PATH" ]]; then
+  mkdir -p "$STAGED_APP_DIR/Contents/Resources/Models/localvqe"
+  cp "$LOCALVQE_GTCRN_MODEL_PATH" "$STAGED_APP_DIR/Contents/Resources/Models/localvqe/localvqe-pi-v1-49k-f32.gguf"
+  cp "$LOCALVQE_V12_MODEL_PATH" "$STAGED_APP_DIR/Contents/Resources/Models/localvqe/localvqe-v1.2-1.3M-f32.gguf"
+fi
+
+# Bundle assets
+cp "$ROOT/assets/homan_menu_template.png" "$STAGED_APP_DIR/Contents/Resources/menu_m_template.png"
+cp "$ROOT/assets/homan.icns" "$STAGED_APP_DIR/Contents/Resources/muesli.icns"
+cp "$ROOT/assets/zoom-app.png" "$STAGED_APP_DIR/Contents/Resources/zoom-app.png"
+cp "$ROOT/assets/Google_Meet_icon_(2020).svg.png" "$STAGED_APP_DIR/Contents/Resources/google-meet.png"
+cp "$ROOT/assets/Microsoft_Office_Teams_(2025–present).svg.png" "$STAGED_APP_DIR/Contents/Resources/teams.png"
+cp "$ROOT/assets/Slack_icon_2019.svg.png" "$STAGED_APP_DIR/Contents/Resources/slack.png"
+cp "$ROOT/assets/Nvidia_logo.svg.png" "$STAGED_APP_DIR/Contents/Resources/nvidia-logo.png"
+cp "$ROOT/assets/OpenAI_Logo.svg.png" "$STAGED_APP_DIR/Contents/Resources/openai-logo.png"
+cp "$ROOT/assets/cohere.png" "$STAGED_APP_DIR/Contents/Resources/cohere-logo.png"
+cp "$ROOT/assets/Qwen_logo.svg.png" "$STAGED_APP_DIR/Contents/Resources/qwen-logo.png"
+cp "$ROOT/assets/AI4Bharat_logo.png" "$STAGED_APP_DIR/Contents/Resources/ai4bharat-logo.png"
+cp "$ROOT/assets/google-logo.svg" "$STAGED_APP_DIR/Contents/Resources/google-logo.svg"
+cp "$ROOT/assets/x-logo.png" "$STAGED_APP_DIR/Contents/Resources/x-logo.png"
+cp "$ROOT/assets/linkedin-logo.png" "$STAGED_APP_DIR/Contents/Resources/linkedin-logo.png"
+cp "$ROOT/assets/insights-share-background.png" "$STAGED_APP_DIR/Contents/Resources/insights-share-background.png"
+cp "$ROOT/assets/homan_app_icon.png" "$STAGED_APP_DIR/Contents/Resources/muesli_app_icon.png"
+if [[ -d "$ROOT/assets/fonts" ]]; then
+  ditto "$ROOT/assets/fonts" "$STAGED_APP_DIR/Contents/Resources/fonts"
+fi
+if [[ -d "$ROOT/assets/audio" ]]; then
+  ditto "$ROOT/assets/audio" "$STAGED_APP_DIR/Contents/Resources/audio"
+fi
+
+cat > "$STAGED_APP_DIR/Contents/Info.plist" <<PLIST
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>CFBundleName</key>
+  <string>$APP_NAME</string>
+  <key>CFBundleDisplayName</key>
+  <string>$APP_DISPLAY_NAME</string>
+  <key>CFBundleIdentifier</key>
+  <string>$BUNDLE_ID</string>
+  <key>CFBundleVersion</key>
+  <string>$APP_BUNDLE_VERSION</string>
+  <key>CFBundleShortVersionString</key>
+  <string>$APP_SHORT_VERSION</string>
+  <key>CFBundleExecutable</key>
+  <string>$APP_EXECUTABLE_NAME</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleIconFile</key>
+  <string>muesli.icns</string>
+  <key>MuesliSupportDirectoryName</key>
+  <string>$APP_SUPPORT_DIR_NAME</string>
+  <key>MuesliTelemetryDeckAppID</key>
+  <string>$TELEMETRYDECK_APP_ID</string>
+  <key>MuesliTelemetryChannel</key>
+  <string>$TELEMETRY_CHANNEL</string>
+  <key>LSUIElement</key>
+  <true/>
+  <key>LSMinimumSystemVersion</key>
+  <string>14.2</string>
+  <key>NSMicrophoneUsageDescription</key>
+  <string>$APP_DISPLAY_NAME records microphone audio for dictation.</string>
+  <key>NSInputMonitoringUsageDescription</key>
+  <string>$APP_DISPLAY_NAME monitors keyboard events to trigger push-to-talk dictation.</string>
+  <key>NSAudioCaptureUsageDescription</key>
+  <string>$APP_DISPLAY_NAME captures system audio from other applications during meeting recordings.</string>
+  <key>NSScreenCaptureUsageDescription</key>
+  <string>$APP_DISPLAY_NAME captures screen content for meeting context.</string>
+  <key>NSCalendarsFullAccessUsageDescription</key>
+  <string>$APP_DISPLAY_NAME reads calendar events to help with meeting recordings.</string>
+  <key>SUFeedURL</key>
+  <string>$SPARKLE_FEED_URL</string>
+  <key>SUPublicEDKey</key>
+  <string>$SPARKLE_EDKEY</string>
+  <key>SUEnableAutomaticChecks</key>
+  <true/>
+</dict>
+</plist>
+PLIST
+
+if [[ ${#ATS_INSECURE_HTTP_HOST_ARRAY[@]} -gt 0 ]]; then
+  /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity dict" "$STAGED_APP_DIR/Contents/Info.plist"
+  /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains dict" "$STAGED_APP_DIR/Contents/Info.plist"
+  for host in "${ATS_INSECURE_HTTP_HOST_ARRAY[@]}"; do
+    /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:$host dict" "$STAGED_APP_DIR/Contents/Info.plist"
+    /usr/libexec/PlistBuddy -c "Add :NSAppTransportSecurity:NSExceptionDomains:$host:NSExceptionAllowsInsecureHTTPLoads bool true" "$STAGED_APP_DIR/Contents/Info.plist"
+    echo "Allowing insecure HTTP for ATS exception host: $host"
+  done
+fi
+plutil -lint "$STAGED_APP_DIR/Contents/Info.plist" >/dev/null
+
+if [[ "$REQUIRE_LOCALVQE" == "1" ]]; then
+  "$ROOT/scripts/verify_localvqe_bundle.sh" "$STAGED_APP_DIR"
+fi
+
+# Replace existing app (no prompt — that's what this script is for)
+if [[ -d "$APP_DIR" ]]; then
+  echo "Replacing $APP_DIR"
+fi
+
+mkdir -p "$INSTALL_DIR"
+rm -rf "$APP_DIR"
+ditto "$STAGED_APP_DIR" "$APP_DIR"
+
+# Checkouts under cloud-synced folders (OneDrive/Dropbox) tag files with Finder
+# metadata that codesign rejects as detritus; strip it before signing.
+xattr -cr "$APP_DIR" 2>/dev/null || true
+
+if [[ "$SKIP_SIGN" != "1" ]]; then
+  if ! security find-identity -v -p codesigning | grep -Fq "$SIGN_IDENTITY"; then
+    echo "Signing identity not found: $SIGN_IDENTITY" >&2
+    echo "For local contributor builds without this certificate, run: MUESLI_SKIP_SIGN=1 ./scripts/dev-test.sh" >&2
+    exit 1
+  fi
+
+  if [[ -n "$PROVISIONING_PROFILE" ]]; then
+    if [[ ! -f "$PROVISIONING_PROFILE" ]]; then
+      echo "Provisioning profile not found: $PROVISIONING_PROFILE" >&2
+      exit 1
+    fi
+    cp "$PROVISIONING_PROFILE" "$APP_DIR/Contents/embedded.provisionprofile"
+  fi
+
+  # Sign all bundled frameworks, including nested Sparkle executables.
+  find "$APP_DIR/Contents/MacOS" -maxdepth 1 -name "*.framework" -type d | while read -r framework; do
+    if [[ "$(basename "$framework")" == "Sparkle.framework" ]]; then
+      find "$framework" -type f -perm +111 | while read -r binary; do
+        if file "$binary" | grep -q "Mach-O"; then
+          codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+            --sign "$SIGN_IDENTITY" "$binary"
+        fi
+      done
+      find "$framework" -name "*.xpc" -type d | while read -r xpc; do
+        codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+          --sign "$SIGN_IDENTITY" "$xpc"
+      done
+      find "$framework" -name "*.app" -type d | while read -r app; do
+        codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+          --sign "$SIGN_IDENTITY" "$app"
+      done
+    fi
+
+    codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+      --sign "$SIGN_IDENTITY" \
+      "$framework"
+  done
+
+  # Sign loose native runtime libraries. Hardened runtime library validation
+  # requires these to have the same Team ID as the app.
+  find "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Frameworks" -maxdepth 1 \( -name "*.dylib" -o -name "*.so" \) -type f | while read -r library; do
+    if file "$library" | grep -q "Mach-O"; then
+      codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+        --sign "$SIGN_IDENTITY" \
+        "$library"
+    fi
+  done
+
+  codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+    --sign "$SIGN_IDENTITY" \
+    "$APP_DIR/Contents/MacOS/homan-cli"
+
+  # Sign the app bundle with hardened runtime, secure timestamp, and entitlements
+  ENTITLEMENTS="${MUESLI_ENTITLEMENTS:-$ROOT/scripts/Muesli.entitlements}"
+  CODESIGN_ENTITLEMENTS="$ENTITLEMENTS"
+  TEMP_ENTITLEMENTS=""
+  APS_ENVIRONMENT="${MUESLI_APS_ENVIRONMENT:-}"
+  ICLOUD_CONTAINER_ENVIRONMENT="${MUESLI_ICLOUD_CONTAINER_ENVIRONMENT:-}"
+  PROFILE_PLIST=""
+  SIGN_TEMP_FILES=()
+  cleanup_sign_temp_files() {
+    local temp_file
+    for temp_file in "${SIGN_TEMP_FILES[@]:-}"; do
+      [[ -n "$temp_file" ]] && rm -f "$temp_file"
+    done
+  }
+  trap cleanup_sign_temp_files EXIT
+  if [[ -n "$PROVISIONING_PROFILE" ]]; then
+    PROFILE_PLIST="$(mktemp "${TMPDIR:-/tmp}/muesli-profile.XXXXXX")"
+    SIGN_TEMP_FILES+=("$PROFILE_PLIST")
+    if ! security cms -D -i "$PROVISIONING_PROFILE" > "$PROFILE_PLIST" 2>/dev/null; then
+      echo "ERROR: could not decode provisioning profile: $PROVISIONING_PROFILE" >&2
+      exit 1
+    fi
+
+    PROFILE_APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
+    if [[ -z "$PROFILE_APP_IDENTIFIER" ]]; then
+      PROFILE_APP_IDENTIFIER="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:application-identifier' "$PROFILE_PLIST" 2>/dev/null || true)"
+    fi
+    if [[ -n "$PROFILE_APP_IDENTIFIER" ]]; then
+      PROFILE_BUNDLE_ID="${PROFILE_APP_IDENTIFIER#*.}"
+      # shellcheck disable=SC2053 # Intentionally glob-match wildcard App IDs such as com.muesli.*.
+      if [[ "$BUNDLE_ID" != $PROFILE_BUNDLE_ID ]]; then
+        echo "ERROR: provisioning profile app identifier '$PROFILE_APP_IDENTIFIER' does not match bundle ID '$BUNDLE_ID'." >&2
+        exit 1
+      fi
+      echo "Using provisioning profile app identifier: $PROFILE_APP_IDENTIFIER"
+    fi
+
+    if [[ -z "$APS_ENVIRONMENT" ]]; then
+      APS_ENVIRONMENT="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:com.apple.developer.aps-environment' "$PROFILE_PLIST" 2>/dev/null || true)"
+      if [[ -z "$APS_ENVIRONMENT" ]]; then
+        APS_ENVIRONMENT="$(/usr/libexec/PlistBuddy -c 'Print :Entitlements:aps-environment' "$PROFILE_PLIST" 2>/dev/null || true)"
+      fi
+    fi
+  fi
+
+  if [[ -n "$APS_ENVIRONMENT" || -n "$PROFILE_PLIST" ]]; then
+    TEMP_ENTITLEMENTS="$(mktemp "${TMPDIR:-/tmp}/muesli-entitlements.XXXXXX")"
+    SIGN_TEMP_FILES+=("$TEMP_ENTITLEMENTS")
+    cp "$ENTITLEMENTS" "$TEMP_ENTITLEMENTS"
+    copy_profile_string_entitlement() {
+      local key="$1"
+      local value
+      [[ -n "$PROFILE_PLIST" ]] || return 0
+      value="$(/usr/libexec/PlistBuddy -c "Print :Entitlements:$key" "$PROFILE_PLIST" 2>/dev/null || true)"
+      [[ -n "$value" ]] || return 0
+      if ! /usr/libexec/PlistBuddy -c "Set :$key $value" "$TEMP_ENTITLEMENTS" 2>/dev/null; then
+        /usr/libexec/PlistBuddy -c "Add :$key string $value" "$TEMP_ENTITLEMENTS"
+      fi
+    }
+    copy_explicit_icloud_container_environment_entitlement() {
+      local key="$1"
+      local value
+      [[ -n "$PROFILE_PLIST" ]] || return 0
+      [[ -n "$ICLOUD_CONTAINER_ENVIRONMENT" ]] || return 0
+      /usr/libexec/PlistBuddy -c "Print :Entitlements:$key" "$PROFILE_PLIST" >/dev/null 2>&1 || return 0
+      value="$(printf '%s' "$ICLOUD_CONTAINER_ENVIRONMENT" | tr '[:upper:]' '[:lower:]')"
+      if [[ "$value" != "development" && "$value" != "production" ]]; then
+        echo "ERROR: unsupported iCloud container environment '$value'. Expected development or production." >&2
+        exit 1
+      fi
+      /usr/libexec/PlistBuddy -c "Delete :$key" "$TEMP_ENTITLEMENTS" >/dev/null 2>&1 || true
+      /usr/libexec/PlistBuddy -c "Add :$key string $value" "$TEMP_ENTITLEMENTS"
+      echo "Using iCloud entitlement: $key=$value"
+    }
+    copy_profile_string_entitlement "com.apple.application-identifier"
+    copy_profile_string_entitlement "application-identifier"
+    copy_profile_string_entitlement "com.apple.developer.team-identifier"
+    # Do not copy this profile entitlement by default: Apple profiles may store
+    # it as an array, while CloudKit expects a single lowercase runtime value.
+    copy_explicit_icloud_container_environment_entitlement "com.apple.developer.icloud-container-environment"
+    if [[ -n "$APS_ENVIRONMENT" ]]; then
+      if ! /usr/libexec/PlistBuddy -c "Set :com.apple.developer.aps-environment $APS_ENVIRONMENT" "$TEMP_ENTITLEMENTS" 2>/dev/null; then
+        /usr/libexec/PlistBuddy -c "Add :com.apple.developer.aps-environment string $APS_ENVIRONMENT" "$TEMP_ENTITLEMENTS"
+      fi
+    fi
+    CODESIGN_ENTITLEMENTS="$TEMP_ENTITLEMENTS"
+    if [[ -n "$APS_ENVIRONMENT" ]]; then
+      echo "Using APNs entitlement: com.apple.developer.aps-environment=$APS_ENVIRONMENT"
+    fi
+  fi
+  codesign --force --options runtime "$CODESIGN_TIMESTAMP" \
+    --entitlements "$CODESIGN_ENTITLEMENTS" \
+    --sign "$SIGN_IDENTITY" \
+    "$APP_DIR"
+  if [[ -n "$PROFILE_PLIST" ]]; then
+    rm -f "$PROFILE_PLIST"
+  fi
+  if [[ -n "$TEMP_ENTITLEMENTS" ]]; then
+    rm -f "$TEMP_ENTITLEMENTS"
+  fi
+  trap - EXIT
+
+  # Deep-verify entire bundle — fail fast if any component has an invalid signature
+  echo "Verifying deep signature..."
+  if ! codesign --verify --deep --strict "$APP_DIR" 2>&1; then
+    echo "ERROR: Deep signature verification failed" >&2
+    exit 1
+  fi
+  echo "  Deep signature valid."
+else
+  # No Developer ID certificate: ad-hoc sign for local dev instead of leaving the
+  # bundle with SwiftPM's incoherent per-binary signature. An ad-hoc *bundle* signature
+  # binds Info.plist and adopts the bundle's CFBundleIdentifier (com.muesli.*) as the
+  # signing identity, which macOS TCC needs to attribute Accessibility / Input-Monitoring
+  # grants to the running process. Without it, AXIsProcessTrusted()/CGPreflightListenEventAccess()
+  # keep returning false even after the user grants permission, so onboarding stalls.
+  #
+  # Note: ad-hoc signatures have no stable designated requirement, so the cdhash changes on
+  # every rebuild and macOS privacy grants must be re-approved after each dev build. For grants
+  # that persist across rebuilds, create a self-signed code-signing certificate and pass its name
+  # via MUESLI_SIGN_IDENTITY. No hardened runtime here: ad-hoc has no Team ID, so library
+  # validation would block dlopen of the bundled frameworks/dylibs.
+  LOCAL_SIGN_IDENTITY="-"
+  if [[ -n "${MUESLI_SIGN_IDENTITY:-}" ]]; then
+    LOCAL_SIGN_IDENTITY="$MUESLI_SIGN_IDENTITY"
+    if ! security find-identity -v -p codesigning | grep -Fq "$LOCAL_SIGN_IDENTITY"; then
+      echo "Signing identity not found: $LOCAL_SIGN_IDENTITY" >&2
+      exit 1
+    fi
+    echo "Local signing with MUESLI_SIGN_IDENTITY=$LOCAL_SIGN_IDENTITY (MUESLI_SKIP_SIGN=1)..."
+  else
+    echo "Ad-hoc signing for local dev (MUESLI_SKIP_SIGN=1; no Developer ID)..."
+  fi
+  ENTITLEMENTS="${MUESLI_ENTITLEMENTS:-$ROOT/scripts/MuesliLocalOnly.entitlements}"
+
+  find "$APP_DIR/Contents/MacOS" -maxdepth 1 -name "*.framework" -type d | while read -r framework; do
+    # Sign every nested standalone Mach-O (e.g. Sparkle's Versions/B/Autoupdate),
+    # then nested .xpc/.app bundles, then the framework itself — mirroring the
+    # Developer-ID path so `codesign --verify --deep --strict` cannot fail on a
+    # nested executable the framework-level sign doesn't reseal.
+    find "$framework" -type f -perm +111 | while read -r binary; do
+      if file "$binary" | grep -q "Mach-O"; then
+          codesign --force --sign "$LOCAL_SIGN_IDENTITY" "$binary"
+      fi
+    done
+    find "$framework" \( -name "*.xpc" -o -name "*.app" \) -type d | while read -r nested; do
+      codesign --force --sign "$LOCAL_SIGN_IDENTITY" "$nested"
+    done
+    codesign --force --sign "$LOCAL_SIGN_IDENTITY" "$framework"
+  done
+
+  find "$APP_DIR/Contents/MacOS" "$APP_DIR/Contents/Frameworks" -maxdepth 1 \( -name "*.dylib" -o -name "*.so" \) -type f | while read -r library; do
+    if file "$library" | grep -q "Mach-O"; then
+      codesign --force --sign "$LOCAL_SIGN_IDENTITY" "$library"
+    fi
+  done
+
+  if [[ -f "$APP_DIR/Contents/MacOS/homan-cli" ]]; then
+    codesign --force --sign "$LOCAL_SIGN_IDENTITY" "$APP_DIR/Contents/MacOS/homan-cli"
+  fi
+
+  # Sign the bundle last so the Info.plist binding / identity stick.
+  codesign --force --sign "$LOCAL_SIGN_IDENTITY" --entitlements "$ENTITLEMENTS" "$APP_DIR"
+
+  echo "Verifying ad-hoc signature..."
+  if ! codesign --verify --deep --strict "$APP_DIR" 2>&1; then
+    echo "ERROR: ad-hoc signature verification failed" >&2
+    exit 1
+  fi
+  echo "  Local signature valid. Re-approve macOS privacy permissions if prompted after ad-hoc rebuilds."
+fi
+
+if [[ "$REQUIRE_LOCALVQE" == "1" ]]; then
+  "$ROOT/scripts/verify_localvqe_bundle.sh" "$APP_DIR"
+fi
+
+rm -rf "$STAGED_APP_DIR"
+
+echo "Installed $APP_DIR ($(du -sh "$APP_DIR" | cut -f1))"

@@ -1,0 +1,105 @@
+// swift-tools-version: 5.9
+import PackageDescription
+
+let package = Package(
+    name: "MuesliNative",
+    platforms: [
+        .macOS("14.2"),
+    ],
+    products: [
+        .library(name: "MuesliCore", targets: ["MuesliCore"]),
+        .executable(name: "MuesliNativeApp", targets: ["MuesliNativeApp"]),
+        .executable(name: "homan-cli", targets: ["MuesliCLI"]),
+    ],
+    dependencies: [
+        .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.1"),
+        .package(url: "https://github.com/argmaxinc/WhisperKit.git", branch: "main"), // TODO: pin to tagged release once one ships post-PR #455 (swift-transformers removal)
+        // Upstream LLM.swift (llama.cpp b10068) — supports Gemma 4 (gemma4) on-device
+        // summarization and the Qwen GGUF post-processor. The old obra/LLM.swift fork
+        // bundles llama.cpp 0.9.8 which cannot load gemma4 architecture.
+        .package(url: "https://github.com/eastriverlee/LLM.swift.git", exact: "3.0.3"),
+        .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.3"),
+        .package(url: "https://github.com/TelemetryDeck/SwiftSDK", from: "2.0.0"),
+        .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
+        .package(url: "https://github.com/apple/swift-atomics.git", from: "1.2.0"),
+    ],
+    targets: [
+        .target(
+            name: "MuesliCore",
+            dependencies: [],
+            path: "Sources/MuesliCore",
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .executableTarget(
+            name: "MuesliNativeApp",
+            dependencies: [
+                "MuesliCore",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+                .product(name: "LLM", package: "LLM.swift"),
+                .target(name: "CLiteRTLM_mac", condition: .when(platforms: [.macOS])),
+                .product(name: "WhisperKit", package: "WhisperKit"),
+                .product(name: "Sparkle", package: "Sparkle"),
+                .product(name: "TelemetryDeck", package: "SwiftSDK"),
+                .product(name: "Atomics", package: "swift-atomics"),
+                .product(name: "DTLNAecCoreML", package: "dtln-aec-coreml"),
+                .product(name: "DTLNAec512", package: "dtln-aec-coreml"),
+                "AudioGraphExceptionBridge",
+                "LocalVQEBridge",
+            ],
+            path: "Sources/MuesliNativeApp",
+            swiftSettings: [
+                .unsafeFlags(["-parse-as-library"]),
+            ],
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+        .executableTarget(
+            name: "MuesliCLI",
+            dependencies: [
+                "MuesliCore",
+                .product(name: "ArgumentParser", package: "swift-argument-parser"),
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "Sources/MuesliCLI"
+        ),
+        .target(
+            name: "AudioGraphExceptionBridge",
+            path: "Sources/AudioGraphExceptionBridge",
+            publicHeadersPath: "include",
+            linkerSettings: [
+                .linkedFramework("AudioToolbox"),
+                .linkedFramework("AVFAudio"),
+            ]
+        ),
+        .target(
+            name: "LocalVQEBridge",
+            path: "Sources/LocalVQEBridge",
+            publicHeadersPath: "include"
+        ),
+        .binaryTarget(
+            name: "CLiteRTLM_mac",
+            url: "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.13.1/CLiteRTLM_mac.xcframework.zip",
+            checksum: "ec9ffe230dc39117a7fc8933b1cc15910454027fee6d3041534ab7cf17313981"
+        ),
+        .testTarget(
+            name: "MuesliTests",
+            dependencies: [
+                "MuesliNativeApp",
+                "MuesliCore",
+                "MuesliCLI",
+                "AudioGraphExceptionBridge",
+                "LocalVQEBridge",
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "Tests/MuesliTests",
+            linkerSettings: [
+                .linkedLibrary("sqlite3"),
+            ]
+        ),
+    ],
+    cxxLanguageStandard: .cxx17
+)
