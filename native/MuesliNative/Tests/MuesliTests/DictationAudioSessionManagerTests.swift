@@ -48,11 +48,47 @@ struct DictationAudioSessionManagerTests {
         #expect(harness.recorder.prepareCalls == 0)
         #expect(harness.recorder.startCalls == 1)
         #expect(harness.events.contains { event in
+            if case .captureStarted = event { return true }
+            return false
+        })
+        #expect(harness.events.contains { event in
             if case .latency(let name, _) = event {
                 return name == "activation_reused:start"
             }
             return false
         })
+    }
+
+    @Test("successful recorder start is reported before the first audio buffer")
+    func successfulStartEmitsCaptureStartedBeforeFirstBuffer() {
+        let harness = Harness(routeKind: .speakerLike)
+
+        harness.manager.beginRecording(mode: "toggle", duckingEnabled: false, mediaPauseEnabled: false)
+        harness.wait()
+
+        #expect(harness.events.contains { if case .captureStarted = $0 { return true }; return false })
+        #expect(!harness.events.contains { if case .streamActive = $0 { return true }; return false })
+
+        harness.recorder.onFirstCapturedAudioBuffer?(Date())
+        harness.wait()
+
+        let captureStartedIndex = harness.events.firstIndex { if case .captureStarted = $0 { return true }; return false }
+        let streamActiveIndex = harness.events.firstIndex { if case .streamActive = $0 { return true }; return false }
+        #expect(captureStartedIndex != nil)
+        #expect(streamActiveIndex != nil)
+        #expect(captureStartedIndex! < streamActiveIndex!)
+    }
+
+    @Test("failed recorder start does not report capture started")
+    func failedStartDoesNotEmitCaptureStarted() {
+        let harness = Harness(routeKind: .speakerLike)
+        harness.recorder.startError = NSError(domain: "DictationAudioSessionManagerTests", code: 2)
+
+        harness.manager.beginRecording(mode: "toggle", duckingEnabled: false, mediaPauseEnabled: false)
+        harness.wait()
+
+        #expect(harness.events.contains { if case .failed = $0 { return true }; return false })
+        #expect(!harness.events.contains { if case .captureStarted = $0 { return true }; return false })
     }
 
     @Test("begin recording queued behind a failed arm does not restart failed session")
@@ -713,6 +749,7 @@ private final class FakeDictationRecorder: DictationAudioRecording {
     var activeRecordingID: UUID?
     var warmUpDelay: TimeInterval = 0
     var activateError: Error?
+    var startError: Error?
 
     func prepare() throws {
         prepareCalls += 1
@@ -745,6 +782,9 @@ private final class FakeDictationRecorder: DictationAudioRecording {
 
     func start() throws -> UUID {
         startCalls += 1
+        if let startError {
+            throw startError
+        }
         let id = UUID()
         activeRecordingID = id
         return id

@@ -21,6 +21,7 @@ enum DictationAudioSessionState: Equatable {
 enum DictationAudioSessionEvent {
     case armed(UUID, source: String)
     case acquiringAudio(UUID)
+    case captureStarted(UUID, startedAt: Date)
     case streamActive(UUID, capturedAt: Date)
     case speechDetected(UUID, capturedAt: Date)
     case noAudioTimeout(UUID, at: Date)
@@ -290,6 +291,9 @@ final class DictationAudioSessionManager: @unchecked Sendable {
                     self.emitLatency("activation_prepare_skipped:\(mode):\(self.activationWarmupSkipReason(route: self.routeSnapshot))")
                 }
                 self.activeRecorderRunID = try self.recorder.start()
+                let startedAt = Date()
+                self.emitLatency("capture_started:\(mode)", at: startedAt)
+                self.emit(.captureStarted(sessionID, startedAt: startedAt))
                 self.emitLatency("activation_end:\(mode)")
                 fputs("[dictation-session] recording mode=\(mode) \(self.routeSnapshot.debugDescription)\n", stderr)
             } catch {

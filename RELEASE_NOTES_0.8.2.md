@@ -25,6 +25,7 @@ Homan 0.8.2 focuses on reliable long-running meeting capture, recoverable proces
 
 ## Dictation and data management
 
+- Played the dictation start cue immediately after audio capture successfully starts, instead of waiting for the first full audio buffer, without changing the recognition buffer or audio-processing path.
 - Kept prepared dictation audio graphs warm after successful dictations, reducing repeated CoreAudio setup work and improving subsequent dictation startup.
 - Avoided unnecessary input-graph rebuilds for unrelated output-route changes while retaining teardown after real failures, cancellation, shutdown, or explicit device changes.
 - Added settings import/export and text-only meeting backups.

@@ -9233,13 +9233,16 @@ final class MuesliController: NSObject {
         case .acquiringAudio(let sessionID):
             guard activeComputerUseAudioSessionID == sessionID else { break }
             setState(.preparing)
+        case .captureStarted(let sessionID, _):
+            guard activeComputerUseAudioSessionID == sessionID,
+                  computerUseCommandStartedAt != nil else { break }
+            SoundController.playDictationStart(
+                enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode
+            )
         case .streamActive(let sessionID, _):
             guard activeComputerUseAudioSessionID == sessionID,
                   computerUseCommandStartedAt != nil else { break }
             setState(.recording)
-            SoundController.playDictationStart(
-                enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode
-            )
         case .speechDetected(let sessionID, _):
             guard activeComputerUseAudioSessionID == sessionID else { break }
         case .noAudioTimeout(let sessionID, _):
@@ -9292,6 +9295,13 @@ final class MuesliController: NSObject {
         case .acquiringAudio:
             markDictationLatency("acquiring_audio")
             activateDictationPreparingIndicator()
+        case .captureStarted(let sessionID, let startedAt):
+            guard dictationAudioSessionManager.currentSessionID == sessionID else { break }
+            markDictationLatency("ui_capture_started_received", at: startedAt)
+            markDictationLatency("sound_start_requested:capture-started")
+            SoundController.playDictationStart(
+                enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode
+            )
         case .streamActive(_, let capturedAt):
             handleDictationStreamActive(capturedAt: capturedAt)
         case .speechDetected(_, let capturedAt):
@@ -9384,8 +9394,6 @@ final class MuesliController: NSObject {
         }
         capturedDictationContext = nil
         activateDictationRecordingIndicator()
-        markDictationLatency("sound_start_requested:stream-active")
-        SoundController.playDictationStart(enabled: shouldPlayDictationLifecycleSounds && !isDictationTestMode)
         markDictationLatency("ui_stream_active")
         logDictationPowerSample(label: "ui_power_sample_350ms", delay: 0.35)
         logDictationPowerSample(label: "ui_power_sample_1000ms", delay: 1.0)
