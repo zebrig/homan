@@ -39,19 +39,19 @@ struct MeetingNotesView: View {
             Color.clear
                 .frame(height: MuesliTheme.spacing8)
         } else if line.hasPrefix("# ") {
-            Text(String(line.dropFirst(2)))
+            Text(Self.inline(String(line.dropFirst(2))))
                 .font(MuesliTheme.title1())
                 .foregroundStyle(MuesliTheme.textPrimary)
                 .padding(.top, MuesliTheme.spacing8)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if line.hasPrefix("## ") {
-            Text(String(line.dropFirst(3)))
+            Text(Self.inline(String(line.dropFirst(3))))
                 .font(MuesliTheme.title3())
                 .foregroundStyle(MuesliTheme.textPrimary)
                 .padding(.top, MuesliTheme.spacing12)
                 .frame(maxWidth: .infinity, alignment: .leading)
         } else if line.hasPrefix("### ") {
-            Text(String(line.dropFirst(4)))
+            Text(Self.inline(String(line.dropFirst(4))))
                 .font(MuesliTheme.headline())
                 .foregroundStyle(MuesliTheme.textPrimary)
                 .padding(.top, MuesliTheme.spacing4)
@@ -68,7 +68,7 @@ struct MeetingNotesView: View {
                     .font(MuesliTheme.body())
                     .foregroundStyle(MuesliTheme.textTertiary)
                     .frame(width: 22, alignment: .trailing)
-                Text(numbered.text)
+                Text(Self.inline(numbered.text))
                     .font(MuesliTheme.body())
                     .foregroundStyle(MuesliTheme.textSecondary)
                     .lineSpacing(3)
@@ -76,13 +76,8 @@ struct MeetingNotesView: View {
             }
             .padding(.leading, CGFloat(indentLevel) * MuesliTheme.spacing20)
             .frame(maxWidth: .infinity, alignment: .leading)
-        } else if line.hasPrefix("**") && line.hasSuffix("**") {
-            Text(String(line.dropFirst(2).dropLast(2)))
-                .font(.system(size: 14, weight: .semibold))
-                .foregroundStyle(MuesliTheme.textPrimary)
-                .frame(maxWidth: .infinity, alignment: .leading)
         } else {
-            Text(line)
+            Text(Self.inline(line))
                 .font(MuesliTheme.body())
                 .foregroundStyle(MuesliTheme.textPrimary)
                 .lineSpacing(3)
@@ -110,7 +105,7 @@ struct MeetingNotesView: View {
                     .offset(y: -2)
                     .frame(width: 14, alignment: .center)
             }
-            Text(text)
+            Text(Self.inline(text))
                 .font(MuesliTheme.body())
                 .foregroundStyle(MuesliTheme.textSecondary)
                 .lineSpacing(3)
@@ -118,6 +113,10 @@ struct MeetingNotesView: View {
         }
         .padding(.leading, CGFloat(indentLevel) * MuesliTheme.spacing20)
         .frame(maxWidth: .infinity, alignment: .leading)
+    }
+
+    static func inline(_ text: String) -> AttributedString {
+        MarkdownInlineParser.parse(text)
     }
 
     private static func indentLevel(for line: String) -> Int {

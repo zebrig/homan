@@ -449,16 +449,19 @@ final class DictationAudioSessionManager: @unchecked Sendable {
         }
         routeSnapshot = makeRouteSnapshot(refreshInput: false)
         emitLatency("route_refresh:\(intent.debugName) \(routeSnapshot.debugDescription)")
+        if intent == .idlePrewarm(.routeChange) {
+            // The next activation refreshes the input pointer. Output-route
+            // notifications alone must not tear down an idle capture graph.
+            emitLatency("route_refresh_ignored:\(intent.debugName)")
+            return
+        }
         guard stateStorage == .idle, !externalSessionActive else { return }
         if let skipReason = idleWarmupSkipReason(route: routeSnapshot, canWarmUp: canWarmUp) {
-            recorder.keepsAudioGraphWarm = false
-            recorder.coolDown()
             emitLatency("warmup_skipped:\(intent.debugName):\(skipReason)")
             fputs("[dictation-session] warmup skipped intent=\(intent.debugName) reason=\(skipReason) \(routeSnapshot.debugDescription)\n", stderr)
             return
         }
         recorder.keepsAudioGraphWarm = true
-        recorder.coolDown()
         do {
             emitLatency("engine_prepare_begin:warmup:\(intent.debugName)")
             try recorder.warmUp(preferredInputDeviceID: routeSnapshot.preferredInputDeviceID)

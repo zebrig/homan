@@ -113,6 +113,9 @@ final class AppState {
     // Dashboard data
     var dictationRows: [DictationRecord] = []
     var meetingRows: [MeetingRecord] = []
+    /// Canonical local processing progress, keyed by meeting id. Rehydrated from the
+    /// local store by `syncAppState` so retry/recovery survives view changes and relaunches.
+    var meetingProcessing: [Int64: MeetingProcessingProgress] = [:]
     var totalMeetingCount: Int = 0
     var meetingCountsByFolder: [Int64: Int] = [:]
     var directMeetingCountsByFolder: [Int64: Int] = [:]

@@ -5,6 +5,15 @@ import Testing
 @Suite("CoreAudioSystemRecorder")
 struct CoreAudioSystemRecorderTests {
 
+    @Test("aggregate identity is stable and bounded")
+    func aggregateIdentityIsStableAndBounded() {
+        #expect(CoreAudioSystemRecorder.aggregateDeviceUIDCandidates == [
+            "com.zebrig.homan.system-audio-tap",
+            "com.zebrig.homan.system-audio-tap-fallback",
+        ])
+        #expect(Set(CoreAudioSystemRecorder.aggregateDeviceUIDCandidates).count == 2)
+    }
+
     @Test("global tap description captures process mix except Muesli")
     func globalTapDescriptionExcludesSelfAudio() {
         let tapDescription = CoreAudioSystemRecorder.makeGlobalTapDescription(

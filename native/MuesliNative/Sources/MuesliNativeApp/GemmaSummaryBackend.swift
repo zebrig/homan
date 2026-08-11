@@ -1,15 +1,13 @@
 import Foundation
-import LLM
 
-/// On-device meeting-summarization backend: Gemma 4 (E4B default, or E2B/QAT
-/// variants) GGUF via upstream LLM.swift (llama.cpp b10068, gemma4 support).
-/// LLM.swift is macOS 13+, so no availability gate is needed.
+/// On-device meeting-summarization backend: Gemma 4 (E4B-QAT default, or E4B/E2B
+/// variants) GGUF via `SummaryRuntime` (mattt/llama.swift, llama.cpp b10276, Metal).
 ///
-/// Uses the chat-template path (`template == nil` → `respondUsingChatTemplate` →
-/// embedded GGUF jinja), system prompt via `bot.systemPrompt`, and thinking
-/// suppression. Sampler defaults are Google's recommended Gemma 4 settings —
-/// `temp=1.0, top_p=0.95, top_k=64`, repeat penalty off — and must not be lowered
-/// for quality (Gemma 4 degrades at low temperature / greedy top_k=1).
+/// Uses the model's embedded chat template (`llama_chat_apply_template(nil, …)`),
+/// thinking stripped post-hoc by `GemmaSummaryOutputCleaner`. Sampler defaults are
+/// Google's recommended Gemma 4 settings — `temp=1.0, top_p=0.95, top_k=64`, repeat
+/// penalty off — and must not be lowered for quality (Gemma 4 degrades at low
+/// temperature / greedy top_k=1).
 actor GemmaSummaryBackend {
     static let shared = GemmaSummaryBackend()
 
@@ -25,9 +23,8 @@ actor GemmaSummaryBackend {
     /// Backend label used in `MeetingSummaryError` messages and logs.
     static let displayName = MeetingSummaryBackendOption.gemmaLocal.label
 
-    private var bot: LLM?
+    private var runtime: SummaryRuntime?
     private var loadedModelID: String?
-    private var loadedSamplerKey: String?
     private let inferenceGate = InferenceGate()
 
     /// Generate a meeting summary (or title) from the rendered Homan prompts.
@@ -46,17 +43,18 @@ actor GemmaSummaryBackend {
         modelID: String,
         settings: SummaryGenerationSettings
     ) async throws -> String {
-        // Actors can re-enter while respond() awaits; serialize access to the cached mutable LLM.
+        // Actors can re-enter while the blocking C generation runs; serialize access via the gate.
         try await inferenceGate.acquire()
         do {
             try Task.checkCancellation()
-            let bot = try loadBot(modelID: modelID, settings: settings)
-            defer { bot.reset() }
-            bot.systemPrompt = systemPrompt
-            await bot.respond(to: userPrompt, thinking: .suppressed)
-            let raw = bot.output
-            let capped = await cappedOutput(raw, maxTokens: settings.normalized.maxOutputTokens, bot: bot)
-            let cleaned = GemmaSummaryOutputCleaner.clean(capped)
+            let runtime = try loadRuntime(modelID: modelID, settings: settings)
+            let maxOut = Int32(settings.normalized.maxOutputTokens ?? Self.defaultMaxOutputTokens)
+            let raw = runtime.respond(
+                systemPrompt: systemPrompt,
+                userPrompt: userPrompt,
+                maxOutputTokens: maxOut
+            )
+            let cleaned = GemmaSummaryOutputCleaner.clean(raw)
             // T020: map empty/degenerate output to a plain failure — no auto-retry.
             guard GemmaSummaryOutputCleaner.isUsable(cleaned) else {
                 await inferenceGate.release()
@@ -70,25 +68,31 @@ actor GemmaSummaryBackend {
         }
     }
 
-    /// Release the loaded model (e.g. when its files are deleted from the Models tab).
+    /// Release the loaded model (e.g. when its files are deleted from the Models tab, or app quit).
     func shutdown() {
-        bot = nil
+        runtime?.shutdown()
+        runtime = nil
         loadedModelID = nil
-        loadedSamplerKey = nil
+    }
+
+    /// Synchronous shutdown for the app-terminate path. llama.cpp's Metal backend must be
+    /// freed before process exit (otherwise the C++ static destructor asserts on teardown).
+    static func shutdownSynchronously() {
+        let sem = DispatchSemaphore(value: 0)
+        Task {
+            await GemmaSummaryBackend.shared.shutdown()
+            sem.signal()
+        }
+        sem.wait()
     }
 
     // MARK: - Loading
 
-    private func loadBot(modelID: String, settings: SummaryGenerationSettings) throws -> LLM {
+    private func loadRuntime(modelID: String, settings: SummaryGenerationSettings) throws -> SummaryRuntime {
         let normalized = settings.normalized
         let context = Int32(normalized.contextTokens ?? Self.defaultContextTokens)
         let temperature = Float(normalized.temperature ?? Self.defaultTemperature)
         let topP = Float(normalized.topP ?? Self.defaultTopP)
-        let samplerKey = "\(context)|\(temperature)|\(topP)"
-
-        if let bot, loadedModelID == modelID, loadedSamplerKey == samplerKey {
-            return bot
-        }
 
         let model = GemmaSummaryModel.resolve(id: modelID)
         guard FileManager.default.fileExists(atPath: model.modelURL.path) else {
@@ -100,16 +104,20 @@ actor GemmaSummaryBackend {
                 ]
             )
         }
-        guard let loaded = LLM(
-            from: model.modelURL,
-            seed: 7,
+
+        // Reuse the cached runtime when the model/sampler matches; reload otherwise.
+        if let runtime, loadedModelID != modelID {
+            runtime.shutdown()
+            self.runtime = nil
+        }
+        let runtime = runtime ?? SummaryRuntime()
+        guard runtime.load(
+            modelURL: model.modelURL,
+            contextTokens: context,
             topK: Self.defaultTopK,
             topP: topP,
             temp: temperature,
-            repeatPenalty: 1.0,
-            repetitionLookback: 64,
-            historyLimit: 0,
-            maxTokenCount: context
+            seed: 7
         ) else {
             throw NSError(
                 domain: "GemmaSummaryBackend",
@@ -119,24 +127,9 @@ actor GemmaSummaryBackend {
                 ]
             )
         }
-        bot = loaded
+        self.runtime = runtime
         loadedModelID = modelID
-        loadedSamplerKey = samplerKey
-        return loaded
-    }
-
-    /// Safety net for runaway output: LLM.swift has no max-output-token parameter,
-    /// so cap a too-long summary post-hoc at the token level (approximate).
-    private func cappedOutput(_ raw: String, maxTokens: Int?, bot: LLM) async -> String {
-        guard let maxTokens, maxTokens > 0 else { return raw }
-        let tokens = await bot.encode(raw)
-        guard tokens.count > maxTokens else { return raw }
-        let capped = tokens.prefix(maxTokens)
-        var text: String = ""
-        for token in capped {
-            text += await bot.core.decode(token)
-        }
-        return text.trimmingCharacters(in: .whitespacesAndNewlines)
+        return runtime
     }
 }
 

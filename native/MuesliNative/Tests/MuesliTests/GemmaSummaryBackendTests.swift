@@ -63,11 +63,11 @@ struct GemmaSummaryBackendOptionTests {
         #expect(MeetingSummaryBackendOption.resolved("unknown") == .transcriptOnly)
     }
 
-    @Test("fresh config defaults gemma summary model to the E4B catalog entry")
+    @Test("fresh config defaults gemma summary model to the E4B QAT catalog entry")
     func configDefaultModel() {
         let config = AppConfig()
         #expect(config.gemmaSummaryModel == GemmaSummaryModel.defaultModel.id)
-        #expect(GemmaSummaryModel.resolve(id: config.gemmaSummaryModel) == .e4b)
+        #expect(GemmaSummaryModel.resolve(id: config.gemmaSummaryModel) == .e4bQAT)
     }
 
     @Test("resolvedMeetingSummaryModel falls back to the catalog default")

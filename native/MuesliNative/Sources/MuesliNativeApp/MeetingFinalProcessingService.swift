@@ -47,7 +47,8 @@ enum MeetingFinalProcessingService {
         meeting: MeetingRecord,
         config: AppConfig,
         templateSnapshot: MeetingTemplateSnapshot,
-        coordinator: TranscriptionCoordinator
+        coordinator: TranscriptionCoordinator,
+        progress: @Sendable (MeetingProcessingPhase) -> Void = { _ in }
     ) async throws -> RecoveredMeetingProcessingResult {
         var stagedAudio = try MeetingProcessingCapture.markProcessing(originalStagedAudio)
         if let cached = try loadCachedResult(for: stagedAudio),
@@ -93,6 +94,7 @@ enum MeetingFinalProcessingService {
             )
             await coordinator.setNemotron35PromptId(language.promptId)
         }
+        progress(.transcribing)
         let transcriptionStartedAt = Date()
         if backend.backend == BackendOption.homanWhisper.backend {
             try await coordinator.configureHomanWhisper(
@@ -134,12 +136,14 @@ enum MeetingFinalProcessingService {
             new: currentSessionTranscript
         )
 
+        progress(.generatingTitle)
         let title = await resolvedTitle(
             meeting: meeting,
             transcript: combinedTranscript,
             config: config
         )
         stagedAudio = try MeetingProcessingCapture.markState(.summarizing, for: stagedAudio)
+        progress(.summarizing)
         let formattedNotes: String
         var summaryMetadata: MeetingProcessingRunMetadata?
         if !MeetingResumePolicy.hasNewTranscriptContent(

@@ -40,7 +40,7 @@ if ! muesli_spm_scratch_disabled; then
 else
   BUILD_ENV+=(MUESLI_DISABLE_SWIFTPM_SCRATCH_PATH=1)
 fi
-PROFILE_NAME="${MUESLI_NOTARY_PROFILE:-MuesliNotary}"
+PROFILE_NAME="${MUESLI_NOTARY_PROFILE:-HomanNotary}"
 SIGN_IDENTITY="${MUESLI_SIGN_IDENTITY:-Developer ID Application: Pranav Hari Guruvayurappan (58W55QJ567)}"
 APP_DIR="/Applications/MuesliCanary.app"
 OUTPUT_DIR="$ROOT/dist-release"

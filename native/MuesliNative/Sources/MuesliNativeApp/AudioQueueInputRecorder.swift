@@ -210,6 +210,9 @@ final class AudioQueueInputRecorder: StreamingDictationRecording, StreamingDicta
     }
 
     private func prepareLocked() throws {
+        // A queue prepared for AQDefaultDevice follows the system default at
+        // start time. An explicitly selected queue is tied to its device UID;
+        // start failure remains the authoritative signal to dispose/rebuild it.
         if isPrepared, preparedInputDeviceID == preferredInputDeviceID {
             emitLatency("audio_queue_prepare_reused")
             return

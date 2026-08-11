@@ -18,7 +18,7 @@ BUNDLE_ID="${MUESLI_BUNDLE_ID:-com.zebrig.homan}"
 TELEMETRYDECK_APP_ID="${MUESLI_TELEMETRYDECK_APP_ID:-}"
 TELEMETRY_CHANNEL="${MUESLI_TELEMETRY_CHANNEL:-unconfigured}"
 ATS_INSECURE_HTTP_HOSTS="${MUESLI_ATS_INSECURE_HTTP_HOSTS:-}"
-DEFAULT_APP_VERSION="0.8.0"
+DEFAULT_APP_VERSION="0.8.2"
 APP_VERSION="${MUESLI_BUILD_VERSION:-$DEFAULT_APP_VERSION}"
 APP_BUNDLE_VERSION="${MUESLI_BUNDLE_VERSION:-$APP_VERSION}"
 APP_SHORT_VERSION="${MUESLI_SHORT_VERSION:-$APP_VERSION}"
@@ -29,7 +29,10 @@ SPARKLE_FEED_URL="${MUESLI_SPARKLE_FEED_URL-}"
 SPARKLE_EDKEY="${MUESLI_SPARKLE_EDKEY-}"
 STAGED_APP_DIR="$DIST_DIR/$APP_BUNDLE_NAME"
 APP_DIR="$INSTALL_DIR/$APP_BUNDLE_NAME"
-DEFAULT_SIGN_IDENTITY="Developer ID Application: Pranav Hari Guruvayurappan (58W55QJ567)"
+# Homan owner identity. Keep this aligned with scripts/install_homan_local.sh.
+# Contributors without this certificate should use an isolated dev lane, not replace
+# the owner's /Applications/Homan.app with an ad-hoc build.
+DEFAULT_SIGN_IDENTITY="Developer ID Application: Yahor Zaleski (YH3W46ABZY)"
 SIGN_IDENTITY="${MUESLI_SIGN_IDENTITY:-$DEFAULT_SIGN_IDENTITY}"
 SKIP_SIGN="${MUESLI_SKIP_SIGN:-0}"
 PROVISIONING_PROFILE="${MUESLI_PROVISIONING_PROFILE:-}"
@@ -413,7 +416,9 @@ if [[ "$SKIP_SIGN" != "1" ]]; then
     "$APP_DIR/Contents/MacOS/homan-cli"
 
   # Sign the app bundle with hardened runtime, secure timestamp, and entitlements
-  ENTITLEMENTS="${MUESLI_ENTITLEMENTS:-$ROOT/scripts/Muesli.entitlements}"
+  # Homan does not own the inherited Muesli CloudKit container. Production-style
+  # local builds therefore default to the reviewed local-only entitlement set.
+  ENTITLEMENTS="${MUESLI_ENTITLEMENTS:-$ROOT/scripts/MuesliLocalOnly.entitlements}"
   CODESIGN_ENTITLEMENTS="$ENTITLEMENTS"
   TEMP_ENTITLEMENTS=""
   APS_ENVIRONMENT="${MUESLI_APS_ENVIRONMENT:-}"

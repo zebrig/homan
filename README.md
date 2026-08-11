@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="assets/brand/homan-readme-hero.png" alt="Homan — Human conversations, kept at home." width="900" />
+  <img src="assets/repository-open-graph.png" alt="Homan — Human conversations, kept at home." width="900" />
 </p>
 
 <h1 align="center">Homan</h1>
@@ -59,10 +59,12 @@ Dictation is a straight line: hold the hotkey → speak → release → text is 
 - **On-device Gemma 4 summaries** — the newest path: a Gemma 4 model on your Mac turns the transcript into structured notes. No API key, no cloud, nothing leaves the device.
 - **Your choice of providers** — OpenAI, OpenRouter, ChatGPT (OAuth), Ollama, LM Studio, or a custom LLM, with per-meeting overrides and full prompt templates.
 - **Meeting templates** — built-in and custom profiles for structured notes.
-- **Export** — notes or transcript as paginated PDF (US Letter) or Markdown.
+- **Export** — notes or transcript as paginated PDF or Markdown, plus timed-text and WebVTT transcript export.
 
 ### Control & recovery
 - **Stable recording lifecycle** — pause/resume, retention policies, protection, and crash-safe recovery.
+- **Route-aware microphone recovery** — Homan keeps the active source until a replacement microphone produces a real signal.
+- **Visible processing progress** — transcription and summarization progress survives navigation, retries, and recovery.
 - **Calendar integration** — upcoming meetings, pre-meeting countdowns, event-driven notifications.
 - **Screen context (opt-in)** — the app name and text near the cursor inform dictation and meeting summaries.
 
@@ -74,8 +76,6 @@ Audio and transcripts stay local by default. Network access is used only for pro
 
 Download the latest release from [Homan Releases](https://github.com/zebrig/homan/releases). Signed and notarized builds are produced from a clean worktree at an approved commit.
 
-> Development note: until the first signed release is published, run the app from a local build (below).
-
 ## Build and test from source
 
 Requires macOS 14.2+, Xcode, and Apple Silicon.
@@ -84,8 +84,11 @@ Requires macOS 14.2+, Xcode, and Apple Silicon.
 # Development build (isolated identity, separate data dir)
 ./scripts/dev-test.sh
 
-# Production build (signed if a Developer ID is configured)
-./scripts/build_native_app.sh
+# Owner-signed local installation (stable macOS privacy permissions)
+./scripts/install_homan_local.sh
+
+# Also notarize and staple the local candidate
+./scripts/install_homan_local.sh --notarize
 
 # Tests
 swift test --package-path native/MuesliNative
@@ -110,10 +113,6 @@ homan-cli dictations list --limit 10
 
 `homan-cli spec` prints the full command tree and schema.
 
-## Related projects
-
-- **[homan-transcribe-server](https://github.com/zebrig/homan-transcribe-server)** — Dockerized whisper.cpp Vulkan server with OpenAI-compatible and Homan-native batch transcription APIs. Run it yourself as a self-hosted remote transcription backend for Homan.
-
 ## Architecture
 
 ```
@@ -123,20 +122,9 @@ native/MuesliNative/Sources/
 └── MuesliCLI/           # homan-cli — agent-friendly JSON over stdout
 ```
 
-> Internal module names and on-disk paths retain their `Muesli*` / `muesli` spelling for
-> compatibility with the upstream project (Homan is a fork). User-visible identity — the app, the
-> CLI, and the support directory — is fully Homan.
-
-## Data storage and permissions
-
 - **Config:** `~/Library/Application Support/Homan/config.json`
 - **Database:** `~/Library/Application Support/Homan/muesli.db`
 - **Models:** `~/.cache/muesli/models/` (shared across app identities)
-- **Microphone** — dictation and meeting mic capture
-- **Accessibility** — paste at cursor and opt-in screen context
-- **Input Monitoring** — global hotkeys
-- **Screen Recording** — system audio capture for meetings
-- **Calendar (optional)** — upcoming meetings and event-driven notifications
 
 ## Contributing
 

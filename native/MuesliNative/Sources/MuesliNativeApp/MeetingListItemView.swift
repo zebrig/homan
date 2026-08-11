@@ -6,6 +6,7 @@ struct MeetingListItemView: View {
     let isSelected: Bool
     let hasFollowUps: Bool
     let folders: [MeetingFolder]
+    let appState: AppState
     private let folderByID: [Int64: MeetingFolder]
     private let folderIDsWithChildren: Set<Int64>
     let onSelect: () -> Void
@@ -23,6 +24,7 @@ struct MeetingListItemView: View {
         isSelected: Bool,
         hasFollowUps: Bool,
         folders: [MeetingFolder],
+        appState: AppState,
         onSelect: @escaping () -> Void,
         onMove: @escaping (Int64?) -> Void,
         onCreateFolderAndMove: ((String) -> Void)?,
@@ -32,6 +34,7 @@ struct MeetingListItemView: View {
         self.isSelected = isSelected
         self.hasFollowUps = hasFollowUps
         self.folders = folders
+        self.appState = appState
         self.folderByID = Dictionary(uniqueKeysWithValues: folders.map { ($0.id, $0) })
         self.folderIDsWithChildren = Set(folders.compactMap(\.parentID))
         self.onSelect = onSelect
@@ -279,14 +282,28 @@ struct MeetingListItemView: View {
 
     // MARK: - Formatting
 
+    @ViewBuilder
     private var statusBadge: some View {
-        Text(record.status.displayLabel)
-            .font(.system(size: 10, weight: .semibold))
-            .foregroundStyle(record.status.displayColor)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(record.status.displayColor.opacity(0.12))
-            .clipShape(Capsule())
+        if record.status == .processing, let progress = appState.meetingProcessing[record.id] {
+            TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                Text(progress.displayTitle(now: context.date))
+                    .font(.system(size: 10, weight: .semibold))
+                    .foregroundStyle(MeetingStatus.processing.displayColor)
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 2)
+                    .background(MeetingStatus.processing.displayColor.opacity(0.12))
+                    .clipShape(Capsule())
+                    .lineLimit(1)
+            }
+        } else {
+            Text(record.status.displayLabel)
+                .font(.system(size: 10, weight: .semibold))
+                .foregroundStyle(record.status.displayColor)
+                .padding(.horizontal, 6)
+                .padding(.vertical, 2)
+                .background(record.status.displayColor.opacity(0.12))
+                .clipShape(Capsule())
+        }
     }
 
     private var sourceIndicator: AnyView? {

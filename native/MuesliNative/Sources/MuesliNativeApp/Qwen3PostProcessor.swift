@@ -1,5 +1,4 @@
 import Foundation
-import LLM
 
 enum Qwen3PostProcessorLogging {
     private static let verboseEnv = "MUESLI_DEBUG_POSTPROC_LOGS"
@@ -254,7 +253,7 @@ actor InferenceGate {
 private actor Qwen3PostProcessorManager {
     private let modelURL: URL
     private let systemPrompt: String
-    private var bot: LLM?
+    private var runtime: SummaryRuntime?
     private let inferenceGate = InferenceGate()
 
     init(modelURL: URL, systemPrompt: String) {
@@ -263,21 +262,23 @@ private actor Qwen3PostProcessorManager {
     }
 
     func warm() throws {
-        _ = try loadBot()
+        _ = try loadRuntime()
     }
 
     func process(_ text: String, appContext: String? = nil) async throws -> String {
-        // Actors can re-enter while respond() awaits; serialize access to the cached mutable LLM.
+        // Actors can re-enter while the blocking C generation runs; serialize access via the gate.
         try await inferenceGate.acquire()
         do {
             try Task.checkCancellation()
-            let bot = try loadBot()
-            defer { bot.reset() }
+            let runtime = try loadRuntime()
             let formattedInput = Qwen3PostProcessorConfig.formatInput(text, appContext: appContext)
-            await bot.respond(to: formattedInput, thinking: .suppressed)
-            let raw = bot.output
+            let raw = runtime.respond(
+                systemPrompt: systemPrompt,
+                userPrompt: formattedInput,
+                maxOutputTokens: 2048
+            )
             let cleaned = Qwen3PostProcessorOutputCleaner.clean(raw)
-            Qwen3PostProcessorLogging.logVerbose("Qwen3 GGUF prompt chars=\(bot.preprocess(formattedInput, [], .suppressed).count)")
+            Qwen3PostProcessorLogging.logVerbose("Qwen3 GGUF prompt chars=\(formattedInput.count)")
             Qwen3PostProcessorLogging.logVerbose("Qwen3 GGUF raw output: \(raw)")
             Qwen3PostProcessorLogging.logVerbose("Qwen3 GGUF cleaned output: \(cleaned)")
             let result: String
@@ -297,28 +298,29 @@ private actor Qwen3PostProcessorManager {
         }
     }
 
-    private func loadBot() throws -> LLM {
-        if let bot { return bot }
-        guard let loaded = LLM(
-            from: modelURL,
-            seed: 7,
+    private func loadRuntime() throws -> SummaryRuntime {
+        if let runtime { return runtime }
+        guard FileManager.default.fileExists(atPath: modelURL.path) else {
+            throw NSError(domain: "Qwen3PostProcessor", code: 3, userInfo: [
+                NSLocalizedDescriptionKey: "Qwen3 GGUF model not found at \(modelURL.path)",
+            ])
+        }
+        let runtime = SummaryRuntime()
+        // Greedy cleanup sampling (topK=1, temp=0) — matches the old LLM.swift config.
+        guard runtime.load(
+            modelURL: modelURL,
+            contextTokens: Qwen3PostProcessorConfig.maxContextTokens,
             topK: 1,
             topP: 1.0,
             temp: 0.0,
-            repeatPenalty: 1.0,
-            repetitionLookback: 64,
-            historyLimit: 0,
-            maxTokenCount: Qwen3PostProcessorConfig.maxContextTokens
+            seed: 7
         ) else {
             throw NSError(domain: "Qwen3PostProcessor", code: 2, userInfo: [
                 NSLocalizedDescriptionKey: "Failed to load Qwen3 GGUF model at \(modelURL.path)",
             ])
         }
-        // Upstream LLM.swift: system prompt via `systemPrompt` + chat-template path
-        // (template == nil → embedded GGUF chat template; Qwen GGUFs carry ChatML).
-        loaded.systemPrompt = systemPrompt
-        bot = loaded
-        return loaded
+        self.runtime = runtime
+        return runtime
     }
 }
 

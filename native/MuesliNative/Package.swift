@@ -15,10 +15,11 @@ let package = Package(
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
         .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.1"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", branch: "main"), // TODO: pin to tagged release once one ships post-PR #455 (swift-transformers removal)
-        // Upstream LLM.swift (llama.cpp b10068) — supports Gemma 4 (gemma4) on-device
-        // summarization and the Qwen GGUF post-processor. The old obra/LLM.swift fork
-        // bundles llama.cpp 0.9.8 which cannot load gemma4 architecture.
-        .package(url: "https://github.com/eastriverlee/LLM.swift.git", exact: "3.0.3"),
+        // mattt/llama.swift re-exports the llama.cpp C API; bundles llama.cpp b10280 (Metal,
+        // fast long-context kernels). Single llama.cpp in the package — both the summarization
+        // runtime and the Qwen GGUF post-processor use it. LLM.swift (b10068) was removed
+        // (upstream inactive; its llama.h conflicted with llama.swift's newer API). Swift 6 tools.
+        .package(url: "https://github.com/mattt/llama.swift.git", from: "2.10276.0"),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.3"),
         .package(url: "https://github.com/TelemetryDeck/SwiftSDK", from: "2.0.0"),
         .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
@@ -38,7 +39,7 @@ let package = Package(
             dependencies: [
                 "MuesliCore",
                 .product(name: "FluidAudio", package: "FluidAudio"),
-                .product(name: "LLM", package: "LLM.swift"),
+                .product(name: "LlamaSwift", package: "llama.swift"),
                 .target(name: "CLiteRTLM_mac", condition: .when(platforms: [.macOS])),
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "Sparkle", package: "Sparkle"),

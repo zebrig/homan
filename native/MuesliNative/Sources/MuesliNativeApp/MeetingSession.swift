@@ -147,8 +147,9 @@ extension MeetingSessionResult {
 }
 
 enum MeetingProcessingStage {
+    case cleaningWav
+    case writingRecording
     case transcribingAudio
-    case cleaningAudio
     case generatingTitle
     case summarizingNotes
 }
@@ -188,6 +189,7 @@ final class MeetingSession: @unchecked Sendable {
     private let micChunkHealthTracker = MeetingTranscriptChunkHealthTracker()
     private let systemChunkHealthTracker = MeetingTranscriptChunkHealthTracker()
     private let micHealthTracker = MeetingMicHealthTracker()
+    private let micRecoveryCoordinator = MeetingMicRecoveryCoordinator()
     private let chunkRotationQueue = DispatchQueue(label: "MuesliNative.MeetingSession.chunkRotation")
     private let pausedDisplayLock = OSAllocatedUnfairLock(initialState: false)
     private var chunkTimingTracker = MeetingChunkTimingTracker()
@@ -195,6 +197,7 @@ final class MeetingSession: @unchecked Sendable {
     private var systemChunkRecorder: PCMChunkRecorder?
     var onProgress: ((MeetingProcessingStage) -> Void)?
     var onMicHealthChanged: ((MeetingMicHealthSnapshot) -> Void)?
+    var onMicHealthEpisode: ((MeetingMicHealthEpisodeEvent) -> Void)?
     var onCaptureIntegrityFailure: ((Error) -> Void)?
     var manualNotesProvider: (() async -> String?)?
     var liveTitleProvider: (() async -> String?)?
@@ -271,6 +274,12 @@ final class MeetingSession: @unchecked Sendable {
             self.systemAudioRecorder = CoreAudioSystemRecorder()
         } else {
             self.systemAudioRecorder = SystemAudioRecorder()
+        }
+        micRecoveryCoordinator.recoveryRequest = { [weak meetingMicRecorder] reason in
+            meetingMicRecorder?.requestSameRouteRecovery(reason: reason) ?? false
+        }
+        micRecoveryCoordinator.onEpisodeEvent = { [weak self] event in
+            self?.onMicHealthEpisode?(event)
         }
     }
 
@@ -1015,6 +1024,7 @@ final class MeetingSession: @unchecked Sendable {
             systemChunkRecorder = nil
             return (rawRecorder, systemRecorder)
         }
+        micRecoveryCoordinator.finishMeeting()
         vadController?.stop()
         vadController = nil
         systemVadController?.stop()
@@ -1038,7 +1048,7 @@ final class MeetingSession: @unchecked Sendable {
     }
 
     func stop() async throws -> MeetingSessionResult {
-        onProgress?(.transcribingAudio)
+        onProgress?(.cleaningWav)
         let endTime = Date()
 
         await finishLiveForMeetingEnd()
@@ -1085,6 +1095,7 @@ final class MeetingSession: @unchecked Sendable {
                 stagedRawAudio
             )
         }
+        micRecoveryCoordinator.finishMeeting()
         defer {
             if let rawStreamingMicURL {
                 try? FileManager.default.removeItem(at: rawStreamingMicURL)
@@ -1107,6 +1118,7 @@ final class MeetingSession: @unchecked Sendable {
             aec: neuralAec,
             supportDirectory: processingSupportDirectory
         )
+        onProgress?(.writingRecording)
         let retainedRecordingURL: URL?
         if config.meetingRecordingSavePolicy == .never {
             retainedRecordingURL = nil
@@ -1149,6 +1161,7 @@ final class MeetingSession: @unchecked Sendable {
             enablePostProcessor: false,
             includeMeetingHelpers: finalBackend.backend == BackendOption.homanWhisper.backend
         )
+        onProgress?(.transcribingAudio)
         fputs("[meeting] processing canonical microphone and system sources with \(finalBackend.label)\n", stderr)
         let pipelineResult = try await MeetingTranscriptionPipeline(
             coordinator: transcriptionCoordinator
@@ -1178,7 +1191,6 @@ final class MeetingSession: @unchecked Sendable {
         )
 
         stagedAudio = try MeetingProcessingCapture.markState(.diarizing, for: stagedAudio)
-        onProgress?(.cleaningAudio)
         fputs(
             "[meeting] complete final pass produced \(protectedTranscriptInputs.micSegments.count) microphone and \(protectedTranscriptInputs.systemSegments.count) system segments\n",
             stderr
@@ -1493,6 +1505,7 @@ final class MeetingSession: @unchecked Sendable {
 
             let healthSnapshot = self.micHealthTracker.noteRawMicSamples(rawSamples)
             self.onMicHealthChanged?(healthSnapshot)
+            self.micRecoveryCoordinator.process(healthSnapshot)
             guard self.activeLiveSnapshot() != nil else { return }
             let floatSamples = rawSamples.map { Float($0) / 32767.0 }
 
@@ -1517,6 +1530,7 @@ final class MeetingSession: @unchecked Sendable {
 
             let healthSnapshot = self.micHealthTracker.noteSystemSamples(samples)
             self.onMicHealthChanged?(healthSnapshot)
+            self.micRecoveryCoordinator.process(healthSnapshot)
             guard self.activeLiveSnapshot() != nil else { return }
             self.systemChunkRecorder?.append(samples)
             self.systemChunkTimingTracker.append(sampleCount: samples.count)

@@ -18,6 +18,16 @@ private struct MicrophoneOption: Identifiable {
     var id: String { uid ?? "__automatic__" }
 }
 
+private struct PendingSettingsImport {
+    let envelope: SettingsFileIO.Envelope
+    let preview: SettingsFileIO.ImportPreview
+}
+
+private struct PendingMeetingsImport {
+    let envelope: MeetingBackup.Envelope
+    let preview: MeetingBackup.ImportPreview
+}
+
 struct SettingsView: View {
     private enum PendingDataDestruction {
         case dictations
@@ -59,6 +69,8 @@ struct SettingsView: View {
     @State private var googleCalSignInError: String?
     @State private var isSigningInGoogleCal = false
     @State private var pendingDataDestruction: PendingDataDestruction?
+    @State private var pendingSettingsImport: PendingSettingsImport?
+    @State private var pendingMeetingsImport: PendingMeetingsImport?
     @State private var isShowingDictionaryAccessibilityPrompt = false
     @State private var isPreviewingClip = false
     @State private var selectedPane: SettingsPane
@@ -259,6 +271,16 @@ struct SettingsView: View {
 
     private var activeFeatureTourTarget: FeatureTourTarget? {
         appState.activeFeatureTourTarget
+    }
+
+    private var settingsImportAlertMessage: String {
+        guard let payload = pendingSettingsImport else { return "" }
+        return "File from \(payload.preview.appVersion), exported \(payload.preview.exportedAt.formatted(date: .abbreviated, time: .shortened)).\nWill change \(payload.preview.changedKeyCount) settings.\(payload.preview.includesSecrets ? " Contains API keys." : " No API keys in this file.")"
+    }
+
+    private var meetingsImportAlertMessage: String {
+        guard let payload = pendingMeetingsImport else { return "" }
+        return "Backup exported \(payload.preview.exportedAt.formatted(date: .abbreviated, time: .shortened)) with \(payload.preview.meetingCount) meetings and \(payload.preview.folderCount) folders.\nThis will add \(payload.preview.meetingCount) meetings."
     }
 
     var body: some View {
@@ -611,7 +633,7 @@ struct SettingsView: View {
 
             permissionsSection
 
-            settingsSection("Data") {
+            settingsSection("Delete data") {
                 HStack(spacing: MuesliTheme.spacing12) {
                     actionButton("Clear dictation history", role: .destructive) {
                         pendingDataDestruction = .dictations
@@ -623,6 +645,72 @@ struct SettingsView: View {
                     .help("Stop the current meeting recording before clearing meeting history.")
                 }
             }
+
+            settingsSection("Settings backup") {
+                HStack(spacing: MuesliTheme.spacing12) {
+                    actionButton("Export settings…", systemImage: "square.and.arrow.up") {
+                        exportSettings()
+                    }
+                    actionButton("Import settings…", systemImage: "square.and.arrow.down") {
+                        importSettings()
+                    }
+                }
+            }
+
+            settingsSection("Meetings backup") {
+                HStack(spacing: MuesliTheme.spacing12) {
+                    actionButton("Export meetings…", systemImage: "square.and.arrow.up") {
+                        exportMeetingsBackup()
+                    }
+                    actionButton("Import meetings…", systemImage: "square.and.arrow.down") {
+                        importMeetingsBackup()
+                    }
+                }
+            }
+        }
+        .alert(
+            "Import settings?",
+            isPresented: Binding(
+                get: { pendingSettingsImport != nil },
+                set: { if !$0 { pendingSettingsImport = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingSettingsImport = nil
+            }
+            Button("Import") {
+                guard let payload = pendingSettingsImport else { return }
+                let changed = controller.applyImportedSettings(payload.envelope)
+                pendingSettingsImport = nil
+                presentImportExportAlert(
+                    title: "Settings imported",
+                    message: "\(changed) settings changed."
+                )
+            }
+        } message: {
+            Text(settingsImportAlertMessage)
+        }
+        .alert(
+            "Import meetings?",
+            isPresented: Binding(
+                get: { pendingMeetingsImport != nil },
+                set: { if !$0 { pendingMeetingsImport = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) {
+                pendingMeetingsImport = nil
+            }
+            Button("Import") {
+                guard let payload = pendingMeetingsImport else { return }
+                let result = controller.applyMeetingsImport(payload.envelope)
+                pendingMeetingsImport = nil
+                presentImportExportAlert(
+                    title: "Meetings imported",
+                    message: "\(result.imported) imported\(result.skipped > 0 ? ", \(result.skipped) skipped" : "")."
+                )
+            }
+        } message: {
+            Text(meetingsImportAlertMessage)
         }
     }
 
@@ -2380,6 +2468,111 @@ struct SettingsView: View {
                 guard response == .OK, let url = panel.url else { return }
                 onPick(url)
             }
+        }
+    }
+
+    private func presentSavePanel(_ panel: NSSavePanel, onSave: @escaping (URL) -> Void) {
+        NSApp.activate()
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            panel.beginSheetModal(for: window) { response in
+                guard response == .OK, let url = panel.url else { return }
+                onSave(url)
+            }
+        } else {
+            panel.begin { response in
+                guard response == .OK, let url = panel.url else { return }
+                onSave(url)
+            }
+        }
+    }
+
+    // MARK: - Settings import/export
+
+    private func exportSettings() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "homan-settings-\(Self.dateStem()).json"
+        let includeSecretsCheckbox = NSButton(checkboxWithTitle: "Include API keys", target: nil, action: nil)
+        includeSecretsCheckbox.state = .on
+        includeSecretsCheckbox.toolTip = "Uncheck to export settings without API keys (safe for sharing)."
+        panel.accessoryView = includeSecretsCheckbox
+        presentSavePanel(panel) { url in
+            let includeSecrets = includeSecretsCheckbox.state == .on
+            do {
+                let data = try controller.exportSettingsData(includeSecrets: includeSecrets)
+                try data.write(to: url, options: .atomic)
+            } catch {
+                presentImportExportAlert(title: "Export settings failed", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func importSettings() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        presentOpenPanel(panel) { url in
+            do {
+                let data = try Data(contentsOf: url)
+                let envelope = try controller.decodedSettingsFile(from: data)
+                let preview = controller.settingsImportPreview(for: envelope)
+                pendingSettingsImport = PendingSettingsImport(envelope: envelope, preview: preview)
+            } catch {
+                presentImportExportAlert(title: "Import settings failed", message: error.localizedDescription)
+            }
+        }
+    }
+
+    // MARK: - Meetings backup
+
+    private func exportMeetingsBackup() {
+        let panel = NSSavePanel()
+        panel.allowedContentTypes = [.json]
+        panel.nameFieldStringValue = "homan-meetings-backup-\(Self.dateStem()).json"
+        presentSavePanel(panel) { url in
+            do {
+                let data = try controller.exportMeetingsBackupData()
+                try data.write(to: url, options: .atomic)
+            } catch {
+                presentImportExportAlert(title: "Export meetings failed", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private func importMeetingsBackup() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.json]
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        presentOpenPanel(panel) { url in
+            do {
+                let data = try Data(contentsOf: url)
+                let envelope = try controller.decodedMeetingsBackup(from: data)
+                let preview = controller.meetingsImportPreview(for: envelope)
+                pendingMeetingsImport = PendingMeetingsImport(envelope: envelope, preview: preview)
+            } catch {
+                presentImportExportAlert(title: "Import meetings failed", message: error.localizedDescription)
+            }
+        }
+    }
+
+    private static func dateStem() -> String {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: Date())
+    }
+
+    private func presentImportExportAlert(title: String, message: String) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = message
+        alert.addButton(withTitle: "OK")
+        NSApp.activate()
+        if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+            alert.beginSheetModal(for: window)
+        } else {
+            alert.runModal()
         }
     }
 

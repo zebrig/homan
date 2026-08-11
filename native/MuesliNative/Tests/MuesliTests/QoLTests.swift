@@ -240,6 +240,66 @@ struct IndicatorFrameSizeTests {
     }
 }
 
+@Suite("Meeting processing progress")
+struct MeetingProcessingProgressTests {
+    @Test("processing title renders phase, count, and both timers")
+    func processingTitleFormat() {
+        let progress = MeetingProcessingProgress(
+            runID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            operation: .finalization,
+            phaseIndex: 3,
+            phaseCount: 7,
+            phase: .transcribing,
+            phaseStartedAt: Date(timeIntervalSince1970: 0),
+            totalStartedAt: Date(timeIntervalSince1970: -51)
+        )
+        #expect(progress.displayTitle(now: Date(timeIntervalSince1970: 12)) == "3/7 Transcribing · 0:12 · 1:03")
+    }
+
+    @Test("each operation exposes its real ordered phase plan")
+    func operationPlans() {
+        #expect(MeetingProcessingOperation.finalization.phases.count == 7)
+        #expect(MeetingProcessingOperation.recovery.phases == MeetingProcessingOperation.finalization.phases)
+        #expect(MeetingProcessingOperation.retranscription.phases == [
+            .preparingAudio, .transcribing, .summarizing, .saving,
+        ])
+        #expect(MeetingProcessingOperation.resummarization.phases == [.summarizing, .saving])
+    }
+
+    @Test("progress advances monotonically and preserves both timers correctly")
+    func progressAdvancesMonotonically() throws {
+        let startedAt = Date(timeIntervalSince1970: 100)
+        let progress = MeetingProcessingProgress.starting(
+            operation: .retranscription,
+            now: startedAt
+        )
+        let transcribing = try #require(progress.advancing(
+            to: .transcribing,
+            now: Date(timeIntervalSince1970: 112)
+        ))
+        #expect(transcribing.phaseIndex == 2)
+        #expect(transcribing.phaseStartedAt == Date(timeIntervalSince1970: 112))
+        #expect(transcribing.totalStartedAt == startedAt)
+        #expect(transcribing.advancing(to: .preparingAudio) == nil)
+        #expect(transcribing.advancing(to: .generatingTitle) == nil)
+        let repeated = try #require(transcribing.advancing(
+            to: .transcribing,
+            now: Date(timeIntervalSince1970: 140)
+        ))
+        #expect(repeated.phaseStartedAt == transcribing.phaseStartedAt)
+    }
+
+    @Test("elapsed string uses m:ss with zero padding")
+    func elapsedStringFormat() {
+        let start = Date(timeIntervalSince1970: 0)
+        #expect(MeetingProcessingProgress.elapsedString(from: start, to: start) == "0:00")
+        #expect(MeetingProcessingProgress.elapsedString(from: start, to: Date(timeIntervalSince1970: 12)) == "0:12")
+        #expect(MeetingProcessingProgress.elapsedString(from: start, to: Date(timeIntervalSince1970: 63)) == "1:03")
+        #expect(MeetingProcessingProgress.elapsedString(from: start, to: Date(timeIntervalSince1970: 600)) == "10:00")
+        #expect(MeetingProcessingProgress.elapsedString(from: Date(timeIntervalSince1970: 10), to: start) == "0:00")
+    }
+}
+
 @Suite("Floating meeting transcript")
 struct FloatingMeetingTranscriptTests {
     @Test("overlay routes header controls and leaves transcript body to SwiftUI")

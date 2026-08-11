@@ -191,6 +191,18 @@ public final class DictationStore {
             end_time TEXT,
             created_at TEXT DEFAULT (datetime('now'))
         );
+
+        CREATE TABLE IF NOT EXISTS meeting_processing_progress (
+            meeting_id INTEGER PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+            run_id TEXT NOT NULL,
+            operation TEXT NOT NULL,
+            phase_index INTEGER NOT NULL,
+            phase_count INTEGER NOT NULL,
+            phase TEXT NOT NULL,
+            phase_started_at REAL NOT NULL,
+            total_started_at REAL NOT NULL,
+            updated_at REAL NOT NULL
+        );
         """
         try exec(createSQL, db: db)
 
@@ -745,6 +757,187 @@ public final class DictationStore {
         return makeMeetingRecord(statement)
     }
 
+    /// Starts a local processing run and marks the meeting as processing in one transaction.
+    /// A newer run replaces stale persisted progress for the same meeting.
+    public func beginMeetingProcessing(
+        id: Int64,
+        progress: MeetingProcessingProgress
+    ) throws {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        try exec("BEGIN IMMEDIATE", db: db)
+        do {
+            try updateMeetingStatus(id: id, status: .processing, db: db)
+            try upsertMeetingProcessing(progress, meetingID: id, db: db)
+            try exec("COMMIT", db: db)
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Persists a phase only while the supplied run still owns the meeting.
+    @discardableResult
+    public func updateMeetingProcessing(
+        id: Int64,
+        progress: MeetingProcessingProgress
+    ) throws -> Bool {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        let sql = """
+        UPDATE meeting_processing_progress
+        SET operation = ?, phase_index = ?, phase_count = ?, phase = ?,
+            phase_started_at = ?, total_started_at = ?, updated_at = ?
+        WHERE meeting_id = ? AND run_id = ?
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_text(statement, 1, (progress.operation.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 2, Int32(progress.phaseIndex))
+        sqlite3_bind_int(statement, 3, Int32(progress.phaseCount))
+        sqlite3_bind_text(statement, 4, (progress.phase.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_double(statement, 5, progress.phaseStartedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 6, progress.totalStartedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 7, Date().timeIntervalSince1970)
+        sqlite3_bind_int64(statement, 8, id)
+        sqlite3_bind_text(statement, 9, (progress.runID.uuidString as NSString).utf8String, -1, nil)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw lastError(db)
+        }
+        return sqlite3_changes(db) > 0
+    }
+
+    /// Clears only the matching run. When `status` is supplied, status and run cleanup are atomic.
+    /// Returns false when a newer run has superseded the caller.
+    @discardableResult
+    public func finishMeetingProcessing(
+        id: Int64,
+        runID: UUID,
+        status: MeetingStatus? = nil
+    ) throws -> Bool {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        try exec("BEGIN IMMEDIATE", db: db)
+        do {
+            let sql = "DELETE FROM meeting_processing_progress WHERE meeting_id = ? AND run_id = ?"
+            var statement: OpaquePointer?
+            guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+                throw lastError(db)
+            }
+            sqlite3_bind_int64(statement, 1, id)
+            sqlite3_bind_text(statement, 2, (runID.uuidString as NSString).utf8String, -1, nil)
+            guard sqlite3_step(statement) == SQLITE_DONE else {
+                sqlite3_finalize(statement)
+                throw lastError(db)
+            }
+            sqlite3_finalize(statement)
+            guard sqlite3_changes(db) > 0 else {
+                try exec("ROLLBACK", db: db)
+                return false
+            }
+            if let status {
+                try updateMeetingStatus(id: id, status: status, db: db)
+            }
+            try exec("COMMIT", db: db)
+            return true
+        } catch {
+            sqlite3_exec(db, "ROLLBACK", nil, nil, nil)
+            throw error
+        }
+    }
+
+    /// Loads local active runs and removes orphaned/stale rows. Transient progress is never synced.
+    public func activeMeetingProcessing() throws -> [Int64: MeetingProcessingProgress] {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+        try exec(
+            """
+            DELETE FROM meeting_processing_progress
+            WHERE meeting_id NOT IN (
+                SELECT id FROM meetings
+                WHERE deleted_at IS NULL AND meeting_status = 'processing'
+            )
+            """,
+            db: db
+        )
+        let sql = """
+        SELECT p.meeting_id, p.run_id, p.operation, p.phase_index, p.phase_count,
+               p.phase, p.phase_started_at, p.total_started_at
+        FROM meeting_processing_progress p
+        JOIN meetings m ON m.id = p.meeting_id
+        WHERE m.deleted_at IS NULL AND m.meeting_status = 'processing'
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        var result: [Int64: MeetingProcessingProgress] = [:]
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let meetingID = sqlite3_column_int64(statement, 0)
+            guard let runCString = sqlite3_column_text(statement, 1),
+                  let operationCString = sqlite3_column_text(statement, 2),
+                  let phaseCString = sqlite3_column_text(statement, 5),
+                  let runID = UUID(uuidString: String(cString: runCString)),
+                  let operation = MeetingProcessingOperation(rawValue: String(cString: operationCString)),
+                  let phase = MeetingProcessingPhase(rawValue: String(cString: phaseCString)) else {
+                continue
+            }
+            result[meetingID] = MeetingProcessingProgress(
+                runID: runID,
+                operation: operation,
+                phaseIndex: Int(sqlite3_column_int(statement, 3)),
+                phaseCount: Int(sqlite3_column_int(statement, 4)),
+                phase: phase,
+                phaseStartedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 6)),
+                totalStartedAt: Date(timeIntervalSince1970: sqlite3_column_double(statement, 7))
+            )
+        }
+        return result
+    }
+
+    private func upsertMeetingProcessing(
+        _ progress: MeetingProcessingProgress,
+        meetingID: Int64,
+        db: OpaquePointer?
+    ) throws {
+        let sql = """
+        INSERT INTO meeting_processing_progress
+        (meeting_id, run_id, operation, phase_index, phase_count, phase,
+         phase_started_at, total_started_at, updated_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(meeting_id) DO UPDATE SET
+            run_id = excluded.run_id,
+            operation = excluded.operation,
+            phase_index = excluded.phase_index,
+            phase_count = excluded.phase_count,
+            phase = excluded.phase,
+            phase_started_at = excluded.phase_started_at,
+            total_started_at = excluded.total_started_at,
+            updated_at = excluded.updated_at
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+        sqlite3_bind_int64(statement, 1, meetingID)
+        sqlite3_bind_text(statement, 2, (progress.runID.uuidString as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 3, (progress.operation.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 4, Int32(progress.phaseIndex))
+        sqlite3_bind_int(statement, 5, Int32(progress.phaseCount))
+        sqlite3_bind_text(statement, 6, (progress.phase.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_double(statement, 7, progress.phaseStartedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 8, progress.totalStartedAt.timeIntervalSince1970)
+        sqlite3_bind_double(statement, 9, Date().timeIntervalSince1970)
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw lastError(db)
+        }
+    }
+
     private static func escapeLikePattern(_ query: String) -> String {
         let escaped = query
             .replacingOccurrences(of: "\\", with: "\\\\")
@@ -959,6 +1152,86 @@ public final class DictationStore {
             )
         }
         return meetingID
+    }
+
+    /// Insert a meeting restored from a text backup. Always assigns a fresh local id (autoincrement)
+    /// and a fresh `cloud_record_name`, so the row syncs to iCloud as a new record. Audio columns are
+    /// always NULL (text-only backups). `remappedFolderID` / `remappedFollowUpToID` are the freshly
+    /// created ids resolved by the import orchestrator.
+    public func insertMeetingFromBackup(
+        entry: MeetingBackupEntry,
+        remappedFolderID: Int64?,
+        remappedFollowUpToID: Int64?
+    ) throws -> Int64 {
+        let db = try openDatabase()
+        defer { sqlite3_close(db) }
+
+        let sql = """
+        INSERT INTO meetings
+        (title, calendar_event_id, calendar_occurrence_key, calendar_source, calendar_id,
+         calendar_series_id, calendar_occurrence_start, start_time, end_time, duration_seconds,
+         raw_transcript, formatted_notes, meeting_status, manual_notes, word_count,
+         selected_template_id, selected_template_name, selected_template_kind, selected_template_prompt,
+         source, folder_id, follow_up_to_id, follow_up_to_record_name, recording_retention_protected,
+         processing_metadata, cloud_record_name, updated_at, sync_dirty)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 1)
+        """
+        var statement: OpaquePointer?
+        guard sqlite3_prepare_v2(db, sql, -1, &statement, nil) == SQLITE_OK else {
+            throw lastError(db)
+        }
+        defer { sqlite3_finalize(statement) }
+
+        let formatter = ISO8601DateFormatter()
+        let startTime = formatter.date(from: entry.startTime) ?? Date()
+        let endTime = startTime.addingTimeInterval(max(entry.durationSeconds, 0))
+        let wordCount = Self.countWords(in: entry.rawTranscript)
+        let recordName = "meeting-\(UUID().uuidString)"
+
+        sqlite3_bind_text(statement, 1, (entry.title as NSString).utf8String, -1, nil)
+        bindOptionalText(entry.calendarOccurrence?.eventID ?? entry.calendarEventID, at: 2, statement: statement)
+        bindOptionalText(entry.calendarOccurrence?.identityKey, at: 3, statement: statement)
+        bindOptionalText(entry.calendarOccurrence?.provider.rawValue, at: 4, statement: statement)
+        bindOptionalText(entry.calendarOccurrence?.calendarID, at: 5, statement: statement)
+        bindOptionalText(entry.calendarOccurrence?.seriesID, at: 6, statement: statement)
+        if let occurrence = entry.calendarOccurrence {
+            sqlite3_bind_double(statement, 7, occurrence.originalStartTime.timeIntervalSince1970)
+        } else {
+            sqlite3_bind_null(statement, 7)
+        }
+        sqlite3_bind_text(statement, 8, (entry.startTime as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 9, (formatter.string(from: endTime) as NSString).utf8String, -1, nil)
+        sqlite3_bind_double(statement, 10, max(entry.durationSeconds, 0))
+        sqlite3_bind_text(statement, 11, (entry.rawTranscript as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 12, (entry.formattedNotes as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 13, (entry.status.rawValue as NSString).utf8String, -1, nil)
+        sqlite3_bind_text(statement, 14, (entry.manualNotes as NSString).utf8String, -1, nil)
+        sqlite3_bind_int(statement, 15, Int32(wordCount))
+        bindOptionalText(entry.selectedTemplateID, at: 16, statement: statement)
+        bindOptionalText(entry.selectedTemplateName, at: 17, statement: statement)
+        bindOptionalText(entry.selectedTemplateKind?.rawValue, at: 18, statement: statement)
+        bindOptionalText(entry.selectedTemplatePrompt, at: 19, statement: statement)
+        sqlite3_bind_text(statement, 20, (entry.source.rawValue as NSString).utf8String, -1, nil)
+        if let remappedFolderID {
+            sqlite3_bind_int64(statement, 21, remappedFolderID)
+        } else {
+            sqlite3_bind_null(statement, 21)
+        }
+        if let remappedFollowUpToID {
+            sqlite3_bind_int64(statement, 22, remappedFollowUpToID)
+        } else {
+            sqlite3_bind_null(statement, 22)
+        }
+        bindOptionalText(entry.followUpToRecordName, at: 23, statement: statement)
+        sqlite3_bind_int(statement, 24, entry.recordingRetentionProtected ? 1 : 0)
+        bindOptionalText(try encodeProcessingMetadata(entry.processingMetadata), at: 25, statement: statement)
+        sqlite3_bind_text(statement, 26, (recordName as NSString).utf8String, -1, nil)
+        sqlite3_bind_double(statement, 27, Date().timeIntervalSince1970)
+
+        guard sqlite3_step(statement) == SQLITE_DONE else {
+            throw lastError(db)
+        }
+        return sqlite3_last_insert_rowid(db)
     }
 
     @discardableResult

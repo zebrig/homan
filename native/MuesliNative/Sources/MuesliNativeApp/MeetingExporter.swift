@@ -50,6 +50,8 @@ struct MeetingExporter {
 
     static let mdType = UTType(filenameExtension: "md") ?? .plainText
     static let pdfType = UTType.pdf
+    static let txtType = UTType.plainText
+    static let vttType = UTType(filenameExtension: "vtt") ?? .plainText
 
     static func export(meeting: MeetingRecord, content: MeetingExportContent) {
         DispatchQueue.main.async {
@@ -61,19 +63,27 @@ struct MeetingExporter {
             panel.allowedContentTypes = [pdfType]
             panel.canCreateDirectories = true
 
-            let formatPicker = ExportFormatAccessory(panel: panel)
+            let formatPicker = ExportFormatAccessory(
+                panel: panel,
+                includesTranscriptFormats: content == .transcript
+            )
             panel.accessoryView = formatPicker.view
 
             presentSavePanel(panel) { url in
-                if formatPicker.selectedFormat == .pdf {
+                switch formatPicker.selectedFormat {
+                case .pdf:
                     do {
                         try writePDF(attributed: buildAttributedString(from: markdown), to: url)
                         NSWorkspace.shared.open(url)
                     } catch {
                         showError("Export Failed", error.localizedDescription)
                     }
-                } else {
-                    writeMarkdown(markdown, to: url)
+                case .markdown:
+                    writeText(markdown, to: url)
+                case .timedText:
+                    writeText(buildTimedTranscript(meeting: meeting), to: url)
+                case .webVTT:
+                    writeText(buildWebVTT(meeting: meeting), to: url)
                 }
             }
         }
@@ -130,7 +140,7 @@ struct MeetingExporter {
 
     // MARK: - Write files
 
-    private static func writeMarkdown(_ text: String, to url: URL) {
+    private static func writeText(_ text: String, to url: URL) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
                 try text.write(to: url, atomically: true, encoding: .utf8)
@@ -139,6 +149,25 @@ struct MeetingExporter {
                 DispatchQueue.main.async { showError("Export Failed", error.localizedDescription) }
             }
         }
+    }
+
+    // MARK: - Timed transcript composition
+
+    /// Produces one plain-text cue per transcript turn in the same range format
+    /// used by common offline transcription tools:
+    /// `[00:00:05.40 - 00:00:19.02] Speaker: text`.
+    ///
+    /// Homan's persisted transcript stores the start of each turn. The next
+    /// turn's start is therefore the most stable available end boundary; the
+    /// final cue ends at the recorded meeting duration.
+    static func buildTimedTranscript(meeting: MeetingRecord) -> String {
+        MeetingTimedTranscriptFormatter.timedText(meeting: meeting)
+    }
+
+    /// Produces standards-compliant WebVTT while retaining Homan's persisted
+    /// speaker label in each cue's visible text.
+    static func buildWebVTT(meeting: MeetingRecord) -> String {
+        MeetingTimedTranscriptFormatter.webVTT(meeting: meeting)
     }
 
     static func writePDF(attributed: NSAttributedString, to url: URL) throws {
@@ -410,15 +439,51 @@ private class ExportFormatAccessory: NSObject {
     let view: NSView
     private let popup: NSPopUpButton
     private weak var panel: NSSavePanel?
+    private let formats: [Format]
 
-    enum Format { case pdf, markdown }
+    enum Format {
+        case pdf
+        case markdown
+        case timedText
+        case webVTT
 
-    var selectedFormat: Format {
-        popup.indexOfSelectedItem == 0 ? .pdf : .markdown
+        var title: String {
+            switch self {
+            case .pdf: return "PDF"
+            case .markdown: return "Markdown"
+            case .timedText: return "Timed Text"
+            case .webVTT: return "WebVTT"
+            }
+        }
+
+        var fileExtension: String {
+            switch self {
+            case .pdf: return "pdf"
+            case .markdown: return "md"
+            case .timedText: return "txt"
+            case .webVTT: return "vtt"
+            }
+        }
+
+        var contentType: UTType {
+            switch self {
+            case .pdf: return MeetingExporter.pdfType
+            case .markdown: return MeetingExporter.mdType
+            case .timedText: return MeetingExporter.txtType
+            case .webVTT: return MeetingExporter.vttType
+            }
+        }
     }
 
-    init(panel: NSSavePanel) {
+    var selectedFormat: Format {
+        formats[popup.indexOfSelectedItem]
+    }
+
+    init(panel: NSSavePanel, includesTranscriptFormats: Bool) {
         self.panel = panel
+        self.formats = includesTranscriptFormats
+            ? [.pdf, .markdown, .timedText, .webVTT]
+            : [.pdf, .markdown]
 
         let container = NSView(frame: NSRect(x: 0, y: 0, width: 260, height: 32))
 
@@ -427,7 +492,7 @@ private class ExportFormatAccessory: NSObject {
         label.frame = NSRect(x: 0, y: 6, width: 55, height: 20)
 
         let button = NSPopUpButton(frame: NSRect(x: 60, y: 2, width: 190, height: 28), pullsDown: false)
-        button.addItems(withTitles: ["PDF", "Markdown"])
+        button.addItems(withTitles: formats.map(\.title))
         button.selectItem(at: 0)
 
         container.addSubview(label)
@@ -447,12 +512,8 @@ private class ExportFormatAccessory: NSObject {
         let currentName = panel.nameFieldStringValue
         let stem = (currentName as NSString).deletingPathExtension
 
-        if selectedFormat == .pdf {
-            panel.allowedContentTypes = [MeetingExporter.pdfType]
-            panel.nameFieldStringValue = "\(stem).pdf"
-        } else {
-            panel.allowedContentTypes = [MeetingExporter.mdType]
-            panel.nameFieldStringValue = "\(stem).md"
-        }
+        let format = selectedFormat
+        panel.allowedContentTypes = [format.contentType]
+        panel.nameFieldStringValue = "\(stem).\(format.fileExtension)"
     }
 }

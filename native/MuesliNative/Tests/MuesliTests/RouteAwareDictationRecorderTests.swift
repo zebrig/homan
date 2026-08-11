@@ -140,8 +140,8 @@ struct RouteAwareDictationRecorderTests {
         ])
     }
 
-    @Test("switching recorder cancels inactive warmed graph")
-    func switchingRecorderCancelsInactiveWarmedGraph() throws {
+    @Test("switching recorder keeps inactive warmed graph")
+    func switchingRecorderKeepsInactiveWarmedGraph() throws {
         let system = FakeRouteAwareChildRecorder()
         let appScoped = FakeRouteAwareChildRecorder()
         let recorder = RouteAwareDictationRecorder(systemDefaultRecorder: system, appScopedRecorder: appScoped)
@@ -151,7 +151,7 @@ struct RouteAwareDictationRecorderTests {
 
         #expect(recorder.activeRecorderKindForDebug() == .appScoped)
         #expect(system.warmUpCalls == 1)
-        #expect(system.cancelCalls == 1)
+        #expect(system.cancelCalls == 0)
         #expect(appScoped.activateCalls == 1)
     }
 
@@ -167,8 +167,8 @@ struct RouteAwareDictationRecorderTests {
         #expect(appScoped.coolDownCalls == 1)
     }
 
-    @Test("route switch waits for in-flight app scoped explicit warmup teardown")
-    func routeSwitchWaitsForInFlightAppScopedExplicitWarmupTeardown() throws {
+    @Test("route switch leaves in-flight app scoped warmup intact")
+    func routeSwitchLeavesInFlightAppScopedWarmupIntact() throws {
         let system = FakeRouteAwareChildRecorder()
         let appScopedStreaming = FakeRouteAwareStreamingRecorder()
         let prepareStarted = DispatchSemaphore(value: 0)
@@ -192,14 +192,13 @@ struct RouteAwareDictationRecorderTests {
             routeSwitchReturned.signal()
         }
 
-        #expect(routeSwitchReturned.wait(timeout: .now() + 0.1) == .timedOut)
+        #expect(routeSwitchReturned.wait(timeout: .now() + 0.5) == .success)
         finishPrepare.signal()
-        #expect(routeSwitchReturned.wait(timeout: .now() + 1) == .success)
 
         #expect(recorder.activeRecorderKindForDebug() == .systemDefault)
         #expect(system.warmUpCalls == 1)
         #expect(appScopedStreaming.prepareCalls == 1)
-        #expect(appScopedStreaming.cancelCalls >= 1)
+        #expect(appScopedStreaming.cancelCalls == 0)
     }
 }
 

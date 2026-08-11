@@ -117,9 +117,9 @@ struct AppDownloadStateTests {
 // MARK: - GemmaSummaryModel catalog
 
 struct GemmaSummaryModelTests {
-    @Test func defaultIsE4B() {
-        #expect(GemmaSummaryModel.defaultModel.id == "gemma-4-e4b-ud-q4_k_xl")
-        #expect(GemmaSummaryModel.resolve(id: "nonexistent") == .e4b)
+    @Test func defaultIsE4BQAT() {
+        #expect(GemmaSummaryModel.defaultModel.id == "gemma-4-e4b-qat-ud-q4_k_xl")
+        #expect(GemmaSummaryModel.resolve(id: "nonexistent") == .e4bQAT)
     }
 
     @Test func allModelsHaveUniqueIDs() {

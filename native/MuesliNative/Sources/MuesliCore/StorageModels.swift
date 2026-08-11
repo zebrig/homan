@@ -590,7 +590,106 @@ public struct MeetingRecord: Identifiable, Codable, Sendable {
     }
 }
 
-public struct MeetingFolder: Identifiable, Codable, Sendable {
+/// A meeting as carried by a text backup file: the `MeetingRecord` content minus audio paths,
+/// plus `sourceID` (the original local id) used only to remap `folderID`/`followUpToID` on restore.
+public struct MeetingBackupEntry: Codable, Sendable, Equatable {
+    public var sourceID: Int64
+    public var title: String
+    public var startTime: String
+    public var durationSeconds: Double
+    public var rawTranscript: String
+    public var formattedNotes: String
+    public var wordCount: Int
+    public var folderID: Int64?
+    public var calendarEventID: String?
+    public var calendarOccurrence: CalendarOccurrenceReference?
+    public var recordingRetentionProtected: Bool
+    public var status: MeetingStatus
+    public var manualNotes: String
+    public var selectedTemplateID: String?
+    public var selectedTemplateName: String?
+    public var selectedTemplateKind: MeetingTemplateKind?
+    public var selectedTemplatePrompt: String?
+    public var source: MeetingSource
+    public var followUpToID: Int64?
+    public var followUpToRecordName: String?
+    public var processingMetadata: MeetingProcessingMetadata
+
+    public init(
+        sourceID: Int64,
+        title: String,
+        startTime: String,
+        durationSeconds: Double,
+        rawTranscript: String,
+        formattedNotes: String,
+        wordCount: Int,
+        folderID: Int64?,
+        calendarEventID: String?,
+        calendarOccurrence: CalendarOccurrenceReference?,
+        recordingRetentionProtected: Bool,
+        status: MeetingStatus,
+        manualNotes: String,
+        selectedTemplateID: String?,
+        selectedTemplateName: String?,
+        selectedTemplateKind: MeetingTemplateKind?,
+        selectedTemplatePrompt: String?,
+        source: MeetingSource,
+        followUpToID: Int64?,
+        followUpToRecordName: String?,
+        processingMetadata: MeetingProcessingMetadata
+    ) {
+        self.sourceID = sourceID
+        self.title = title
+        self.startTime = startTime
+        self.durationSeconds = durationSeconds
+        self.rawTranscript = rawTranscript
+        self.formattedNotes = formattedNotes
+        self.wordCount = wordCount
+        self.folderID = folderID
+        self.calendarEventID = calendarEventID
+        self.calendarOccurrence = calendarOccurrence
+        self.recordingRetentionProtected = recordingRetentionProtected
+        self.status = status
+        self.manualNotes = manualNotes
+        self.selectedTemplateID = selectedTemplateID
+        self.selectedTemplateName = selectedTemplateName
+        self.selectedTemplateKind = selectedTemplateKind
+        self.selectedTemplatePrompt = selectedTemplatePrompt
+        self.source = source
+        self.followUpToID = followUpToID
+        self.followUpToRecordName = followUpToRecordName
+        self.processingMetadata = processingMetadata
+    }
+
+    /// Build from a `MeetingRecord`, dropping audio-path fields (text-only backup).
+    public init(record: MeetingRecord) {
+        self.init(
+            sourceID: record.id,
+            title: record.title,
+            startTime: record.startTime,
+            durationSeconds: record.durationSeconds,
+            rawTranscript: record.rawTranscript,
+            formattedNotes: record.formattedNotes,
+            wordCount: record.wordCount,
+            folderID: record.folderID,
+            calendarEventID: record.calendarEventID,
+            calendarOccurrence: record.calendarOccurrence,
+            recordingRetentionProtected: record.recordingRetentionProtected,
+            status: record.status,
+            manualNotes: record.manualNotes,
+            selectedTemplateID: record.selectedTemplateID,
+            selectedTemplateName: record.selectedTemplateName,
+            selectedTemplateKind: record.selectedTemplateKind,
+            selectedTemplatePrompt: record.selectedTemplatePrompt,
+            source: record.source,
+            followUpToID: record.followUpToID,
+            followUpToRecordName: record.followUpToRecordName,
+            processingMetadata: record.processingMetadata
+        )
+    }
+}
+
+public struct MeetingFolder: Identifiable, Codable, Equatable, Sendable {
     public let id: Int64
     public var name: String
     public let parentID: Int64?

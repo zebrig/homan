@@ -1918,9 +1918,40 @@ struct MeetingDetailView: View {
                 statusChip(for: meeting)
                 deleteButton
             }
+        } else if meeting.status == .processing,
+                  let progress = appState.meetingProcessing[meeting.id] {
+            processingProgressCard(statusChip: statusChip(for: meeting), progress: progress)
         } else {
             statusChip(for: meeting)
         }
+    }
+
+    /// Per-meeting processing progress in the detail toolbar: status chip + phase + timers.
+    private func processingProgressCard(
+        statusChip: some View,
+        progress: MeetingProcessingProgress
+    ) -> some View {
+        VStack(alignment: .leading, spacing: 3) {
+            statusChip
+            TimelineView(.periodic(from: .now, by: 0.5)) { context in
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("Фаза: \(progress.phaseIndex)/\(progress.phaseCount) \(progress.phaseLabel)")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(MuesliTheme.textSecondary)
+                    Text("Фаза: \(MeetingProcessingProgress.elapsedString(from: progress.phaseStartedAt, to: context.date)) · Всего: \(MeetingProcessingProgress.elapsedString(from: progress.totalStartedAt, to: context.date))")
+                        .font(MuesliTheme.caption())
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                }
+            }
+        }
+        .padding(.horizontal, MuesliTheme.spacing8)
+        .padding(.vertical, 6)
+        .background(MuesliTheme.surfacePrimary)
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium))
+        .overlay(
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium)
+                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+        )
     }
 
     private func retryFinalProcessingButton(for meeting: MeetingRecord) -> some View {

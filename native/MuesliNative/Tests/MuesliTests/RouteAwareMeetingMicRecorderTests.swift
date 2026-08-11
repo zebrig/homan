@@ -746,6 +746,75 @@ struct RouteAwareMeetingMicRecorderTests {
         #expect(recorder.activeRecorderKindForDebug() == .appScoped)
     }
 
+    @Test("health recovery rebuilds the same route and waits for real signal")
+    func healthRecoveryRebuildsSameRoute() async throws {
+        let degraded = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        let replacement = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        var factoryCalls = 0
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: degraded,
+            appScopedRecorder: FakeMeetingMicRecorder(kind: .appScopedAudioQueue),
+            systemDefaultRecorderFactory: {
+                factoryCalls += 1
+                return replacement
+            },
+            handoffTimeout: 1,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler
+        )
+        var samples: [[Int16]] = []
+        recorder.onRawPCMSamples = { samples.append($0) }
+
+        try recorder.start()
+        #expect(recorder.requestSameRouteRecovery(reason: "silent_graph"))
+        try await waitUntil { replacement.startCalls == 1 }
+        replacement.onRawPCMSamples?([0, 0])
+        #expect(degraded.stopCalls == 0)
+        replacement.onRawPCMSamples?([4, 5, 6])
+        try await waitUntil { samples == [[4, 5, 6]] }
+        try await waitUntil { degraded.stopCalls == 1 }
+
+        #expect(factoryCalls == 1)
+    }
+
+    @Test("health recovery is ignored outside an active recording")
+    func healthRecoveryRequiresActiveRecording() {
+        var factoryCalls = 0
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorder: FakeMeetingMicRecorder(kind: .appScopedAudioQueue),
+            systemDefaultRecorderFactory: {
+                factoryCalls += 1
+                return FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+            }
+        )
+
+        #expect(!recorder.requestSameRouteRecovery(reason: "silent_graph"))
+        #expect(factoryCalls == 0)
+    }
+
+    @Test("health recovery does not stack behind an in-flight handoff")
+    func healthRecoveryDoesNotStack() async throws {
+        let degraded = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        var factoryCalls = 0
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: degraded,
+            appScopedRecorder: FakeMeetingMicRecorder(kind: .appScopedAudioQueue),
+            systemDefaultRecorderFactory: {
+                factoryCalls += 1
+                return FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+            },
+            handoffTimeout: 1,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler
+        )
+
+        try recorder.start()
+        #expect(recorder.requestSameRouteRecovery(reason: "first"))
+        #expect(!recorder.requestSameRouteRecovery(reason: "second"))
+        try await waitUntil { factoryCalls == 1 }
+        try await Task.sleep(for: .milliseconds(50))
+        #expect(factoryCalls == 1)
+    }
+
     @Test("failed configuration-change restart marks the recorder inactive")
     func failedConfigurationChangeRestartMarksRecorderInactive() {
         var state = StreamingMicRecorderRunState()

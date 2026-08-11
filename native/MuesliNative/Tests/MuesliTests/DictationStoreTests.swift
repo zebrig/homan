@@ -49,6 +49,80 @@ struct DictationStoreTests {
         NSError(domain: "DictationStoreTests", code: 1, userInfo: [NSLocalizedDescriptionKey: message])
     }
 
+    @Test("meeting processing progress persists and stale runs cannot clear newer work")
+    func meetingProcessingProgressLifecycle() throws {
+        let store = try makeStore()
+        let meetingID = try store.insertMeeting(
+            title: "Progress lifecycle",
+            calendarEventID: nil,
+            startTime: Date(timeIntervalSince1970: 1_000),
+            endTime: Date(timeIntervalSince1970: 1_030),
+            rawTranscript: "Transcript",
+            formattedNotes: "Notes",
+            micAudioPath: nil,
+            systemAudioPath: nil
+        )
+        let first = MeetingProcessingProgress.starting(
+            operation: .retranscription,
+            runID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
+            now: Date(timeIntervalSince1970: 2_000)
+        )
+        try store.beginMeetingProcessing(id: meetingID, progress: first)
+        #expect(try store.meeting(id: meetingID)?.status == .processing)
+        #expect(try store.activeMeetingProcessing()[meetingID] == first)
+
+        let advanced = try #require(first.advancing(
+            to: .transcribing,
+            now: Date(timeIntervalSince1970: 2_010)
+        ))
+        #expect(try store.updateMeetingProcessing(id: meetingID, progress: advanced))
+        #expect(try store.activeMeetingProcessing()[meetingID] == advanced)
+
+        let newer = MeetingProcessingProgress.starting(
+            operation: .resummarization,
+            runID: UUID(uuidString: "00000000-0000-0000-0000-000000000002")!,
+            now: Date(timeIntervalSince1970: 2_020)
+        )
+        try store.beginMeetingProcessing(id: meetingID, progress: newer)
+        #expect(try !store.finishMeetingProcessing(
+            id: meetingID,
+            runID: first.runID,
+            status: .failed
+        ))
+        #expect(try store.meeting(id: meetingID)?.status == .processing)
+        #expect(try store.activeMeetingProcessing()[meetingID] == newer)
+
+        #expect(try store.finishMeetingProcessing(
+            id: meetingID,
+            runID: newer.runID,
+            status: .completed
+        ))
+        #expect(try store.activeMeetingProcessing()[meetingID] == nil)
+        #expect(try store.meeting(id: meetingID)?.status == .completed)
+    }
+
+    @Test("loading progress prunes rows for meetings no longer processing")
+    func meetingProcessingProgressPrunesStaleRows() throws {
+        let store = try makeStore()
+        let meetingID = try store.insertMeeting(
+            title: "Stale progress",
+            calendarEventID: nil,
+            startTime: Date(timeIntervalSince1970: 1_000),
+            endTime: Date(timeIntervalSince1970: 1_030),
+            rawTranscript: "",
+            formattedNotes: "",
+            micAudioPath: nil,
+            systemAudioPath: nil
+        )
+        let progress = MeetingProcessingProgress.starting(operation: .recovery)
+        try store.beginMeetingProcessing(id: meetingID, progress: progress)
+        try store.updateMeetingStatus(id: meetingID, status: .failed)
+
+        #expect(try store.activeMeetingProcessing()[meetingID] == nil)
+        try store.updateMeetingStatus(id: meetingID, status: .processing)
+        #expect(try store.activeMeetingProcessing()[meetingID] == nil)
+    }
+
     private func setFolderParentRaw(folderID: Int64, parentID: Int64, store: DictationStore) throws {
         var db: OpaquePointer?
         guard sqlite3_open(store.databasePath().path, &db) == SQLITE_OK else {

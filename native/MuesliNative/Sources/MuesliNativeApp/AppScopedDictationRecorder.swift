@@ -280,9 +280,9 @@ final class AppScopedDictationRecorder: DictationAudioRecording {
         lifecycleGeneration &+= 1
         lock.unlock()
         return recorderQueue.sync {
-            let url = recorder.stop()
-            recorder.cancel()
-            return url
+            // Finalize this take, but preserve the prepared capture graph for
+            // the next dictation. cancel() remains the explicit invalidation.
+            recorder.stop()
         }
     }
 

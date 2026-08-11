@@ -104,6 +104,79 @@ struct MeetingExporterTests {
         #expect(md.contains("**Duration:** 1h 30m"))
     }
 
+    // MARK: - Timed transcript formats
+
+    @Test("Timed text matches range-based transcript format")
+    func timedTextUsesRangeFormat() {
+        let meeting = makeMeeting(
+            durationSeconds: 19.02,
+            rawTranscript: "[00:00:00.00] You: приступаем к работе\n[00:00:05.40] Others: открываю вкладки"
+        )
+
+        #expect(MeetingExporter.buildTimedTranscript(meeting: meeting) == """
+        [00:00:00.00 - 00:00:05.40] You: приступаем к работе
+        [00:00:05.40 - 00:00:19.02] Others: открываю вкладки
+        """)
+    }
+
+    @Test("Timed text converts Homan wall-clock timestamps to meeting offsets")
+    func timedTextConvertsWallClockTimestamps() {
+        let meeting = makeMeeting(
+            startTime: "2026-04-14T10:00:00",
+            durationSeconds: 20,
+            rawTranscript: "[10:00:05] You: Hello\n[10:00:10] Others: Hi"
+        )
+
+        #expect(MeetingExporter.buildTimedTranscript(meeting: meeting) == """
+        [00:00:05.00 - 00:00:10.00] You: Hello
+        [00:00:10.00 - 00:00:20.00] Others: Hi
+        """)
+    }
+
+    @Test("Timed text handles wall-clock rollover at midnight")
+    func timedTextHandlesMidnightRollover() {
+        let meeting = makeMeeting(
+            startTime: "2026-04-14T23:59:55",
+            durationSeconds: 20,
+            rawTranscript: "[23:59:58] You: Before midnight\n[00:00:05] Others: After midnight"
+        )
+
+        #expect(MeetingExporter.buildTimedTranscript(meeting: meeting) == """
+        [00:00:03.00 - 00:00:10.00] You: Before midnight
+        [00:00:10.00 - 00:00:20.00] Others: After midnight
+        """)
+    }
+
+    @Test("WebVTT uses millisecond cue ranges and keeps speaker labels")
+    func webVTTUsesStandardCueRanges() {
+        let meeting = makeMeeting(
+            durationSeconds: 12.5,
+            rawTranscript: "[00:00:01.25] You: Hello\n[00:00:03.50] Speaker 1: Hi"
+        )
+
+        #expect(MeetingExporter.buildWebVTT(meeting: meeting) == """
+        WEBVTT
+
+        00:00:01.250 --> 00:00:03.500
+        You: Hello
+
+        00:00:03.500 --> 00:00:12.500
+        Speaker 1: Hi
+
+        """)
+    }
+
+    @Test("Untimed transcript remains exportable as one full-duration cue")
+    func untimedTranscriptFallsBackToOneCue() {
+        let meeting = makeMeeting(
+            durationSeconds: 8,
+            rawTranscript: "A manually edited transcript\nwith a second line"
+        )
+
+        #expect(MeetingExporter.buildTimedTranscript(meeting: meeting) ==
+            "[00:00:00.00 - 00:00:08.00] A manually edited transcript with a second line")
+    }
+
     // MARK: - HTML rendering
 
     @Test("Converts headings to HTML tags")

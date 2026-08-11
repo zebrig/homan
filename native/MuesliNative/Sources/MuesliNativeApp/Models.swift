@@ -1592,6 +1592,7 @@ struct AppConfig: Codable {
         case homanWhisperEndpoint = "homan_whisper_endpoint"
         case homanWhisperAPIKey = "homan_whisper_api_key"
         case meetingSummaryBackend = "meeting_summary_backend"
+        case gemmaSummaryModel = "gemma_summary_model"
         case defaultMeetingTemplateID = "default_meeting_template_id"
         case whisperModel = "whisper_model"
         case idleTimeout = "idle_timeout"
@@ -1734,6 +1735,7 @@ struct AppConfig: Codable {
         homanWhisperEndpoint = (try? c.decode(String.self, forKey: .homanWhisperEndpoint)) ?? defaults.homanWhisperEndpoint
         homanWhisperAPIKey = (try? c.decode(String.self, forKey: .homanWhisperAPIKey)) ?? defaults.homanWhisperAPIKey
         meetingSummaryBackend = (try? c.decode(String.self, forKey: .meetingSummaryBackend)) ?? defaults.meetingSummaryBackend
+        gemmaSummaryModel = (try? c.decode(String.self, forKey: .gemmaSummaryModel)) ?? defaults.gemmaSummaryModel
         defaultMeetingTemplateID = (try? c.decode(String.self, forKey: .defaultMeetingTemplateID)) ?? defaults.defaultMeetingTemplateID
         whisperModel = (try? c.decode(String.self, forKey: .whisperModel)) ?? defaults.whisperModel
         idleTimeout = (try? c.decode(Double.self, forKey: .idleTimeout)) ?? defaults.idleTimeout

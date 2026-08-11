@@ -67,7 +67,7 @@ If launch fails with `No matching profile found`, the embedded profile, bundle I
 - [ ] **Step 1: Notarize the app bundle**
   ```bash
   ditto -c -k --keepParent /Applications/Muesli.app Muesli-app.zip
-  xcrun notarytool submit Muesli-app.zip --keychain-profile MuesliNotary --wait
+  xcrun notarytool submit Muesli-app.zip --keychain-profile HomanNotary --wait
   ```
   - Must show `status: Accepted`
 
@@ -84,7 +84,7 @@ If launch fails with `No matching profile found`, the embedded profile, bundle I
 
 - [ ] **Step 4: Notarize the DMG**
   ```bash
-  xcrun notarytool submit dist-release/Muesli-X.Y.Z.dmg --keychain-profile MuesliNotary --wait
+  xcrun notarytool submit dist-release/Muesli-X.Y.Z.dmg --keychain-profile HomanNotary --wait
   ```
   - Must show `status: Accepted`
 

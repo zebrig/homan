@@ -382,19 +382,25 @@ enum MeetingTemplates {
     static func resolveDefinition(
         id: String?,
         customTemplates: [CustomMeetingTemplate],
-        builtInOverrides: [BuiltInMeetingTemplateOverride] = []
+        builtInOverrides: [BuiltInMeetingTemplateOverride] = [],
+        defaultTemplateID: String? = nil
     ) -> MeetingTemplateDefinition {
-        let normalizedID = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? autoID
-        if normalizedID == autoID {
+        let normalizedID = id?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let normalizedDefaultID = defaultTemplateID?
+            .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
+        let effectiveID = normalizedID.isEmpty || normalizedID == autoID
+            ? (normalizedDefaultID.isEmpty ? autoID : normalizedDefaultID)
+            : normalizedID
+        if effectiveID == autoID {
             return applyingOverride(to: auto, overrides: builtInOverrides)
         }
-        if let builtIn = builtInDefinition(id: normalizedID, overrides: builtInOverrides) {
+        if let builtIn = builtInDefinition(id: effectiveID, overrides: builtInOverrides) {
             return builtIn
         }
-        if let custom = customTemplates.first(where: { $0.id == normalizedID }) {
+        if let custom = customTemplates.first(where: { $0.id == effectiveID }) {
             return customDefinition(from: custom)
         }
-        return auto
+        return applyingOverride(to: auto, overrides: builtInOverrides)
     }
 
     static func resolveExactDefinition(
@@ -418,12 +424,14 @@ enum MeetingTemplates {
     static func resolveSnapshot(
         id: String?,
         customTemplates: [CustomMeetingTemplate],
-        builtInOverrides: [BuiltInMeetingTemplateOverride] = []
+        builtInOverrides: [BuiltInMeetingTemplateOverride] = [],
+        defaultTemplateID: String? = nil
     ) -> MeetingTemplateSnapshot {
         resolveDefinition(
             id: id,
             customTemplates: customTemplates,
-            builtInOverrides: builtInOverrides
+            builtInOverrides: builtInOverrides,
+            defaultTemplateID: defaultTemplateID
         ).snapshot
     }
 
@@ -442,7 +450,8 @@ enum MeetingTemplates {
     static func snapshot(
         for meeting: MeetingRecord,
         customTemplates: [CustomMeetingTemplate],
-        builtInOverrides: [BuiltInMeetingTemplateOverride] = []
+        builtInOverrides: [BuiltInMeetingTemplateOverride] = [],
+        defaultTemplateID: String? = nil
     ) -> MeetingTemplateSnapshot {
         let storedID = meeting.selectedTemplateID?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
         let storedName = meeting.selectedTemplateName?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -458,7 +467,8 @@ enum MeetingTemplates {
         return resolveSnapshot(
             id: storedID.isEmpty ? nil : storedID,
             customTemplates: customTemplates,
-            builtInOverrides: builtInOverrides
+            builtInOverrides: builtInOverrides,
+            defaultTemplateID: defaultTemplateID
         )
     }
 }

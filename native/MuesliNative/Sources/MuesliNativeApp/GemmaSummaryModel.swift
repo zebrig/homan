@@ -28,7 +28,7 @@ extension DownloadableModel {
 // MARK: - Gemma summary model catalog
 
 /// On-device meeting-summarization models (llama.cpp / GGUF).
-/// E4B (non-QAT UD-Q4_K_XL) is the default — matches the benchmark winner.
+/// E4B QAT is the default (2026-08-05) — fastest stable path on the llama.swift runtime.
 struct GemmaSummaryModel: DownloadableModel {
     enum Variant: String {
         case e4b = "gemma-4-e4b-ud-q4_k_xl"
@@ -54,25 +54,25 @@ struct GemmaSummaryModel: DownloadableModel {
         cacheDirectory.appendingPathComponent(filename)
     }
 
-    // E4B non-QAT UD-Q4_K_XL (5.13 GB) — the verified benchmark winner for EN+RU.
+    // E4B non-QAT UD-Q4_K_XL (5.13 GB) — higher quality, ~2.5× slower decode.
     static let e4b = GemmaSummaryModel(
         id: Variant.e4b.rawValue,
         label: "Gemma 4 E4B",
         sizeLabel: "~5.1 GB",
-        description: "Recommended. Non-QAT Gemma 4 E4B (UD-Q4_K_XL). Correct English and Russian; ~3–7 min per meeting on M4.",
+        description: "Non-QAT Gemma 4 E4B (UD-Q4_K_XL). Full-quality baseline; ~8 t/s decode on M4.",
         downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E4B-it-GGUF/resolve/main/gemma-4-E4B-it-UD-Q4_K_XL.gguf")!,
         expectedSizeBytes: 5_126_306_944,
         sha256: nil,
         filename: "gemma-4-E4B-it-UD-Q4_K_XL.gguf"
     )
 
-    // E4B QAT UD-Q4_K_XL (4.22 GB) — ~30% faster decode but mis-languages EN meetings.
-    // Lives in the dedicated unsloth QAT repo.
+    // E4B QAT UD-Q4_K_XL (4.22 GB) — the default since 2026-08-05: ~11 t/s decode on the
+    // llama.swift runtime (b10276). Lives in the dedicated unsloth QAT repo.
     static let e4bQAT = GemmaSummaryModel(
         id: Variant.e4bQAT.rawValue,
         label: "Gemma 4 E4B (QAT)",
         sizeLabel: "~4.2 GB",
-        description: "Experimental. QAT build decodes ~30% faster but may produce meeting notes in a different language than the transcript.",
+        description: "Recommended. QAT build; ~11 t/s decode on M4. Good English and Russian.",
         downloadURL: URL(string: "https://huggingface.co/unsloth/gemma-4-E4B-it-qat-GGUF/resolve/main/gemma-4-E4B-it-qat-UD-Q4_K_XL.gguf")!,
         expectedSizeBytes: 4_215_695_776,
         sha256: nil,
@@ -92,8 +92,8 @@ struct GemmaSummaryModel: DownloadableModel {
         filename: "gemma-4-E2B-it-qat-UD-Q4_K_XL.gguf"
     )
 
-    static let all: [GemmaSummaryModel] = [.e4b, .e4bQAT, .e2bQAT]
-    static let defaultModel: GemmaSummaryModel = .e4b
+    static let all: [GemmaSummaryModel] = [.e4bQAT, .e4b, .e2bQAT]
+    static let defaultModel: GemmaSummaryModel = .e4bQAT
 
     static func resolve(id: String) -> GemmaSummaryModel {
         all.first { $0.id == id } ?? .defaultModel

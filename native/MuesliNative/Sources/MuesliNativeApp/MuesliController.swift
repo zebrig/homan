@@ -918,6 +918,9 @@ final class MuesliController: NSObject {
         }
         indicator.close()
         CoreAudioSystemRecorder.cleanupStaleDevices()
+        // Free the on-device summarization runtime (llama Metal) before process exit,
+        // otherwise the llama.cpp static destructor asserts during teardown.
+        GemmaSummaryBackend.shutdownSynchronously()
     }
 
     func recentDictations() -> [DictationRecord] {
@@ -1158,6 +1161,7 @@ final class MuesliController: NSObject {
             folderID: appState.selectedFolderID,
             origin: appState.meetingOriginFilter
         )) ?? []
+        appState.meetingProcessing = (try? dictationStore.activeMeetingProcessing()) ?? [:]
         let counts = (try? dictationStore.meetingCounts(origin: appState.meetingOriginFilter))
             ?? (total: 0, byFolder: [:], directByFolder: [:])
         appState.totalMeetingCount = counts.total
@@ -1468,6 +1472,66 @@ final class MuesliController: NSObject {
         }
         updateConfig { $0.dictationRetentionHours = clampedHours }
         performRetentionCleanup()
+    }
+
+    // MARK: - Settings import/export
+
+    /// Serialize the current config as a `homan-settings` export file.
+    func exportSettingsData(includeSecrets: Bool) throws -> Data {
+        try SettingsFileIO.exportData(config: config, includeSecrets: includeSecrets)
+    }
+
+    /// Decode + validate a settings import file (throws on invalid format/version).
+    func decodedSettingsFile(from data: Data) throws -> SettingsFileIO.Envelope {
+        try SettingsFileIO.decodeEnvelope(data)
+    }
+
+    func settingsImportPreview(for envelope: SettingsFileIO.Envelope) -> SettingsFileIO.ImportPreview {
+        SettingsFileIO.previewImport(current: config, envelope: envelope)
+    }
+
+    /// Apply an imported settings envelope: merge per-field and route through `updateConfig`
+    /// so all runtime state (backends, hotkeys, iCloud, indicator) follows. Returns changed-key count.
+    @discardableResult
+    func applyImportedSettings(_ envelope: SettingsFileIO.Envelope) -> Int {
+        let merged = SettingsFileIO.mergedConfig(config, envelope: envelope)
+        let changed = settingsImportPreview(for: envelope).changedKeyCount
+        updateConfig { $0 = merged }
+        return changed
+    }
+
+    // MARK: - Meetings backup
+
+    /// Serialize all non-deleted meetings (text only, no audio) + folders as a backup file.
+    func exportMeetingsBackupData() throws -> Data {
+        let meetings = try dictationStore.recentMeetings(limit: nil)
+            .map { MeetingBackupEntry(record: $0) }
+        let folders = (try? dictationStore.listFolders()) ?? []
+        return try MeetingBackup.exportData(meetings: meetings, folders: folders)
+    }
+
+    /// Decode + validate a meetings backup file (throws on invalid format/version).
+    func decodedMeetingsBackup(from data: Data) throws -> MeetingBackup.Envelope {
+        try MeetingBackup.decodeEnvelope(data)
+    }
+
+    func meetingsImportPreview(for envelope: MeetingBackup.Envelope) -> MeetingBackup.ImportPreview {
+        MeetingBackup.previewImport(envelope: envelope)
+    }
+
+    /// Restore a meetings backup (fresh ids), refresh the UI, and schedule an iCloud sync.
+    @discardableResult
+    func applyMeetingsImport(_ envelope: MeetingBackup.Envelope) -> MeetingBackup.ImportResult {
+        do {
+            let result = try MeetingBackup.importBackup(envelope, store: dictationStore)
+            syncAppState()
+            scheduleICloudSyncAfterLocalChange()
+            historyWindowController?.reload()
+            return result
+        } catch {
+            fputs("[meeting-backup] import failed: \(error)\n", stderr)
+            return MeetingBackup.ImportResult(imported: 0, skipped: envelope.meetings.count)
+        }
     }
 
     private func applyConfigRuntimeSideEffects(wasICloudSyncEnabled: Bool, hotkeyTriggerThresholdChanged: Bool) {
@@ -2764,7 +2828,8 @@ final class MuesliController: NSObject {
         MeetingTemplates.snapshot(
             for: meeting,
             customTemplates: config.customMeetingTemplates,
-            builtInOverrides: config.builtInMeetingTemplateOverrides
+            builtInOverrides: config.builtInMeetingTemplateOverrides,
+            defaultTemplateID: config.defaultMeetingTemplateID
         )
     }
 
@@ -4369,7 +4434,13 @@ final class MuesliController: NSObject {
                 baseConfig: self.config,
                 backend: summaryBackend
             )
+            var processingRunID: UUID?
             do {
+                processingRunID = try self.beginMeetingProcessing(
+                    meetingID: meeting.id,
+                    operation: .resummarization
+                )
+                self.syncAppState()
                 let summaryStartedAt = Date()
                 let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
                     transcript: meeting.rawTranscript,
@@ -4387,6 +4458,13 @@ final class MuesliController: NSObject {
                     ),
                     manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
                 )
+                if let processingRunID {
+                    self.advanceMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID,
+                        phase: .saving
+                    )
+                }
                 try self.dictationStore.updateMeetingSummary(
                     id: meeting.id,
                     title: plan.persistedTitle,
@@ -4397,6 +4475,13 @@ final class MuesliController: NSObject {
                     selectedTemplatePrompt: templateSnapshot.prompt,
                     processingMetadata: processingMetadata
                 )
+                if let processingRunID {
+                    self.finishMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID,
+                        status: meeting.status
+                    )
+                }
                 await MainActor.run {
                     self.scheduleICloudSyncAfterLocalChange()
                     self.syncAppState()
@@ -4406,6 +4491,15 @@ final class MuesliController: NSObject {
             } catch {
                 fputs("[muesli-native] failed to generate or persist meeting summary: \(error)\n", stderr)
                 await MainActor.run {
+                    if let processingRunID {
+                        self.finishMeetingProcessing(
+                            meetingID: meeting.id,
+                            runID: processingRunID,
+                            status: meeting.status
+                        )
+                        self.syncAppState()
+                        self.historyWindowController?.reload()
+                    }
                     if error is MeetingSummaryError {
                         completion(.failure(error))
                     } else {
@@ -4432,6 +4526,7 @@ final class MuesliController: NSObject {
                 self.performRetentionCleanup()
             }
             var didSetProcessing = false
+            var processingRunID: UUID?
             do {
                 let recordingUnits = try MeetingRecordingUnitResolver.resolve(
                     meetingID: meeting.id,
@@ -4460,12 +4555,22 @@ final class MuesliController: NSObject {
                     backend = configuredBackend
                 }
 
-                try self.updateMeetingStatusAndScheduleSyncThrowing(id: meeting.id, status: .processing)
+                processingRunID = try self.beginMeetingProcessing(
+                    meetingID: meeting.id,
+                    operation: .retranscription
+                )
                 didSetProcessing = true
                 self.syncAppState()
                 self.historyWindowController?.reload()
 
                 let transcriptionStartedAt = Date()
+                if let processingRunID {
+                    self.advanceMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID,
+                        phase: .transcribing
+                    )
+                }
                 if backend.backend == BackendOption.homanWhisper.backend {
                     try await self.transcriptionCoordinator.configureHomanWhisper(
                         endpointString: self.config.homanWhisperEndpoint,
@@ -4515,14 +4620,17 @@ final class MuesliController: NSObject {
                     startedAt: transcriptionStartedAt
                 )
 
-                let templateSnapshot = MeetingTemplates.snapshot(
-                    for: meeting,
-                    customTemplates: self.config.customMeetingTemplates,
-                    builtInOverrides: self.config.builtInMeetingTemplateOverrides
-                )
+                let templateSnapshot = self.meetingTemplateSnapshot(for: meeting)
                 let formattedNotes: String
                 var summaryMetadata: MeetingProcessingRunMetadata?
                 let summaryStartedAt = Date()
+                if let processingRunID {
+                    self.advanceMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID,
+                        phase: .summarizing
+                    )
+                }
                 do {
                     let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
                         transcript: rawTranscript,
@@ -4548,6 +4656,13 @@ final class MuesliController: NSObject {
                 }
 
                 do {
+                    if let processingRunID {
+                        self.advanceMeetingProcessing(
+                            meetingID: meeting.id,
+                            runID: processingRunID,
+                            phase: .saving
+                        )
+                    }
                     try self.dictationStore.updateMeetingTranscriptAndSummary(
                         id: meeting.id,
                         rawTranscript: rawTranscript,
@@ -4566,18 +4681,31 @@ final class MuesliController: NSObject {
                     throw MeetingRetranscriptionError.failedToSave(underlying: error)
                 }
 
+                if let processingRunID {
+                    self.finishMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID
+                    )
+                }
                 self.scheduleICloudSyncAfterLocalChange()
                 self.syncAppState()
                 self.historyWindowController?.reload()
                 completion(.success(()))
             } catch {
                 fputs("[muesli-native] failed to re-transcribe meeting \(meeting.id): \(error)\n", stderr)
-                if let status = Self.retranscriptionFailureStatus(
+                let failureStatus = Self.retranscriptionFailureStatus(
                     originalStatus: meeting.status,
                     didSetProcessing: didSetProcessing,
                     error: error
-                ) {
-                    self.updateMeetingStatusAndScheduleSync(id: meeting.id, status: status)
+                )
+                if let processingRunID {
+                    self.finishMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: processingRunID,
+                        status: failureStatus ?? .failed
+                    )
+                } else if let failureStatus {
+                    self.updateMeetingStatusAndScheduleSync(id: meeting.id, status: failureStatus)
                 }
                 self.syncAppState()
                 self.historyWindowController?.reload()
@@ -4642,15 +4770,24 @@ final class MuesliController: NSObject {
             return
         }
         meetingRecoveryInFlightIDs.insert(meetingID)
-        updateMeetingStatusAndScheduleSync(id: meetingID, status: .processing)
+        let processingRunID: UUID
+        do {
+            processingRunID = try beginMeetingProcessing(
+                meetingID: meetingID,
+                operation: .recovery
+            )
+        } catch {
+            meetingRecoveryInFlightIDs.remove(meetingID)
+            fputs("[muesli-native] failed to begin meeting recovery for \(meetingID): \(error)\n", stderr)
+            if presentErrors {
+                presentErrorAlert(title: "Meeting Recovery", message: error.localizedDescription)
+            }
+            return
+        }
         syncAppState()
         historyWindowController?.reload()
 
-        let templateSnapshot = MeetingTemplates.snapshot(
-            for: meeting,
-            customTemplates: config.customMeetingTemplates,
-            builtInOverrides: config.builtInMeetingTemplateOverrides
-        )
+        let templateSnapshot = meetingTemplateSnapshot(for: meeting)
         Task { @MainActor [weak self] in
             guard let self else { return }
             var activeStagedAudio = legacyStagedAudio
@@ -4674,6 +4811,11 @@ final class MuesliController: NSObject {
                             supportDirectory: self.processingSupportDirectory
                         )
                 }
+                self.advanceMeetingProcessing(
+                    meetingID: meetingID,
+                    runID: processingRunID,
+                    phase: .preparingRecording
+                )
                 guard let stagedAudio = activeStagedAudio else {
                     throw MeetingFinalProcessingError.noCapturedAudio
                 }
@@ -4682,7 +4824,16 @@ final class MuesliController: NSObject {
                     meeting: meeting,
                     config: self.config,
                     templateSnapshot: templateSnapshot,
-                    coordinator: self.transcriptionCoordinator
+                    coordinator: self.transcriptionCoordinator,
+                    progress: { [weak self] phase in
+                        Task { @MainActor [weak self] in
+                            self?.advanceMeetingProcessing(
+                                meetingID: meetingID,
+                                runID: processingRunID,
+                                phase: phase
+                            )
+                        }
+                    }
                 )
                 let isResume = !meeting.rawTranscript
                     .trimmingCharacters(in: .whitespacesAndNewlines)
@@ -4692,6 +4843,11 @@ final class MuesliController: NSObject {
                 }
                 let retainedRecordingURL: URL?
                 let retainedRecordingError: Error?
+                self.advanceMeetingProcessing(
+                    meetingID: meetingID,
+                    runID: processingRunID,
+                    phase: .encodingRecording
+                )
                 if self.config.meetingRecordingSavePolicy == .never {
                     retainedRecordingURL = nil
                     retainedRecordingError = nil
@@ -4752,6 +4908,11 @@ final class MuesliController: NSObject {
                     for: result,
                     saveDecision: recordingSaveDecision
                 )
+                self.advanceMeetingProcessing(
+                    meetingID: meetingID,
+                    runID: processingRunID,
+                    phase: .saving
+                )
                 let persistenceResult = try self.persistCompletedMeetingResultAndDispatchHook(
                     result,
                     existingMeetingID: meetingID,
@@ -4759,8 +4920,9 @@ final class MuesliController: NSObject {
                 )
                 self.pendingResumePriorTranscript[meetingID] = nil
                 if let recordingSaveError = persistenceResult.recordingSaveError {
-                    self.updateMeetingStatusAndScheduleSync(
-                        id: meetingID,
+                    self.finishMeetingProcessing(
+                        meetingID: meetingID,
+                        runID: processingRunID,
                         status: .failed
                     )
                     self.presentErrorAlert(
@@ -4768,6 +4930,10 @@ final class MuesliController: NSObject {
                         message: recordingSaveError.localizedDescription
                     )
                 } else {
+                    self.finishMeetingProcessing(
+                        meetingID: meetingID,
+                        runID: processingRunID
+                    )
                     _ = try? MeetingProcessingCapture.markState(
                         .completed,
                         for: recovered.stagedAudio
@@ -4798,7 +4964,11 @@ final class MuesliController: NSObject {
                         error: error
                     )
                 }
-                self.updateMeetingStatusAndScheduleSync(id: meetingID, status: .failed)
+                self.finishMeetingProcessing(
+                    meetingID: meetingID,
+                    runID: processingRunID,
+                    status: .failed
+                )
                 if presentErrors {
                     self.presentErrorAlert(
                         title: "Meeting Recovery",
@@ -6281,14 +6451,26 @@ final class MuesliController: NSObject {
                         guard let self,
                               self.activeMeetingID == meetingID || self.meetingStartMeetingID == meetingID else { return }
                         self.updateActiveMeetingAudioWarning(meetingID: meetingID, health: snapshot)
-                        if warningMessage != nil {
-                            self.recordDiagnosticIncident(
-                                kind: .meetingMicrophoneCaptureFailed,
-                                severity: .warning,
-                                stage: .meetingMicrophoneCapture,
-                                promptUser: false
-                            )
-                        }
+                    }
+                }
+                meetingSession.onMicHealthEpisode = { [weak self] event in
+                    fputs(
+                        "[meeting-mic] health episode \(event.kind.rawValue) "
+                            + "reason=\(event.reason) duration=\(event.durationSeconds)s "
+                            + "flaps=\(event.flapCount) recoveries=\(event.recoveryAttempts)\n",
+                        stderr
+                    )
+                    guard event.kind == .unrecovered else { return }
+                    Task { @MainActor in
+                        guard let self,
+                              self.activeMeetingID == meetingID
+                                || self.meetingStartMeetingID == meetingID else { return }
+                        self.recordDiagnosticIncident(
+                            kind: .meetingMicrophoneCaptureFailed,
+                            severity: .error,
+                            stage: .meetingMicrophoneCapture,
+                            promptUser: false
+                        )
                     }
                 }
                 meetingSession.onCaptureIntegrityFailure = { [weak self] error in
@@ -6834,23 +7016,33 @@ final class MuesliController: NSObject {
         meetingEndTimer = nil
         meetingNotification.close()
         let liveMeetingID = activeMeetingID
+        var processingRunID: UUID?
         if let liveMeetingID {
             flushCachedMeetingManualNotes(id: liveMeetingID, sync: false)
             flushCachedMeetingTitle(id: liveMeetingID)
-            updateMeetingStatusAndScheduleSync(id: liveMeetingID, status: .processing)
+            do {
+                processingRunID = try beginMeetingProcessing(
+                    meetingID: liveMeetingID,
+                    operation: .finalization
+                )
+            } catch {
+                fputs("[muesli-native] failed to begin final processing progress for \(liveMeetingID): \(error)\n", stderr)
+                updateMeetingStatusAndScheduleSync(id: liveMeetingID, status: .processing)
+            }
             syncAppState()
         }
         indicator.setMeetingRecording(false, config: config)
         indicator.setTranscribingTitle("Transcribing", config: config)
         setState(.transcribing)
-        let processingGeneration = backgroundMeetingProcessingCount + 1
+        let processingMeetingID = liveMeetingID
         sessionToStop.onProgress = { [weak self] stage in
             Task { @MainActor [weak self] in
                 guard let self,
                       !self.isMeetingRecording(),
                       !self.isStartingMeetingRecording,
-                      self.backgroundMeetingProcessingCount == processingGeneration else { return }
-                self.setMeetingProcessingStage(stage)
+                      let meetingID = processingMeetingID,
+                      let runID = processingRunID else { return }
+                self.setMeetingProcessingStage(stage, meetingID: meetingID, runID: runID)
             }
         }
 
@@ -6884,13 +7076,28 @@ final class MuesliController: NSObject {
                 meetingResult = result
                 meetingTitle = result.title
                 await MainActor.run {
-                    self.setMeetingProcessingStatus("Finalizing")
+                    if let meetingID = liveMeetingID, let runID = processingRunID {
+                        self.advanceMeetingProcessing(
+                            meetingID: meetingID,
+                            runID: runID,
+                            phase: .encodingRecording
+                        )
+                    }
                 }
                 let recordingSaveDecision = await self.recordingSaveDecision(for: result)
                 let preparedRecordingSave = await self.prepareMeetingRecordingSave(
                     for: result,
                     saveDecision: recordingSaveDecision
                 )
+                await MainActor.run {
+                    if let meetingID = liveMeetingID, let runID = processingRunID {
+                        self.advanceMeetingProcessing(
+                            meetingID: meetingID,
+                            runID: runID,
+                            phase: .saving
+                        )
+                    }
+                }
                 let persistenceResult = try await MainActor.run {
                     try self.persistCompletedMeetingResultAndDispatchHook(
                         result,
@@ -6958,9 +7165,18 @@ final class MuesliController: NSObject {
                 self.backgroundMeetingProcessingCount -= 1
                 if let failedLiveMeetingID {
                     self.resolveLiveMeetingAfterStopFailure(id: failedLiveMeetingID)
+                    if let runID = processingRunID {
+                        self.finishMeetingProcessing(
+                            meetingID: failedLiveMeetingID,
+                            runID: runID
+                        )
+                    }
                 } else if let liveMeetingID {
                     // Resume merged + persisted successfully — drop the prior-transcript marker.
                     self.pendingResumePriorTranscript[liveMeetingID] = nil
+                    if let runID = processingRunID {
+                        self.finishMeetingProcessing(meetingID: liveMeetingID, runID: runID)
+                    }
                 }
                 if !self.isMeetingRecording() && !self.isStartingMeetingRecording && self.backgroundMeetingProcessingCount == 0 {
                     self.setState(.idle)
@@ -8283,25 +8499,97 @@ final class MuesliController: NSObject {
         }
     }
 
-    @MainActor
-    private func setMeetingProcessingStage(_ stage: MeetingProcessingStage) {
-        switch stage {
-        case .transcribingAudio:
-            setMeetingProcessingStatus("Transcribing")
-        case .cleaningAudio:
-            setMeetingProcessingStatus("Cleaning")
-        case .generatingTitle:
-            setMeetingProcessingStatus("Titling")
-        case .summarizingNotes:
-            setMeetingProcessingStatus("Summarizing")
+    /// Short float-pill labels keep the always-on-top indicator compact while the
+    /// meeting list/detail use the full persisted phase, counter and timers.
+    private static func processingShortLabel(for phase: MeetingProcessingPhase) -> String {
+        switch phase {
+        case .preparingAudio, .preparingRecording: return "Cleaning"
+        case .transcribing: return "Transcribing"
+        case .generatingTitle: return "Titling"
+        case .summarizing: return "Summarizing"
+        case .encodingRecording: return "Finalizing"
+        case .saving: return "Saving"
         }
     }
 
     @MainActor
-    private func setMeetingProcessingStatus(_ status: String) {
-        statusBarController?.setStatus(status)
+    private func setMeetingProcessingStage(
+        _ stage: MeetingProcessingStage,
+        meetingID: Int64,
+        runID: UUID
+    ) {
+        let phase: MeetingProcessingPhase
+        switch stage {
+        case .cleaningWav: phase = .preparingAudio
+        case .writingRecording: phase = .preparingRecording
+        case .transcribingAudio: phase = .transcribing
+        case .generatingTitle: phase = .generatingTitle
+        case .summarizingNotes: phase = .summarizing
+        }
+        advanceMeetingProcessing(meetingID: meetingID, runID: runID, phase: phase)
+    }
+
+    /// Starts the canonical local run and changes the meeting status atomically.
+    @MainActor
+    private func beginMeetingProcessing(
+        meetingID: Int64,
+        operation: MeetingProcessingOperation
+    ) throws -> UUID {
+        let progress = MeetingProcessingProgress.starting(operation: operation)
+        try dictationStore.beginMeetingProcessing(id: meetingID, progress: progress)
+        appState.meetingProcessing[meetingID] = progress
+        scheduleICloudSyncAfterLocalChange()
+        historyWindowController?.reload()
+        return progress.runID
+    }
+
+    /// Advances only the run which still owns this meeting. Stale callbacks are ignored.
+    @MainActor
+    private func advanceMeetingProcessing(
+        meetingID: Int64,
+        runID: UUID,
+        phase: MeetingProcessingPhase
+    ) {
+        guard let current = appState.meetingProcessing[meetingID],
+              current.runID == runID,
+              let advanced = current.advancing(to: phase) else { return }
+        do {
+            guard try dictationStore.updateMeetingProcessing(id: meetingID, progress: advanced) else {
+                return
+            }
+        } catch {
+            fputs("[muesli-native] failed to persist meeting progress for \(meetingID): \(error)\n", stderr)
+            return
+        }
+        appState.meetingProcessing[meetingID] = advanced
+        let shortLabel = Self.processingShortLabel(for: phase)
+        statusBarController?.setStatus(shortLabel)
         statusBarController?.refresh()
-        indicator.setTranscribingTitle(status, config: config)
+        indicator.setTranscribingTitle(shortLabel, config: config)
+    }
+
+    /// Finishes only the matching run. Passing a status makes status and cleanup atomic.
+    @MainActor
+    private func finishMeetingProcessing(
+        meetingID: Int64,
+        runID: UUID,
+        status: MeetingStatus? = nil
+    ) {
+        do {
+            guard try dictationStore.finishMeetingProcessing(
+                id: meetingID,
+                runID: runID,
+                status: status
+            ) else { return }
+            if appState.meetingProcessing[meetingID]?.runID == runID {
+                appState.meetingProcessing[meetingID] = nil
+            }
+            if status != nil {
+                scheduleICloudSyncAfterLocalChange()
+            }
+        } catch {
+            fputs("[muesli-native] failed to finish meeting progress for \(meetingID): \(error)\n", stderr)
+        }
     }
 
     private func handleComputerUsePrepare() {

@@ -58,6 +58,8 @@ protocol MeetingMicRecording: AnyObject {
     func currentPower() -> Float
     func diagnosticsSnapshot() -> MeetingMicRecorderDiagnosticsSnapshot
     func routeTransitionSnapshot() -> MeetingMicRouteTransitionSnapshot
+    @discardableResult
+    func requestSameRouteRecovery(reason: String) -> Bool
 }
 
 extension MeetingMicRecording {
@@ -71,6 +73,8 @@ extension MeetingMicRecording {
             attempt: 0
         )
     }
+
+    func requestSameRouteRecovery(reason: String) -> Bool { false }
 }
 
 final class StreamingMeetingMicRecorderAdapter: MeetingMicRecording {
@@ -468,6 +472,29 @@ final class RouteAwareMeetingMicRecorder: MeetingMicRecording {
         )
     }
 
+    @discardableResult
+    func requestSameRouteRecovery(reason: String) -> Bool {
+        lifecycleQueue.sync {
+            let canStart = lock.withLock { state -> Bool in
+                guard state.lifecycleState == .running || state.lifecycleState == .failed,
+                      state.pending == nil,
+                      state.transitionPhase == .stable || state.transitionPhase == .failed else {
+                    return false
+                }
+                state.handoffAttempt = 0
+                state.transitionPhase = .switching
+                state.generation &+= 1
+                return true
+            }
+            guard canStart else { return false }
+            fputs(
+                "[meeting-mic] health-triggered same-route recovery requested: \(reason)\n",
+                stderr
+            )
+            return beginHandoffIfNeeded(force: true)
+        }
+    }
+
     private func ensureCurrentChild() throws -> Child {
         let desired = preferredInputDeviceID
         if let active = lock.withLock({ $0.active }), active.deviceID == desired { return active }
@@ -492,7 +519,8 @@ final class RouteAwareMeetingMicRecorder: MeetingMicRecording {
         beginHandoffIfNeeded(force: force)
     }
 
-    private func beginHandoffIfNeeded(force: Bool = false) {
+    @discardableResult
+    private func beginHandoffIfNeeded(force: Bool = false) -> Bool {
         let request = lock.withLock { state -> (AudioObjectID, UInt64, Int)? in
             guard state.lifecycleState == .running || state.lifecycleState == .failed,
                   state.pending == nil,
@@ -505,7 +533,7 @@ final class RouteAwareMeetingMicRecorder: MeetingMicRecording {
                 state.handoffAttempt
             )
         }
-        guard let (encodedDeviceID, generation, _) = request else { return }
+        guard let (encodedDeviceID, generation, _) = request else { return false }
         let deviceID = encodedDeviceID == kAudioObjectUnknown ? nil : encodedDeviceID
         let candidate = makeChild(deviceID: deviceID, generation: generation)
         lock.withLock { $0.pending = candidate }
@@ -539,6 +567,7 @@ final class RouteAwareMeetingMicRecorder: MeetingMicRecording {
                 }
             }
         }
+        return true
     }
 
     private func makeChild(deviceID: AudioObjectID?, generation: UInt64) -> Child {
