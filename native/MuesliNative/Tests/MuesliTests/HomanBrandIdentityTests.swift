@@ -1,5 +1,6 @@
 import Foundation
 import CoreText
+import ImageIO
 import Testing
 @testable import MuesliNativeApp
 
@@ -90,5 +91,38 @@ struct HomanBrandIdentityTests {
         #expect(!appDelegate.contains("applicationIconImage ="))
         #expect(buildScript.contains("<key>CFBundleIconFile</key>"))
         #expect(buildScript.contains("<string>muesli.icns</string>"))
+    }
+
+    @Test("Insights share background is a complete build input")
+    func insightsShareBackgroundIsCompleteBuildInput() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let assetURL = repoRoot.appendingPathComponent("assets/insights-share-background.png")
+        let source = try #require(CGImageSourceCreateWithURL(assetURL as CFURL, nil))
+        let properties = try #require(
+            CGImageSourceCopyPropertiesAtIndex(source, 0, nil) as? [CFString: Any]
+        )
+
+        #expect((properties[kCGImagePropertyPixelWidth] as? NSNumber)?.intValue == 1_200)
+        #expect((properties[kCGImagePropertyPixelHeight] as? NSNumber)?.intValue == 630)
+
+        let buildScriptURL = repoRoot.appendingPathComponent("scripts/build_native_app.sh")
+        let buildScript = try String(contentsOf: buildScriptURL, encoding: .utf8)
+        #expect(
+            buildScript.contains(
+                #"cp "$ROOT/assets/insights-share-background.png" "$STAGED_APP_DIR/Contents/Resources/insights-share-background.png""#
+            )
+        )
+        #expect(InsightsBrandAssets.shareWordmark == "homan")
+        #expect(InsightsBrandAssets.appIconRepositoryPath == "assets/homan_app_icon.png")
+        #expect(
+            FileManager.default.fileExists(
+                atPath: repoRoot.appendingPathComponent(InsightsBrandAssets.appIconRepositoryPath).path
+            )
+        )
     }
 }

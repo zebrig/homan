@@ -257,7 +257,7 @@ private struct InsightsShareCard: View {
                         .tracking(1.9)
                         .foregroundStyle(pale.opacity(0.82))
                     Spacer()
-                    MuesliShareMark(color: pale)
+                    HomanShareMark(color: pale)
                         .padding(.horizontal, 14)
                         .padding(.vertical, 9)
                         .background(Color(red: 0.035, green: 0.050, blue: 0.068).opacity(0.44))
@@ -336,7 +336,7 @@ private struct InsightsShareCard: View {
     }
 }
 
-private struct MuesliShareMark: View {
+private struct HomanShareMark: View {
     let color: Color
 
     var body: some View {
@@ -348,7 +348,7 @@ private struct MuesliShareMark: View {
                     .frame(width: 54, height: 54)
                     .clipShape(RoundedRectangle(cornerRadius: 12))
             }
-            Text("muesli")
+            Text(InsightsBrandAssets.shareWordmark)
                 .font(Font(AppFonts.bold(30)))
                 .tracking(-1.1)
                 .foregroundStyle(color)
@@ -359,6 +359,8 @@ private struct MuesliShareMark: View {
 }
 
 enum InsightsBrandAssets {
+    static let shareWordmark = AppIdentity.displayName.lowercased()
+    static let appIconRepositoryPath = "assets/homan_app_icon.png"
     static let shareBackground = image(
         bundledName: "insights-share-background",
         extension: "png",
@@ -367,7 +369,7 @@ enum InsightsBrandAssets {
     static let appIcon = image(
         bundledName: "muesli_app_icon",
         extension: "png",
-        repositoryPath: "assets/muesli_app_icon.png"
+        repositoryPath: appIconRepositoryPath
     )
 
     private static func image(bundledName: String, extension fileExtension: String, repositoryPath: String) -> NSImage? {
