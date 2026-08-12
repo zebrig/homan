@@ -16,6 +16,16 @@ struct MeetingMicHealthEpisodeEvent: Equatable {
     let recoveryAttempts: Int
 }
 
+enum MeetingMicHealthIncidentPolicy {
+    /// Terminal recovery failures are emitted while `MeetingSession.stop()` is
+    /// finishing. By then the controller has intentionally released active
+    /// capture ownership so another meeting can start, but the session-scoped
+    /// callback still belongs to the meeting that just stopped.
+    static func shouldRecordCaptureFailure(for event: MeetingMicHealthEpisodeEvent) -> Bool {
+        event.kind == .unrecovered
+    }
+}
+
 /// Collapses the raw health stream into bounded degradation episodes and asks
 /// the route-aware recorder to rebuild the current route when it silently dies.
 final class MeetingMicRecoveryCoordinator {

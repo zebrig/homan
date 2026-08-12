@@ -6460,11 +6460,11 @@ final class MuesliController: NSObject {
                             + "flaps=\(event.flapCount) recoveries=\(event.recoveryAttempts)\n",
                         stderr
                     )
-                    guard event.kind == .unrecovered else { return }
+                    guard MeetingMicHealthIncidentPolicy.shouldRecordCaptureFailure(for: event) else {
+                        return
+                    }
                     Task { @MainActor in
-                        guard let self,
-                              self.activeMeetingID == meetingID
-                                || self.meetingStartMeetingID == meetingID else { return }
+                        guard let self else { return }
                         self.recordDiagnosticIncident(
                             kind: .meetingMicrophoneCaptureFailed,
                             severity: .error,

@@ -120,6 +120,19 @@ struct MeetingMicRecoveryCoordinatorTests {
         #expect(!harness.coordinator.hasActiveEpisode)
     }
 
+    @Test("terminal failure remains reportable after active capture is released")
+    func terminalFailureRemainsReportableAfterCaptureRelease() throws {
+        let harness = Harness()
+        harness.systemActive(seconds: 4)
+        harness.coordinator.finishMeeting()
+
+        let terminalEvent = try #require(harness.events.last)
+        #expect(MeetingMicHealthIncidentPolicy.shouldRecordCaptureFailure(for: terminalEvent))
+
+        let nonterminalEvent = try #require(harness.events.first)
+        #expect(!MeetingMicHealthIncidentPolicy.shouldRecordCaptureFailure(for: nonterminalEvent))
+    }
+
     @Test("late callbacks after finish cannot create a dangling episode")
     func lateCallbacksAreIgnored() {
         let harness = Harness()
