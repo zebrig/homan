@@ -72,4 +72,23 @@ struct HomanBrandIdentityTests {
         #expect(path.boundingBoxOfPath.minX == 4)
         #expect(path.boundingBoxOfPath.maxX == 36)
     }
+
+    @Test("Dock icon remains owned by bundle metadata")
+    func dockIconRemainsOwnedByBundleMetadata() throws {
+        let repoRoot = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+        let appDelegateURL = repoRoot
+            .appendingPathComponent("native/MuesliNative/Sources/MuesliNativeApp/AppDelegate.swift")
+        let buildScriptURL = repoRoot.appendingPathComponent("scripts/build_native_app.sh")
+        let appDelegate = try String(contentsOf: appDelegateURL, encoding: .utf8)
+        let buildScript = try String(contentsOf: buildScriptURL, encoding: .utf8)
+
+        #expect(!appDelegate.contains("applicationIconImage ="))
+        #expect(buildScript.contains("<key>CFBundleIconFile</key>"))
+        #expect(buildScript.contains("<string>muesli.icns</string>"))
+    }
 }

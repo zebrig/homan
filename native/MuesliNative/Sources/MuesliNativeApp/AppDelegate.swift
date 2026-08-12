@@ -26,9 +26,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         do {
             let runtime = try RuntimePaths.resolve()
             AppFonts.registerIfNeeded(runtime: runtime)
-            if let appIcon = runtime.appIcon, let image = NSImage(contentsOf: appIcon) {
-                NSApplication.shared.applicationIconImage = image
-            }
+            // Keep the Dock tile owned by the bundle icon metadata. Assigning
+            // applicationIconImage turns it into a temporary custom Dock image
+            // and bypasses macOS system masking and edge treatment.
             let controller = MuesliController(runtime: runtime)
             sparkleUpdateDelegate.appState = controller.appState
             if Self.hasConfiguredSparkleFeed {
