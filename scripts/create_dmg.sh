@@ -15,6 +15,7 @@ if [[ ! -d "$APP_PATH" ]]; then
   echo "App not found: $APP_PATH" >&2
   exit 1
 fi
+APP_PATH="$(cd "$(dirname "$APP_PATH")" && pwd)/$(basename "$APP_PATH")"
 
 if [[ ! -f "$BACKGROUND_DIR/dmg-background.png" ]]; then
   echo "DMG background not found: $BACKGROUND_DIR/dmg-background.png" >&2
@@ -22,9 +23,20 @@ if [[ ! -f "$BACKGROUND_DIR/dmg-background.png" ]]; then
   exit 1
 fi
 
-# Extract version from Info.plist
-VERSION=$(defaults read "$APP_PATH/Contents/Info" CFBundleShortVersionString 2>/dev/null || echo "0.0.0")
-APP_NAME=$(defaults read "$APP_PATH/Contents/Info" CFBundleDisplayName 2>/dev/null || echo "Muesli")
+# Extract required identity directly from the bundle plist. `defaults read`
+# interprets relative bundle paths as preference domains and can silently fall
+# back to placeholder values, producing a wrongly named release artifact.
+INFO_PLIST="$APP_PATH/Contents/Info.plist"
+if [[ ! -f "$INFO_PLIST" ]]; then
+  echo "Info.plist not found: $INFO_PLIST" >&2
+  exit 1
+fi
+VERSION="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleShortVersionString' "$INFO_PLIST" 2>/dev/null || true)"
+APP_NAME="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleDisplayName' "$INFO_PLIST" 2>/dev/null || true)"
+if [[ -z "$VERSION" || -z "$APP_NAME" ]]; then
+  echo "Info.plist is missing CFBundleShortVersionString or CFBundleDisplayName: $INFO_PLIST" >&2
+  exit 1
+fi
 export MUESLI_DMG_APP_NAME="$APP_NAME"
 APP_BUNDLE_NAME="$(basename "$APP_PATH")"
 DMG_NAME="${APP_NAME}-${VERSION}.dmg"
