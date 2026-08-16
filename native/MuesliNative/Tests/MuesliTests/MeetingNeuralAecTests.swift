@@ -1,5 +1,6 @@
 import Foundation
 import LocalVQEBridge
+import LocalVQEBridgeTestSupport
 import Testing
 @testable import MuesliNativeApp
 
@@ -169,6 +170,18 @@ struct MeetingNeuralAecTests {
         )
         #expect(context == nil)
         #expect(String(cString: error).contains("Could not load LocalVQE library"))
+    }
+
+    @Test("LocalVQE bridge contains C++ exceptions at the native boundary")
+    func localVQEBridgeContainsCppExceptions() {
+        var error = [CChar](repeating: 0, count: 512)
+        let status = muesli_test_localvqe_guard_system_error(
+            &error,
+            Int32(error.count)
+        )
+
+        #expect(status == -103)
+        #expect(String(cString: error).contains("simulated LocalVQE mutex failure"))
     }
 
     @Test("streaming AEC emits original sample count after flush")

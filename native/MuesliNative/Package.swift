@@ -81,6 +81,12 @@ let package = Package(
             path: "Sources/LocalVQEBridge",
             publicHeadersPath: "include"
         ),
+        .target(
+            name: "LocalVQEBridgeTestSupport",
+            dependencies: ["LocalVQEBridge"],
+            path: "Tests/LocalVQEBridgeTestSupport",
+            publicHeadersPath: "include"
+        ),
         .binaryTarget(
             name: "CLiteRTLM_mac",
             url: "https://github.com/google-ai-edge/LiteRT-LM/releases/download/v0.13.1/CLiteRTLM_mac.xcframework.zip",
@@ -94,6 +100,7 @@ let package = Package(
                 "MuesliCLI",
                 "AudioGraphExceptionBridge",
                 "LocalVQEBridge",
+                "LocalVQEBridgeTestSupport",
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Tests/MuesliTests",

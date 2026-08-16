@@ -9,6 +9,7 @@ Homan 0.8.2 focuses on reliable long-running meeting capture, recoverable proces
 - Bounded recovery attempts and grouped repeated degradation into one visible diagnostic episode instead of repeatedly restarting capture.
 - Stabilized CoreAudio aggregate-device identities and added cleanup diagnostics, preventing unbounded phantom aggregate devices after interrupted recordings.
 - Preserved raw microphone and system sources throughout recording and post-processing.
+- Made application shutdown wait for meeting finalization to unwind safely, preserving recoverable raw audio and preventing LocalVQE teardown crashes.
 
 ## Processing and templates
 

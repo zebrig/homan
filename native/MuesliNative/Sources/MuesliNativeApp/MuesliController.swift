@@ -445,8 +445,9 @@ final class MuesliController: NSObject {
     private var meetingActivity: NSObjectProtocol?
     private var isStoppingMeetingRecording = false
     private var isPresentingMeetingTerminationConfirmation = false
+    private var isPreparingForApplicationTermination = false
     private var isTerminatingAfterMeetingConfirmation = false
-    private var backgroundMeetingProcessingCount = 0
+    private let backgroundMeetingProcessing = MeetingBackgroundProcessingRegistry()
     private var pendingMeetingCompletionNotification: PendingMeetingCompletionNotification?
     private var contributionMilestonePromptDismissedThisLaunch = false
     private var contributionMilestonePromptSeenIDsThisLaunch: Set<String> = []
@@ -5445,7 +5446,9 @@ final class MuesliController: NSObject {
     }
 
     func clearMeetingHistory() {
-        guard !isMeetingRecording(), !isStartingMeetingRecording, backgroundMeetingProcessingCount == 0 else {
+        guard !isMeetingRecording(),
+              !isStartingMeetingRecording,
+              backgroundMeetingProcessing.count == 0 else {
             presentErrorAlert(
                 title: "Couldn't Clear Meeting History",
                 message: "A meeting is recording or still being processed. Please wait before clearing saved meetings."
@@ -5508,7 +5511,7 @@ final class MuesliController: NSObject {
             isStarting: isStartingMeetingRecording,
             hasActiveSession: activeMeetingSession != nil,
             isRecording: activeMeetingSession?.isRecording == true,
-            isStopping: isStoppingMeetingRecording || backgroundMeetingProcessingCount > 0
+            isStopping: isStoppingMeetingRecording || backgroundMeetingProcessing.count > 0
         )
     }
 
@@ -5521,6 +5524,14 @@ final class MuesliController: NSObject {
         if isTerminatingAfterMeetingConfirmation {
             isTerminatingAfterMeetingConfirmation = false
             return true
+        }
+
+        // A first termination request is cancelled while native work drains.
+        // The second request is issued by beginApplicationTermination() only
+        // after all owned meeting work has stopped, so dynamic libraries cannot
+        // be torn down underneath a final-processing task.
+        if isPreparingForApplicationTermination {
+            return false
         }
 
         switch state {
@@ -5554,9 +5565,7 @@ final class MuesliController: NSObject {
                 guard let self else { return }
                 self.isPresentingMeetingTerminationConfirmation = false
                 guard response == .alertSecondButtonReturn else { return }
-                self.discardMeetingStateForTermination()
-                self.isTerminatingAfterMeetingConfirmation = true
-                NSApp.terminate(nil)
+                self.beginApplicationTermination()
             }
         }
         if !didPresent {
@@ -5564,6 +5573,30 @@ final class MuesliController: NSObject {
         }
 
         return false
+    }
+
+    private func beginApplicationTermination() {
+        guard !isPreparingForApplicationTermination else { return }
+        isPreparingForApplicationTermination = true
+
+        let meetingStartTaskToAwait = meetingStartTask
+        let importTaskToAwait = importTask
+        discardMeetingStateForTermination()
+        statusBarController?.setStatus("Stopping background processing...")
+        statusBarController?.refresh()
+
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            if let meetingStartTaskToAwait {
+                await meetingStartTaskToAwait.value
+            }
+            if let importTaskToAwait {
+                await importTaskToAwait.value
+            }
+            await self.backgroundMeetingProcessing.cancelAllAndWait()
+            self.isTerminatingAfterMeetingConfirmation = true
+            NSApp.terminate(nil)
+        }
     }
 
     private func discardMeetingStateForTermination() {
@@ -5580,6 +5613,9 @@ final class MuesliController: NSObject {
         meetingStartTask?.cancel()
         meetingStartTask = nil
         meetingStartMeetingID = nil
+        importTask?.cancel()
+        importTask = nil
+        importSessionID = nil
         isStartingMeetingRecording = false
         isStoppingMeetingRecording = false
         updateMeetingStartStatus(nil)
@@ -5748,6 +5784,7 @@ final class MuesliController: NSObject {
         presentation: MeetingStartPresentation = .foregroundNotes,
         startOrigin: MeetingRecordingStartOrigin = .manual
     ) -> Bool {
+        guard !isPreparingForApplicationTermination else { return false }
         guard ensureBasicDictationPermissionsBeforeDashboard() else { return false }
         if isMeetingRecording() {
             if presentation.presentsHistoryWindow {
@@ -5785,6 +5822,7 @@ final class MuesliController: NSObject {
         inheritedFolderID: Int64? = nil,
         previousMeetingNotes: String? = nil
     ) -> Bool {
+        guard !isPreparingForApplicationTermination else { return false }
         guard !isMeetingRecording(), !isStartingMeetingRecording else { return false }
         guard let meetingBackend = normalizeMeetingTranscriptionSelectionForAvailability() else {
             presentErrorAlert(
@@ -6052,6 +6090,7 @@ final class MuesliController: NSObject {
 
     /// Presents a file picker and imports an audio file for offline transcription.
     func importAudioFile() {
+        guard !isPreparingForApplicationTermination else { return }
         guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
         guard normalizeMeetingTranscriptionSelectionForAvailability() != nil else {
             presentErrorAlert(
@@ -6080,6 +6119,7 @@ final class MuesliController: NSObject {
 
     /// Imports an audio file from a URL (drag-and-drop or file picker).
     func importAudioFileFromURL(_ url: URL) {
+        guard !isPreparingForApplicationTermination else { return }
         guard !isMeetingRecording(), !isStartingMeetingRecording else { return }
         guard AudioFileImportController.isSupportedFileURL(url) else {
             presentErrorAlert(
@@ -7054,7 +7094,6 @@ final class MuesliController: NSObject {
             activeMeetingAudioWarning = nil
         }
         isStoppingMeetingRecording = false
-        backgroundMeetingProcessingCount += 1
         // The previous meeting still counts as background processing for quit
         // protection, but it no longer owns capture. Publish that distinction
         // immediately so Record Meeting is available for the next call.
@@ -7063,13 +7102,18 @@ final class MuesliController: NSObject {
         meetingMonitor.refreshState()
         syncDictationRecorderWarmup(intent: .idlePrewarm(.meetingStateChanged))
 
-        Task { [weak self] in
+        let backgroundTaskID = UUID()
+        let backgroundTask = Task { [weak self] in
             guard let self else { return }
+            defer {
+                self.backgroundMeetingProcessing.remove(id: backgroundTaskID)
+            }
             var meetingTitle = "Meeting"
             var completedMeetingID: Int64?
             var meetingResult: MeetingSessionResult?
             var failedLiveMeetingID: Int64?
             var shouldRemoveProcessingStaging = false
+            var wasCancelled = false
             do {
                 let stopped = try await sessionToStop.stop()
                 let result = await self.mergedResumeResult(for: stopped, meetingID: liveMeetingID)
@@ -7121,7 +7165,9 @@ final class MuesliController: NSObject {
                     }
                 }
             } catch {
-                fputs("[muesli-native] meeting transcription failed: \(error)\n", stderr)
+                wasCancelled = Task.isCancelled || error is CancellationError
+                let outcome = wasCancelled ? "cancelled" : "failed"
+                fputs("[muesli-native] meeting transcription \(outcome): \(error)\n", stderr)
                 if let liveMeetingID,
                    let stagedRawAudio = MeetingRawAudioCapture
                     .recoverableSessions(
@@ -7142,13 +7188,15 @@ final class MuesliController: NSObject {
                     .first {
                     _ = try? MeetingProcessingCapture.markFailed(stagedAudio, error: error)
                 }
-                await MainActor.run {
-                    _ = self.recordDiagnosticIncident(
-                        kind: .meetingProcessingFailed,
-                        stage: .meetingStopProcessing,
-                        backend: self.selectedMeetingTranscriptionBackend,
-                        error: error
-                    )
+                if !wasCancelled {
+                    await MainActor.run {
+                        _ = self.recordDiagnosticIncident(
+                            kind: .meetingProcessingFailed,
+                            stage: .meetingStopProcessing,
+                            backend: self.selectedMeetingTranscriptionBackend,
+                            error: error
+                        )
+                    }
                 }
                 let message: String
                 if let lifecycleError = error as? MeetingLifecycleError {
@@ -7157,12 +7205,14 @@ final class MuesliController: NSObject {
                     message = error.localizedDescription
                 }
                 failedLiveMeetingID = liveMeetingID
-                await MainActor.run {
-                    self.presentErrorAlert(title: "Meeting Recording", message: message)
+                if !wasCancelled {
+                    await MainActor.run {
+                        guard !self.isPreparingForApplicationTermination else { return }
+                        self.presentErrorAlert(title: "Meeting Recording", message: message)
+                    }
                 }
             }
             await MainActor.run {
-                self.backgroundMeetingProcessingCount -= 1
                 if let failedLiveMeetingID {
                     self.resolveLiveMeetingAfterStopFailure(id: failedLiveMeetingID)
                     if let runID = processingRunID {
@@ -7178,7 +7228,10 @@ final class MuesliController: NSObject {
                         self.finishMeetingProcessing(meetingID: liveMeetingID, runID: runID)
                     }
                 }
-                if !self.isMeetingRecording() && !self.isStartingMeetingRecording && self.backgroundMeetingProcessingCount == 0 {
+                if !self.isMeetingRecording()
+                    && !self.isStartingMeetingRecording
+                    && !self.isPreparingForApplicationTermination
+                    && self.backgroundMeetingProcessing.count == 0 {
                     self.setState(.idle)
                     self.statusBarController?.refresh()
                 }
@@ -7194,15 +7247,17 @@ final class MuesliController: NSObject {
                     )
                 }
                 self.performRetentionCleanup()
-                TelemetryDeck.signal("meeting.completed")
-
-                self.enqueueOrShowMeetingCompletionNotification(
-                    meetingID: completedMeetingID,
-                    title: meetingTitle
-                )
+                if !wasCancelled {
+                    TelemetryDeck.signal("meeting.completed")
+                    self.enqueueOrShowMeetingCompletionNotification(
+                        meetingID: completedMeetingID,
+                        title: meetingTitle
+                    )
+                }
                 self.updateMeetingNotificationVisibility()
             }
         }
+        backgroundMeetingProcessing.insert(backgroundTask, id: backgroundTaskID)
     }
 
     func revealMeetingRecordingInFinder(path: String) {
@@ -8221,7 +8276,7 @@ final class MuesliController: NSObject {
     }
 
     private func endMeetingActivity() {
-        guard backgroundMeetingProcessingCount == 0,
+        guard backgroundMeetingProcessing.count == 0,
               activeMeetingSession?.isRecording != true else { return }
         guard let activity = meetingActivity else { return }
         ProcessInfo.processInfo.endActivity(activity)

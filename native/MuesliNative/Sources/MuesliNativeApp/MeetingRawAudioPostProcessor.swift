@@ -83,10 +83,12 @@ enum MeetingRawAudioPostProcessor {
         _ rawAudio: MeetingStagedRawAudio,
         aec: MeetingNeuralAec
     ) async throws -> MeetingPreparedRawAudio {
+        try Task.checkCancellation()
         let rendered = try MeetingRawAudioRenderer.renderForProcessing(rawAudio)
         var microphoneWriter: PCMChunkRecorder?
         do {
             await aec.preload()
+            try Task.checkCancellation()
             aec.resetForStreaming()
 
             let microphoneReader = try rendered.microphoneURL.map(MonoFloatReader.init(url:))
@@ -101,6 +103,7 @@ enum MeetingRawAudioPostProcessor {
             var microphoneSamplesWritten = 0
 
             while processedFrames < targetFrames {
+                try Task.checkCancellation()
                 let requestedFrames = min(
                     Int(processingBlockFrames),
                     targetFrames - processedFrames
@@ -125,6 +128,7 @@ enum MeetingRawAudioPostProcessor {
             }
 
             if microphoneReader != nil {
+                try Task.checkCancellation()
                 let flushed = aec.flushStreamingMic().map(pcm16Sample)
                 microphoneWriter?.append(flushed)
                 microphoneSamplesWritten += flushed.count

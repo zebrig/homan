@@ -42,6 +42,50 @@ struct MeetingRawAudioPostProcessorTests {
         #expect(processor.nonZeroReferenceFrames == 1)
     }
 
+    @Test("cancellation stops post-AEC processing and leaves raw capture recoverable")
+    func cancellationStopsPostProcessing() async throws {
+        let support = try temporarySupportDirectory()
+        defer { try? FileManager.default.removeItem(at: support) }
+        let capture = try MeetingRawAudioCapture(
+            meetingID: 92,
+            startedAt: Date(),
+            timelineAnchorNanoseconds: 1_000,
+            finalModelID: .parakeetRealtimeEOU,
+            supportDirectory: support,
+            compactLosslessly: false
+        )
+        let samples = [Int16](repeating: 4_096, count: 16_000 * 4)
+        capture.append(chunk(samples: samples, timestamp: 1_000), role: .microphone)
+        capture.append(chunk(samples: samples, timestamp: 1_000), role: .system)
+        let raw = try capture.finalize(endedAt: Date())
+        let processor = SlowCancellationAecProcessor()
+
+        let task = Task {
+            try await MeetingRawAudioPostProcessor.prepare(
+                raw,
+                aec: MeetingNeuralAec(preloadedProcessor: processor),
+                supportDirectory: support
+            )
+        }
+        while processor.processedFrameCount == 0 {
+            await Task.yield()
+        }
+        task.cancel()
+
+        do {
+            let staged = try await task.value
+            MeetingProcessingCapture.discard(staged)
+            Issue.record("Expected post-processing cancellation")
+        } catch is CancellationError {
+            // Expected: cancellation is observed between bounded AEC blocks.
+        } catch {
+            Issue.record("Expected CancellationError, got \(error)")
+        }
+
+        #expect(processor.processedFrameCount < samples.count / processor.frameSize)
+        #expect(FileManager.default.fileExists(atPath: raw.manifestURL.path))
+    }
+
     private func chunk(
         samples: [Int16],
         timestamp: UInt64
@@ -99,5 +143,25 @@ private final class DirectionalAecProcessor: MeetingAecProcessor {
             nonZeroReferenceFrames += 1
         }
         return zip(mic, reference).map(-)
+    }
+}
+
+private final class SlowCancellationAecProcessor: MeetingAecProcessor, @unchecked Sendable {
+    let name = "test-slow-cancellation"
+    let frameSize = 256
+    let sampleRate = 16_000
+    private let lock = NSLock()
+    private var _processedFrameCount = 0
+
+    var processedFrameCount: Int {
+        lock.withLock { _processedFrameCount }
+    }
+
+    func reset() {}
+
+    func processFrame(mic: [Float], reference: [Float]) throws -> [Float] {
+        lock.withLock { _processedFrameCount += 1 }
+        Thread.sleep(forTimeInterval: 0.001)
+        return mic
     }
 }

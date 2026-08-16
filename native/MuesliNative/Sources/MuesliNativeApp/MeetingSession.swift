@@ -1113,6 +1113,9 @@ final class MeetingSession: @unchecked Sendable {
         guard let stagedRawAudio else {
             throw MeetingRawAudioCaptureError.missingManifest
         }
+        // Raw capture is finalized before cancellation is observed so an
+        // interrupted quit always leaves a recoverable canonical recording.
+        try Task.checkCancellation()
         var stagedAudio = try await MeetingRawAudioPostProcessor.prepare(
             stagedRawAudio,
             aec: neuralAec,
@@ -1141,6 +1144,7 @@ final class MeetingSession: @unchecked Sendable {
                 )
             }
         }
+        try Task.checkCancellation()
         stagedAudio = try MeetingProcessingCapture.markProcessing(stagedAudio)
         let finalBackend = currentBackend()
         if finalBackend.backend == BackendOption.nemotron35Multilingual.backend {
@@ -1161,6 +1165,7 @@ final class MeetingSession: @unchecked Sendable {
             enablePostProcessor: false,
             includeMeetingHelpers: finalBackend.backend == BackendOption.homanWhisper.backend
         )
+        try Task.checkCancellation()
         onProgress?(.transcribingAudio)
         fputs("[meeting] processing canonical microphone and system sources with \(finalBackend.label)\n", stderr)
         let pipelineResult = try await MeetingTranscriptionPipeline(
@@ -1176,6 +1181,7 @@ final class MeetingSession: @unchecked Sendable {
             purpose: .final,
             systemDiarization: .optionalPost
         )
+        try Task.checkCancellation()
         guard let processedUnit = pipelineResult.units.first else {
             throw MeetingTranscriptionPipelineError.emptyTranscript
         }
@@ -1219,6 +1225,7 @@ final class MeetingSession: @unchecked Sendable {
         }
 
         let visualContext = await screenContextCollector.stopAndDrain()
+        try Task.checkCancellation()
         Self.logger.info("visual context drained chars=\(visualContext.count) includedInPrompt=\(!visualContext.isEmpty) useOCR=\(self.config.useCoreAudioTap)")
         fputs("[meeting] visual context drained chars=\(visualContext.count) includedInPrompt=\(!visualContext.isEmpty) useOCR=\(config.useCoreAudioTap)\n", stderr)
         stagedAudio = try MeetingProcessingCapture.markState(.summarizing, for: stagedAudio)

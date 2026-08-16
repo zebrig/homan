@@ -1,11 +1,12 @@
 #include "LocalVQEBridge.h"
+#include "LocalVQEExceptionGuard.h"
 
 #include <dlfcn.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-typedef uintptr_t localvqe_ctx_t;
+typedef muesli_localvqe_context_handle_t localvqe_ctx_t;
 typedef uintptr_t localvqe_options_t;
 
 typedef localvqe_options_t (*localvqe_options_new_fn)(void);
@@ -16,7 +17,7 @@ typedef int (*localvqe_options_set_threads_fn)(localvqe_options_t, int);
 typedef localvqe_ctx_t (*localvqe_new_with_options_fn)(localvqe_options_t);
 typedef void (*localvqe_free_fn)(localvqe_ctx_t);
 typedef void (*localvqe_reset_fn)(localvqe_ctx_t);
-typedef int (*localvqe_process_frame_f32_fn)(localvqe_ctx_t, const float *, const float *, int, float *);
+typedef muesli_localvqe_process_frame_callback_t localvqe_process_frame_f32_fn;
 typedef int (*localvqe_sample_rate_fn)(localvqe_ctx_t);
 typedef int (*localvqe_hop_length_fn)(localvqe_ctx_t);
 typedef const char *(*localvqe_last_error_fn)(localvqe_ctx_t);
@@ -189,7 +190,17 @@ int muesli_localvqe_process_frame_f32(
         context_error(context, "LocalVQE frame pointers must be non-null");
         return -102;
     }
-    int result = context->process_frame_f32(context->localvqe, mic, reference, hop_samples, output);
+    context->error[0] = '\0';
+    int result = muesli_localvqe_call_process_frame_guarded(
+        context->process_frame_f32,
+        context->localvqe,
+        mic,
+        reference,
+        hop_samples,
+        output,
+        context->error,
+        sizeof(context->error)
+    );
     if (result == 0) {
         context->error[0] = '\0';
     }
