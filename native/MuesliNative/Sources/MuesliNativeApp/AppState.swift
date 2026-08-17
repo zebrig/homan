@@ -156,6 +156,9 @@ final class AppState {
     var liveMeetingPartialOthers: String = ""
     var meetingLiveState: MeetingLiveRuntimeState = .off(selection: .parakeetRealtimeEOU)
     var meetingLiveDiarizationState = MeetingLiveDiarizationRuntimeState.off()
+    /// Resolved shared speaker-model selection for future meetings, owned by
+    /// `MuesliController.reconcileMeetingDiarizationSelection`.
+    var meetingDiarizationSelection: MeetingDiarizationSelection?
     var activeMeetingAudioWarning: ActiveMeetingAudioWarning?
     var activeMeetingMicrophone: ActiveMeetingMicrophoneState?
     var dictationState: DictationState = .idle

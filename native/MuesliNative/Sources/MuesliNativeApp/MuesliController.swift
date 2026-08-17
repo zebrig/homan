@@ -853,6 +853,10 @@ final class MuesliController: NSObject {
             }
         }
 
+        Task { @MainActor [weak self] in
+            await self?.reconcileMeetingDiarizationSelection(trigger: .startup)
+        }
+
         if !canRunMainApp {
             if let progress = OnboardingProgress.load() {
                 showOnboarding(resumeFrom: progress)
@@ -6651,7 +6655,8 @@ final class MuesliController: NSObject {
 
     func installMeetingDiarizationModel(
         profileID: MeetingDiarizationProfileID,
-        progress: @escaping @Sendable (ModelPreparationProgress) -> Void
+        progress: @escaping @Sendable (ModelPreparationProgress) -> Void,
+        trigger: MeetingDiarizationSelectionTrigger = .install
     ) async throws {
         guard !isMeetingRecording(),
               !isStartingMeetingRecording,
@@ -6667,6 +6672,7 @@ final class MuesliController: NSObject {
             profileID: profileID,
             progress: progress
         )
+        await reconcileMeetingDiarizationSelection(trigger: trigger)
     }
 
     func removeMeetingDiarizationModel(
@@ -6685,6 +6691,51 @@ final class MuesliController: NSObject {
         try await transcriptionCoordinator.removeMeetingDiarizationModel(
             profileID: profileID
         )
+        await reconcileMeetingDiarizationSelection(trigger: .remove)
+    }
+
+    // MARK: - Diarization selection reconciliation
+
+    private var diarizationSelectionGeneration: UInt64 = 0
+    private var lastDiarizationSelection: MeetingDiarizationSelection?
+
+    /// Serialized, controller-owned reconciliation of the shared speaker-model
+    /// selection. Views read the published state but never write selection.
+    @discardableResult
+    @MainActor
+    func reconcileMeetingDiarizationSelection(
+        trigger: MeetingDiarizationSelectionTrigger = .startup
+    ) async -> MeetingDiarizationSelection {
+        diarizationSelectionGeneration &+= 1
+        let generation = diarizationSelectionGeneration
+        let catalog = MeetingDiarizationModelCatalog.loadBundled()
+        let statuses = await transcriptionCoordinator.meetingDiarizationAssetStatuses()
+        let decision = MeetingDiarizationReconciliation.plan(
+            catalog: catalog,
+            statuses: statuses,
+            storedModelID: config.meetingFinalDiarizationProfile,
+            liveDefaultEnabled: config.meetingLiveDiarizationEnabledByDefault,
+            generation: generation
+        )
+
+        if decision.shouldPersistSelection || decision.normalizeLiveOff {
+            updateConfig {
+                if let storedModelID = decision.storedModelID {
+                    $0.meetingFinalDiarizationProfile = storedModelID
+                }
+                if decision.normalizeLiveOff {
+                    $0.meetingLiveDiarizationEnabledByDefault = false
+                }
+            }
+        }
+
+        guard generation == diarizationSelectionGeneration else {
+            return lastDiarizationSelection ?? decision.selection
+        }
+        lastDiarizationSelection = decision.selection
+        syncAppState()
+        appState.meetingDiarizationSelection = decision.selection
+        return decision.selection
     }
 
     func persistImportedAudioMeeting(

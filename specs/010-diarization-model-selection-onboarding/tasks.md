@@ -5,9 +5,11 @@
 **Prerequisites**: approval of `spec.md`, `flows-and-ux.md`, `plan.md`, `data-model.md`, and
 `contracts/model-selection.md`
 
-**Implementation status**: Milestone A and Milestone B core (T001–T004, T006–T009) are
-implemented in `MeetingDiarizationModelCatalog.swift`, `MeetingDiarizationModelSelection.swift`,
-and their tests. Reconciliation ownership (T010–T012) and all later milestones remain pending.
+**Implementation status**: Milestones A and B (T001–T012) are implemented in
+`MeetingDiarizationModelCatalog.swift`, `MeetingDiarizationModelSelection.swift`,
+`MeetingDiarizationReconciliation.swift`, and their tests. `MuesliController` owns
+reconciliation and calls it after startup, install/update/retry, and remove commits; views only
+read the published state. Milestone C and later remain pending.
 
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
@@ -35,11 +37,11 @@ because the app builds.
   transition reason without a fallback model constant.
 - [x] T009 Cover the full generic truth table, idempotence, malformed/unknown/retired values, and
   synthetic catalogs containing 0, 1, 2, 3, and 10 descriptors.
-- [ ] T010 Add a serialized controller-owned reconciliation operation with stale-generation
+- [x] T010 Add a serialized controller-owned reconciliation operation with stale-generation
   rejection.
-- [ ] T011 Invoke reconciliation after startup validation and successful install/update/retry/
+- [x] T011 Invoke reconciliation after startup validation and successful install/update/retry/
   remove/repair/lifecycle commits; prove views do not own selection writes.
-- [ ] T012 Normalize Live default Off transactionally when a Final-only profile is selected.
+- [x] T012 Normalize Live default Off transactionally when a Final-only profile is selected.
 
 ## Milestone C - Compatibility and concrete run capture
 

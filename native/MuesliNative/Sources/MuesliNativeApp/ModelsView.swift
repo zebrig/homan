@@ -642,17 +642,17 @@ struct ModelsView: View {
             do {
                 if replacingExisting {
                     do {
-                        try await installSpeakerModelFiles(profile)
+                        try await installSpeakerModelFiles(profile, trigger: .retry)
                     } catch is CancellationError {
                         throw CancellationError()
                     } catch MeetingDiarizationAssetError.captureActive {
                         throw MeetingDiarizationAssetError.captureActive
                     } catch {
                         try await controller.removeMeetingDiarizationModel(profileID: profile)
-                        try await installSpeakerModelFiles(profile)
+                        try await installSpeakerModelFiles(profile, trigger: .retry)
                     }
                 } else {
-                    try await installSpeakerModelFiles(profile)
+                    try await installSpeakerModelFiles(profile, trigger: .install)
                 }
             } catch is CancellationError {
                 // The user or application shutdown cancelled an explicit install.
@@ -665,7 +665,8 @@ struct ModelsView: View {
     }
 
     private func installSpeakerModelFiles(
-        _ profile: MeetingDiarizationProfileID
+        _ profile: MeetingDiarizationProfileID,
+        trigger: MeetingDiarizationSelectionTrigger
     ) async throws {
         try await controller.installMeetingDiarizationModel(
             profileID: profile,
@@ -676,7 +677,8 @@ struct ModelsView: View {
                         1
                     )
                 }
-            }
+            },
+            trigger: trigger
         )
     }
 
