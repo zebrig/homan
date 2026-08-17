@@ -1461,12 +1461,10 @@ struct MeetingsNavigationTests {
         #expect(controller.appState.config.meetingTranscriptionModel == BackendOption.whisperLargeTurbo.model)
     }
 
-    @Test("selecting Gemma dictation replaces conflicting Gemma cleanup")
-    func selectingGemmaDictationReplacesGemmaCleanup() {
+    @Test("selecting Gemma dictation keeps the cleanup backend")
+    func selectingGemmaDictationKeepsCleanupBackend() {
         let controller = makeController()
-        controller.selectPostProcessorBackend(.gemma4LiteRT)
-
-        #expect(controller.appState.selectedPostProcessorBackend == .gemma4LiteRT)
+        controller.selectPostProcessorBackend(.local)
 
         controller.selectBackend(.gemma4E2BLiteRT)
 
@@ -1475,13 +1473,13 @@ struct MeetingsNavigationTests {
         #expect(controller.appState.config.postProcessorBackend == TranscriptCleanupBackendOption.local.backend)
     }
 
-    @Test("startup repairs a persisted Gemma dictation and cleanup conflict")
-    func startupRepairsPersistedGemmaConflict() {
+    @Test("startup falls a removed cleanup backend back to Local")
+    func startupFallsRemovedCleanupBackendBackToLocal() {
         let configStore = ConfigStore(supportDirectory: makeSupportDirectory())
         var config = AppConfig()
         config.sttBackend = BackendOption.gemma4E2BLiteRT.backend
         config.sttModel = BackendOption.gemma4E2BLiteRT.model
-        config.postProcessorBackend = TranscriptCleanupBackendOption.gemma4LiteRT.backend
+        config.postProcessorBackend = "gemma4-litert"
         config.enablePostProcessor = true
         configStore.save(config)
         let persistedConfig = configStore.load()
@@ -1492,7 +1490,6 @@ struct MeetingsNavigationTests {
 
         #expect(controller.selectedPostProcessorBackend == .local)
         #expect(controller.config.postProcessorBackend == TranscriptCleanupBackendOption.local.backend)
-        #expect(!controller.config.enablePostProcessor)
         #expect(controller.selectedBackend == .gemma4E2BLiteRT)
     }
 

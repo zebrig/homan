@@ -105,22 +105,14 @@ struct Gemma4LiteRTTranscriberTests {
         #expect(!BackendOption.onboarding.contains(.gemma4E2BLiteRT))
     }
 
-    @available(macOS 15, *)
-    @Test("gemma4 cleanup reuses the managed model and excludes Gemma ASR")
-    func gemma4CleanupCompatibility() {
-        let cleanup = TranscriptCleanupBackendOption.gemma4LiteRT
-
-        #expect(cleanup.isOnDevice)
-        #expect(cleanup.isGemma4LiteRT)
-        #expect(cleanup.backend == BackendOption.gemma4E2BLiteRT.backend)
-        #expect(TranscriptCleanupBackendOption.resolved(cleanup.backend) == cleanup)
-        #expect(TranscriptCleanupClient.defaultModel(for: cleanup) == Gemma4LiteRTModelStore.repoID)
-        #expect(cleanup.isCompatible(with: .parakeetMultilingual))
-        #expect(!cleanup.isCompatible(with: .gemma4E2BLiteRT))
-        #expect(TranscriptCleanupBackendOption.available(for: .parakeetMultilingual).contains(cleanup))
-        #expect(!TranscriptCleanupBackendOption.available(for: .gemma4E2BLiteRT).contains(cleanup))
-        #expect(TranscriptCleanupBackendOption.available(for: .gemma4E2BLiteRT).contains(.local))
-        #expect(Gemma4LiteRTTranscriber.maxCleanupOutputTokens == 1024)
+    @Test("gemma4 stays a dictation-only experimental backend")
+    func gemma4DictationOnly() {
+        #expect(BackendOption.gemma4E2BLiteRT.backend == "gemma4-litert")
+        #expect(
+            !TranscriptCleanupBackendOption.all.contains {
+                $0.backend == BackendOption.gemma4E2BLiteRT.backend
+            }
+        )
     }
 
     @Test("gemma4 model store uses env override and detects local file")

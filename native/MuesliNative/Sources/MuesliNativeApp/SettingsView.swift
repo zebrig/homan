@@ -218,11 +218,6 @@ struct SettingsView: View {
                 ? "Download a cleanup model from Models to refine dictations on this Mac."
                 : "Refines dictated text on this Mac."
         }
-        if appState.selectedPostProcessorBackend == .gemma4LiteRT {
-            return Gemma4LiteRTModelStore.isAvailableLocally()
-                ? "Uses the downloaded Gemma 4 model to refine dictated text on this Mac."
-                : "Download Gemma 4 E2B from Models to use it for cleanup."
-        }
         return "Sends dictated text to \(appState.selectedPostProcessorBackend.label) and may add latency."
     }
 
@@ -1099,21 +1094,6 @@ struct SettingsView: View {
                                 controller.selectPostProcessor(option)
                             }
                         }
-                    }
-                }
-            } else if appState.selectedPostProcessorBackend == .gemma4LiteRT {
-                Divider().background(MuesliTheme.surfaceBorder)
-                settingsRow("Cleanup model", controlWidth: meetingControlWidth) {
-                    if Gemma4LiteRTModelStore.isAvailableLocally() {
-                        Text("Gemma 4 E2B (Downloaded)")
-                            .font(.system(size: 12, weight: .medium))
-                            .foregroundStyle(MuesliTheme.textSecondary)
-                            .frame(width: meetingControlWidth, alignment: .trailing)
-                    } else {
-                        compactActionButton("View Gemma model", systemImage: "arrow.right") {
-                            controller.showModels(category: .postProcessing)
-                        }
-                        .frame(width: meetingControlWidth, alignment: .trailing)
                     }
                 }
             } else {

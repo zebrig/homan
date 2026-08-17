@@ -728,16 +728,7 @@ struct ModelsView: View {
             if showExperimental {
                 VStack(spacing: MuesliTheme.spacing12) {
                     ForEach(BackendOption.experimental, id: \.model) { option in
-                        if !appState.selectedPostProcessorBackend.isCompatible(with: option) {
-                            modelCard(
-                                option: option,
-                                logo: logoForBackend(option),
-                                downloadedLabel: "Used for Cleanup",
-                                activationDisabledReason: "Unavailable while Gemma 4 is selected for cleanup. Choose another cleanup backend first."
-                            )
-                        } else {
-                            modelCard(option: option, logo: logoForBackend(option))
-                        }
+                        modelCard(option: option, logo: logoForBackend(option))
                     }
                 }
             }
@@ -792,8 +783,6 @@ struct ModelsView: View {
             .padding(.top, MuesliTheme.spacing8)
 
             VStack(spacing: MuesliTheme.spacing12) {
-                gemmaCleanupModelCard
-
                 ForEach(PostProcessorOption.all) { option in
                     postProcModelCard(option)
                 }
@@ -861,29 +850,6 @@ struct ModelsView: View {
         let fm = FileManager.default
         try? fm.removeItem(at: model.cacheDirectory)
         try? fm.removeItem(at: AppPaths.stateFileURL(for: model.downloadStateID))
-    }
-
-    private var gemmaCleanupModelCard: some View {
-        let option = BackendOption.gemma4E2BLiteRT
-        let isDownloaded = downloadedModels.contains(option.model)
-        let isCompatible = TranscriptCleanupBackendOption.gemma4LiteRT
-            .isCompatible(with: appState.selectedBackend)
-
-        return modelCard(
-            option: option,
-            logo: "google-logo",
-            isActive: isDownloaded && appState.selectedPostProcessorBackend == .gemma4LiteRT,
-            onSetActive: {
-                controller.selectPostProcessorBackend(.gemma4LiteRT)
-            },
-            description: "On-device Gemma cleanup for filler removal, formatting, and transcript correction. Shares one download with the experimental Gemma dictation backend.",
-            activeLabel: "Cleanup Active",
-            downloadedLabel: isCompatible ? "Downloaded" : "Used for Dictation",
-            actionTitle: "Use for Cleanup",
-            activationDisabledReason: isCompatible
-                ? nil
-                : "Unavailable while Gemma 4 is selected for dictation. Choose another dictation model first."
-        )
     }
 
     private func postProcModelCard(_ option: PostProcessorOption) -> some View {

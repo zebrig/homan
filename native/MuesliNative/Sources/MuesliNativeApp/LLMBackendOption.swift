@@ -28,18 +28,11 @@ struct TranscriptCleanupBackendOption: Equatable, Identifiable {
 
     var id: String { backend }
     var isLocal: Bool { self == .local }
-    var isGemma4LiteRT: Bool { self == .gemma4LiteRT }
-    var isOnDevice: Bool { isLocal || isGemma4LiteRT }
+    var isOnDevice: Bool { isLocal }
 
     static let local = TranscriptCleanupBackendOption(
         backend: "local",
         label: "Local Model",
-        llmBackend: nil
-    )
-
-    static let gemma4LiteRT = TranscriptCleanupBackendOption(
-        backend: "gemma4-litert",
-        label: "Gemma 4 E2B",
         llmBackend: nil
     )
 
@@ -51,10 +44,10 @@ struct TranscriptCleanupBackendOption: Equatable, Identifiable {
         )
     }
 
-    static let all: [TranscriptCleanupBackendOption] = [.local, .gemma4LiteRT] + LLMBackendOption.all.map(hosted)
+    static let all: [TranscriptCleanupBackendOption] = [.local] + LLMBackendOption.all.map(hosted)
 
     func isCompatible(with transcriptionBackend: BackendOption) -> Bool {
-        !(isGemma4LiteRT && transcriptionBackend.backend == BackendOption.gemma4E2BLiteRT.backend)
+        true
     }
 
     static func available(for transcriptionBackend: BackendOption) -> [TranscriptCleanupBackendOption] {

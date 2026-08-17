@@ -2521,9 +2521,6 @@ final class MuesliController: NSObject {
         if selectedPostProcessorBackend == .local {
             return option != nil
         }
-        if selectedPostProcessorBackend == .gemma4LiteRT {
-            return Gemma4LiteRTModelStore.isAvailableLocally()
-        }
         return TranscriptCleanupClient.hasRequiredSettings(
             for: selectedPostProcessorBackend,
             config: config,
@@ -2551,12 +2548,6 @@ final class MuesliController: NSObject {
                 showModels(category: .postProcessing)
                 return
             }
-        }
-        if enabled, selectedPostProcessorBackend == .gemma4LiteRT,
-           !Gemma4LiteRTModelStore.isAvailableLocally() {
-            updateConfig { $0.enablePostProcessor = false }
-            showModels(category: .postProcessing)
-            return
         }
         updateConfig { $0.enablePostProcessor = enabled }
         preloadExperimentalTranscriptionFeatures()
@@ -2607,12 +2598,6 @@ final class MuesliController: NSObject {
                 showModels(category: .postProcessing)
                 return
             }
-        }
-        if option == .gemma4LiteRT, config.enablePostProcessor,
-           !Gemma4LiteRTModelStore.isAvailableLocally() {
-            updateConfig { $0.enablePostProcessor = false }
-            showModels(category: .postProcessing)
-            return
         }
         preloadExperimentalTranscriptionFeatures()
     }

@@ -462,28 +462,24 @@ struct PostProcessorOptionTests {
 @Suite("TranscriptCleanupBackendOption")
 struct TranscriptCleanupBackendOptionTests {
 
-    @Test("Gemma cleanup is unavailable only for Gemma dictation")
-    func gemmaCleanupCompatibility() {
-        #expect(!TranscriptCleanupBackendOption.gemma4LiteRT.isCompatible(with: .gemma4E2BLiteRT))
-
-        for backend in BackendOption.all where backend != .gemma4E2BLiteRT {
-            #expect(TranscriptCleanupBackendOption.gemma4LiteRT.isCompatible(with: backend))
-        }
+    @Test("Gemma 4 is no longer a cleanup backend")
+    func gemma4IsNotACleanupBackend() {
+        #expect(
+            !TranscriptCleanupBackendOption.all.contains {
+                $0.backend == BackendOption.gemma4E2BLiteRT.backend
+            }
+        )
+        #expect(
+            TranscriptCleanupBackendOption.resolved(BackendOption.gemma4E2BLiteRT.backend)
+                == .local
+        )
     }
 
-    @Test("Other cleanup backends remain available for Gemma dictation")
-    func otherCleanupBackendsRemainCompatible() {
-        for backend in TranscriptCleanupBackendOption.all where backend != .gemma4LiteRT {
+    @Test("cleanup backends are all compatible with Gemma dictation")
+    func cleanupBackendsCompatibleWithGemmaDictation() {
+        for backend in TranscriptCleanupBackendOption.all {
             #expect(backend.isCompatible(with: .gemma4E2BLiteRT))
         }
-    }
-
-    @Test("Available cleanup options exclude only conflicting Gemma cleanup")
-    func availableOptionsExcludeGemmaConflict() {
-        let available = TranscriptCleanupBackendOption.available(for: .gemma4E2BLiteRT)
-
-        #expect(!available.contains(.gemma4LiteRT))
-        #expect(available.count == TranscriptCleanupBackendOption.all.count - 1)
     }
 }
 
