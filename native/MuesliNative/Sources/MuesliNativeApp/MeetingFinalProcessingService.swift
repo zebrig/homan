@@ -116,7 +116,11 @@ enum MeetingFinalProcessingService {
 
         let finalDiarizationPolicy = MeetingDiarizationPolicyResolver.resolveCaptured(
             enabled: stagedAudio.manifest.finalDiarizationEnabled,
-            profileRawValue: stagedAudio.manifest.finalDiarizationProfileID
+            profileRawValue: stagedAudio.manifest.finalDiarizationProfileID,
+            safeFallbackProfile: MeetingDiarizationCompatibility.capturedProfileID(
+                profileRawValue: stagedAudio.manifest.finalDiarizationProfileID,
+                catalog: MeetingDiarizationModelCatalog.loadBundled()
+            )
         )
 
         let transcription = try await MeetingTranscriptionPipeline(

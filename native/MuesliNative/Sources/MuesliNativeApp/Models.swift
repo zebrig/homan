@@ -2067,8 +2067,18 @@ struct AppConfig: Codable {
         MeetingAecModel.resolved(meetingAecModel)
     }
 
-    var resolvedMeetingFinalDiarizationProfile: MeetingDiarizationProfileID {
+    /// Shared semantic accessor for the persisted diarization profile value.
+    /// The key stays `meeting_final_diarization_profile` for downgrade
+    /// tolerance; new captures store the open catalog stable ID in the same
+    /// field and resolve here through the legacy enum or the safe fallback.
+    var resolvedMeetingDiarizationProfile: MeetingDiarizationProfileID {
         MeetingDiarizationProfileID(rawValue: meetingFinalDiarizationProfile) ?? .automatic
+    }
+
+    /// Compatibility-only alias kept for call sites that predate the shared
+    /// selection model. Prefer `resolvedMeetingDiarizationProfile`.
+    var resolvedMeetingFinalDiarizationProfile: MeetingDiarizationProfileID {
+        resolvedMeetingDiarizationProfile
     }
 }
 

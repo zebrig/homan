@@ -109,6 +109,30 @@ enum MeetingDiarizationCompatibility {
             $0.legacyAliases.contains(MeetingDiarizationProfileID.offlineQuality.rawValue)
         }?.id
     }
+
+    /// Resolves a captured manifest profile value back to the legacy profile
+    /// used by the processing pipeline. Legacy raw values pass through
+    /// unchanged; spec-010 stable IDs map through their catalog alias; unknown
+    /// future values fall back safely without crashing or rewriting evidence.
+    static func capturedProfileID(
+        profileRawValue: String?,
+        catalog: MeetingDiarizationCatalogSnapshot,
+        safeFallbackProfile: MeetingDiarizationProfileID = .automatic
+    ) -> MeetingDiarizationProfileID {
+        guard let rawValue = profileRawValue else {
+            return safeFallbackProfile
+        }
+        if let legacy = MeetingDiarizationProfileID(rawValue: rawValue) {
+            return legacy
+        }
+        guard let descriptor = catalog.descriptors.first(
+            where: { $0.id.rawValue == rawValue }
+        ), let alias = descriptor.legacyAliases.first,
+        let legacy = MeetingDiarizationProfileID(rawValue: alias) else {
+            return safeFallbackProfile
+        }
+        return legacy
+    }
 }
 
 enum MeetingDiarizationCatalogError: Error, Equatable, Sendable {

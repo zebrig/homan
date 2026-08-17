@@ -41,10 +41,19 @@ public enum MeetingDiarizationRunMode: Sendable, Equatable {
 public struct ResolvedMeetingDiarizationPolicy: Codable, Sendable, Equatable {
     public let enabled: Bool
     public let profileID: MeetingDiarizationProfileID
+    /// Open catalog stable ID captured for a new run, when the run was started
+    /// by a build with the spec-010 selection model. Nil for legacy runs and
+    /// for compatibility-only resolution. Never used to reinterpret evidence.
+    public let concreteModelID: String?
 
-    public init(enabled: Bool, profileID: MeetingDiarizationProfileID) {
+    public init(
+        enabled: Bool,
+        profileID: MeetingDiarizationProfileID,
+        concreteModelID: String? = nil
+    ) {
         self.enabled = enabled
         self.profileID = profileID
+        self.concreteModelID = concreteModelID
     }
 }
 
@@ -62,7 +71,8 @@ public enum MeetingDiarizationPolicyResolver {
         }
         return ResolvedMeetingDiarizationPolicy(
             enabled: enabled,
-            profileID: preference?.preferredProfileID ?? globalProfileID
+            profileID: preference?.preferredProfileID ?? globalProfileID,
+            concreteModelID: nil
         )
     }
 
@@ -71,10 +81,11 @@ public enum MeetingDiarizationPolicyResolver {
         profileRawValue: String?,
         safeFallbackProfile: MeetingDiarizationProfileID = .automatic
     ) -> ResolvedMeetingDiarizationPolicy {
-        ResolvedMeetingDiarizationPolicy(
+        let parsed = profileRawValue.flatMap(MeetingDiarizationProfileID.init(rawValue:))
+        return ResolvedMeetingDiarizationPolicy(
             enabled: enabled ?? false,
-            profileID: profileRawValue.flatMap(MeetingDiarizationProfileID.init(rawValue:))
-                ?? safeFallbackProfile
+            profileID: parsed ?? safeFallbackProfile,
+            concreteModelID: parsed == nil ? profileRawValue : nil
         )
     }
 }

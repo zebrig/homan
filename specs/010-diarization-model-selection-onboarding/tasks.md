@@ -5,11 +5,12 @@
 **Prerequisites**: approval of `spec.md`, `flows-and-ux.md`, `plan.md`, `data-model.md`, and
 `contracts/model-selection.md`
 
-**Implementation status**: Milestones A and B (T001–T012) are implemented in
+**Implementation status**: Milestones A–C (T001–T018) are implemented in
 `MeetingDiarizationModelCatalog.swift`, `MeetingDiarizationModelSelection.swift`,
-`MeetingDiarizationReconciliation.swift`, and their tests. `MuesliController` owns
-reconciliation and calls it after startup, install/update/retry, and remove commits; views only
-read the published state. Milestone C and later remain pending.
+`MeetingDiarizationReconciliation.swift`, capture types, and their tests. New runs capture the
+concrete open stable ID (or disabled when nothing is selectable); recovery maps captured stable
+IDs back through the catalog and unknown future values fail safely. Milestone D and later remain
+pending.
 
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
@@ -45,15 +46,15 @@ because the app builds.
 
 ## Milestone C - Compatibility and concrete run capture
 
-- [ ] T013 Add a shared semantic config accessor while retaining the existing persisted JSON key.
-- [ ] T014 Bridge future global `.automatic` through its historical catalog alias and then the
+- [x] T013 Add a shared semantic config accessor while retaining the existing persisted JSON key.
+- [x] T014 Bridge future global `.automatic` through its historical catalog alias and then the
   generic zero/one/many rules without modifying any meeting/evidence record.
-- [ ] T015 Keep historical `.automatic` definition resolution and profile digest checks unchanged;
+- [x] T015 Keep historical `.automatic` definition resolution and profile digest checks unchanged;
   add fixtures for legacy manifests and completed evidence.
-- [ ] T016 Require a concrete open stable ID/descriptor revision or disabled/unavailable/
+- [x] T016 Require a concrete open stable ID/descriptor revision or disabled/unavailable/
   choice-required state for every new meeting/run capture.
-- [ ] T017 Verify recovery uses the captured profile even after Settings or installed assets change.
-- [ ] T018 Verify old/downgraded builds fail safely rather than crash on unknown future stable IDs,
+- [x] T017 Verify recovery uses the captured profile even after Settings or installed assets change.
+- [x] T018 Verify old/downgraded builds fail safely rather than crash on unknown future stable IDs,
   while current/legacy IDs and old evidence remain compatible.
 
 ## Milestone D - Capability-aware Final and Live runtime

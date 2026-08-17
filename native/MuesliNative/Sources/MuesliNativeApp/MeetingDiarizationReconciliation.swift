@@ -2,6 +2,7 @@ import Foundation
 
 enum MeetingDiarizationSelectionTrigger: String, Sendable, Equatable {
     case startup
+    case meetingStart
     case install
     case update
     case retry

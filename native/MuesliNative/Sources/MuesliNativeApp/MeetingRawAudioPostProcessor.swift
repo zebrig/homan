@@ -67,9 +67,7 @@ enum MeetingRawAudioPostProcessor {
             indicASRLanguage: manifest.indicASRLanguage.flatMap(IndicASRLanguage.init(rawValue:)),
             nemotron35Language: manifest.nemotron35Language.flatMap(Nemotron35Language.init(rawValue:)),
             finalDiarizationEnabled: manifest.finalDiarizationEnabled,
-            finalDiarizationProfileID: manifest.finalDiarizationProfileID.flatMap(
-                MeetingDiarizationProfileID.init(rawValue:)
-            ),
+            finalDiarizationProfileID: manifest.finalDiarizationProfileID,
             supportDirectory: supportDirectory
         )
 

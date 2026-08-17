@@ -340,7 +340,7 @@ final class MeetingSession: @unchecked Sendable {
         finalDiarizationPolicyStorage.withLock { $0 = policy }
         try? rawAudioCapture?.setFinalDiarizationPolicy(
             enabled: policy.enabled,
-            profileID: policy.profileID
+            profileRawValue: policy.concreteModelID ?? policy.profileID.rawValue
         )
     }
 
@@ -385,7 +385,10 @@ final class MeetingSession: @unchecked Sendable {
                 indicASRLanguage: config.resolvedIndicASRLanguage,
                 nemotron35Language: config.resolvedNemotron35Language,
                 finalDiarizationEnabled: finalDiarizationPolicy.enabled,
-                finalDiarizationProfileID: finalDiarizationPolicy.profileID,
+                finalDiarizationProfileID: finalDiarizationPolicy.enabled
+                    ? (finalDiarizationPolicy.concreteModelID
+                        ?? finalDiarizationPolicy.profileID.rawValue)
+                    : nil,
                 supportDirectory: processingSupportDirectory
             )
             capture.onFailure = { [weak self] error in

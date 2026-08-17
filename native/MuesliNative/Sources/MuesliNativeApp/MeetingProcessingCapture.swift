@@ -112,7 +112,7 @@ final class MeetingProcessingCapture: @unchecked Sendable {
         indicASRLanguage: IndicASRLanguage? = nil,
         nemotron35Language: Nemotron35Language? = nil,
         finalDiarizationEnabled: Bool? = nil,
-        finalDiarizationProfileID: MeetingDiarizationProfileID? = nil,
+        finalDiarizationProfileID: String? = nil,
         supportDirectory: URL = AppIdentity.supportDirectoryURL
     ) throws {
         let root = supportDirectory
@@ -151,7 +151,7 @@ final class MeetingProcessingCapture: @unchecked Sendable {
                 indicASRLanguage: indicASRLanguage?.rawValue,
                 nemotron35Language: nemotron35Language?.rawValue,
                 finalDiarizationEnabled: finalDiarizationEnabled,
-                finalDiarizationProfileID: finalDiarizationProfileID?.rawValue,
+                finalDiarizationProfileID: finalDiarizationProfileID,
                 timelinePolicy: .activeCaptureCompacted,
                 preprocessing: .current,
                 sampleFormat: MeetingRecordingPreprocessingDescriptor.current.sampleFormat

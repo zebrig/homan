@@ -176,7 +176,7 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
         indicASRLanguage: IndicASRLanguage? = nil,
         nemotron35Language: Nemotron35Language? = nil,
         finalDiarizationEnabled: Bool? = nil,
-        finalDiarizationProfileID: MeetingDiarizationProfileID? = nil,
+        finalDiarizationProfileID: String? = nil,
         supportDirectory: URL = AppIdentity.supportDirectoryURL,
         segmentDuration: TimeInterval = 60,
         discontinuityTolerance: TimeInterval = 0.020,
@@ -226,7 +226,7 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
             indicASRLanguage: indicASRLanguage?.rawValue,
             nemotron35Language: nemotron35Language?.rawValue,
             finalDiarizationEnabled: finalDiarizationEnabled,
-            finalDiarizationProfileID: finalDiarizationProfileID?.rawValue,
+            finalDiarizationProfileID: finalDiarizationProfileID,
             microphoneEpochs: [],
             systemEpochs: []
         )
@@ -263,12 +263,12 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
 
     func setFinalDiarizationPolicy(
         enabled: Bool,
-        profileID: MeetingDiarizationProfileID
+        profileRawValue: String
     ) throws {
         try writerQueue.sync {
             guard !state.isFinalized, !state.isDiscarded else { return }
             state.manifest.finalDiarizationEnabled = enabled
-            state.manifest.finalDiarizationProfileID = profileID.rawValue
+            state.manifest.finalDiarizationProfileID = profileRawValue
             try writeManifest(state.manifest)
         }
     }

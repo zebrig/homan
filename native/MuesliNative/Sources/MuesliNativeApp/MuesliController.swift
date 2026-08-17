@@ -5167,16 +5167,25 @@ final class MuesliController: NSObject {
             return
         }
         meetingRecoveryInFlightIDs.insert(meetingID)
+        let recoveryCatalog = MeetingDiarizationModelCatalog.loadBundled()
         let recoveryDiarizationPolicy: ResolvedMeetingDiarizationPolicy = {
             if let stagedRawAudio {
                 return MeetingDiarizationPolicyResolver.resolveCaptured(
                     enabled: stagedRawAudio.manifest.finalDiarizationEnabled,
-                    profileRawValue: stagedRawAudio.manifest.finalDiarizationProfileID
+                    profileRawValue: stagedRawAudio.manifest.finalDiarizationProfileID,
+                    safeFallbackProfile: MeetingDiarizationCompatibility.capturedProfileID(
+                        profileRawValue: stagedRawAudio.manifest.finalDiarizationProfileID,
+                        catalog: recoveryCatalog
+                    )
                 )
             }
             return MeetingDiarizationPolicyResolver.resolveCaptured(
                 enabled: legacyStagedAudio?.manifest.finalDiarizationEnabled,
-                profileRawValue: legacyStagedAudio?.manifest.finalDiarizationProfileID
+                profileRawValue: legacyStagedAudio?.manifest.finalDiarizationProfileID,
+                safeFallbackProfile: MeetingDiarizationCompatibility.capturedProfileID(
+                    profileRawValue: legacyStagedAudio?.manifest.finalDiarizationProfileID,
+                    catalog: recoveryCatalog
+                )
             )
         }()
         let processingRunID: UUID
@@ -6857,6 +6866,10 @@ final class MuesliController: NSObject {
         try Task.checkCancellation()
         try checkMeetingStartStillCurrent(meetingID)
 
+        let selection = await reconcileMeetingDiarizationSelection(
+            trigger: .meetingStart
+        )
+
         while true {
             try Task.checkCancellation()
             try checkMeetingStartStillCurrent(meetingID)
@@ -6877,8 +6890,9 @@ final class MuesliController: NSObject {
                 config: config,
                 templateSnapshot: templateSnapshot,
                 transcriptionCoordinator: transcriptionCoordinator,
-                finalDiarizationPolicy: resolvedFinalDiarizationPolicy(
-                    meetingID: meetingID
+                finalDiarizationPolicy: capturedFinalDiarizationPolicy(
+                    meetingID: meetingID,
+                    selection: selection
                 ),
                 processingSupportDirectory: processingSupportDirectory,
                 meetingMicRecorder: meetingMicRecorder
@@ -9219,6 +9233,31 @@ final class MuesliController: NSObject {
             globalProfileID: config.resolvedMeetingFinalDiarizationProfile,
             preference: preference
         )
+    }
+
+    /// Captures the concrete open stable ID for a new run. When no concrete
+    /// model is selectable (unavailable or choice-required), the run capture
+    /// records speaker analysis as disabled; the stored user preference is
+    /// preserved and may be satisfied by a later Re-transcribe/Re-diarize.
+    private func capturedFinalDiarizationPolicy(
+        meetingID: Int64,
+        selection: MeetingDiarizationSelection
+    ) -> ResolvedMeetingDiarizationPolicy {
+        let policy = resolvedFinalDiarizationPolicy(meetingID: meetingID)
+        switch selection.state {
+        case .selected:
+            return ResolvedMeetingDiarizationPolicy(
+                enabled: policy.enabled,
+                profileID: policy.profileID,
+                concreteModelID: selection.profileID?.rawValue
+            )
+        case .unavailable, .choiceRequired:
+            return ResolvedMeetingDiarizationPolicy(
+                enabled: false,
+                profileID: policy.profileID,
+                concreteModelID: nil
+            )
+        }
     }
 
     private func resolveRetranscriptionDiarization(
