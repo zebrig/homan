@@ -90,6 +90,7 @@ enum MeetingDiarizationAssetError: Error, LocalizedError {
     case incomplete(String)
     case incompatible(String)
     case invalidPLDA
+    case unsupportedLiveModel(String)
     case captureActive
 
     var errorDescription: String? {
@@ -102,6 +103,8 @@ enum MeetingDiarizationAssetError: Error, LocalizedError {
             return "The installed \(name) speaker model is not compatible with this Homan profile."
         case .invalidPLDA:
             return "The Offline quality speaker model has invalid PLDA parameters."
+        case .unsupportedLiveModel(let name):
+            return "This model doesn't support Live speaker diarization: \(name)."
         case .captureActive:
             return "Speaker model installation was stopped because a meeting recording started. Try again after recording finishes."
         }

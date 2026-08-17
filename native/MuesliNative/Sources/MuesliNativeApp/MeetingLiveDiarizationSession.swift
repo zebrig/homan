@@ -20,8 +20,11 @@ actor MeetingLiveDiarizationEngine {
         self.assets = assets
     }
 
-    func prepare() async throws {
-        let definition = MeetingDiarizationProfiles.resolve(.stableFourSpeaker)
+    func prepare(profileID: MeetingDiarizationProfileID) async throws {
+        let definition = MeetingDiarizationProfiles.resolve(profileID)
+        guard definition.engineID == .sortformerBalanced else {
+            throw MeetingDiarizationAssetError.unsupportedLiveModel(definition.displayName)
+        }
         let ready = try await assets.requireReady(definition)
         try Task.checkCancellation()
         var timelineConfig = DiarizerTimelineConfig.sortformerDefault

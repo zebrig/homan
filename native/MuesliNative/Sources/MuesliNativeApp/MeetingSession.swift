@@ -245,6 +245,10 @@ final class MeetingSession: @unchecked Sendable {
     private let liveDiarizationStorage = OSAllocatedUnfairLock(
         initialState: LiveDiarizationStorage()
     )
+    /// Captured at meeting start from the shared selection. Nil callers fall
+    /// back to the legacy Stable up to 4 profile; Final-only selections are
+    /// blocked by the Live capability gate before any model work starts.
+    private let liveDiarizationProfileID: MeetingDiarizationProfileID
     /// These fields are owned exclusively by `chunkRotationQueue`.
     private var liveDiarizationEngine: MeetingLiveDiarizationEngine?
     private var liveDiarizationPreparationTask: Task<Void, Never>?
@@ -289,6 +293,7 @@ final class MeetingSession: @unchecked Sendable {
         templateSnapshot: MeetingTemplateSnapshot,
         transcriptionCoordinator: TranscriptionCoordinator,
         finalDiarizationPolicy: ResolvedMeetingDiarizationPolicy? = nil,
+        liveDiarizationProfileID: MeetingDiarizationProfileID? = nil,
         processingSupportDirectory: URL = AppIdentity.supportDirectoryURL,
         meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder(),
         inferenceScheduler: MeetingInferenceScheduler = .shared
@@ -307,6 +312,8 @@ final class MeetingSession: @unchecked Sendable {
                 profileID: config.resolvedMeetingFinalDiarizationProfile
             )
         )
+        let capturedLiveProfileID = liveDiarizationProfileID ?? .stableFourSpeaker
+        self.liveDiarizationProfileID = capturedLiveProfileID
         self.processingSupportDirectory = processingSupportDirectory
         self.meetingMicRecorder = meetingMicRecorder
         self.inferenceScheduler = inferenceScheduler
@@ -315,7 +322,14 @@ final class MeetingSession: @unchecked Sendable {
             $0.state = .off(selection: config.resolvedMeetingLiveASRModelID)
         }
         liveDiarizationStorage.withLock {
-            $0.state = .off()
+            $0.state = MeetingLiveDiarizationRuntimeState(
+                enabled: false,
+                phase: .off,
+                epoch: 0,
+                profileID: capturedLiveProfileID,
+                message: nil,
+                droppedAudioSeconds: 0
+            )
         }
         if config.useCoreAudioTap {
             self.systemAudioRecorder = CoreAudioSystemRecorder()
@@ -464,6 +478,30 @@ final class MeetingSession: @unchecked Sendable {
 
     private func startLiveDiarization() {
         guard chunkRotationQueue.sync(execute: { isRecording }) else { return }
+        guard MeetingDiarizationProfiles.resolve(liveDiarizationProfileID)
+            .engineID == .sortformerBalanced else {
+            let failed = liveDiarizationStorage.withLock {
+                storage -> MeetingLiveDiarizationRuntimeState? in
+                guard storage.state.phase == .off || storage.state.phase == .failed else {
+                    return nil
+                }
+                let epoch = storage.state.epoch &+ 1
+                storage.activity.removeAll()
+                storage.state = MeetingLiveDiarizationRuntimeState(
+                    enabled: false,
+                    phase: .failed,
+                    epoch: epoch,
+                    profileID: liveDiarizationProfileID,
+                    message: "This model doesn't support Live speaker diarization.",
+                    droppedAudioSeconds: 0
+                )
+                return storage.state
+            }
+            if let failed {
+                publishLiveDiarizationState(failed)
+            }
+            return
+        }
         let loading = liveDiarizationStorage.withLock {
             storage -> MeetingLiveDiarizationRuntimeState? in
             guard storage.state.phase == .off || storage.state.phase == .failed else {
@@ -493,7 +531,7 @@ final class MeetingSession: @unchecked Sendable {
         let preparationTask = Task.detached(priority: .userInitiated) { [weak self, engine] in
             guard let self else { return }
             do {
-                try await engine.prepare()
+                try await engine.prepare(profileID: self.liveDiarizationProfileID)
                 self.chunkRotationQueue.async { [weak self, engine] in
                     guard let self else {
                         Task { await engine.stop() }

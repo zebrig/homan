@@ -1073,6 +1073,7 @@ struct MeetingDetailView: View {
                 )
                 .labelsHidden()
                 .toggleStyle(.switch)
+                .disabled(!capturedLiveDiarizationSupported(diarizationState))
             }
 
             HStack(spacing: MuesliTheme.spacing8) {
@@ -1229,6 +1230,9 @@ struct MeetingDetailView: View {
         }
         switch state.phase {
         case .off:
+            if !capturedLiveDiarizationSupported(state) {
+                return "This model doesn't support Live speaker diarization."
+            }
             return "Independent from Live transcription. Final speaker separation follows this meeting’s Final setting."
         case .loading:
             return "Loading the installed Stable up to 4 model. Earlier audio is not backfilled."
@@ -1241,6 +1245,12 @@ struct MeetingDetailView: View {
         case .failed:
             return "Install or repair Stable up to 4 in Models, then enable this again. Raw recording and captions are unaffected."
         }
+    }
+
+    private func capturedLiveDiarizationSupported(
+        _ state: MeetingLiveDiarizationRuntimeState
+    ) -> Bool {
+        MeetingDiarizationProfiles.resolve(state.profileID).engineID == .sortformerBalanced
     }
 
     @ViewBuilder

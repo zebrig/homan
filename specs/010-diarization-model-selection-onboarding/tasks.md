@@ -7,10 +7,11 @@
 
 **Implementation status**: Milestones A–C (T001–T018) are implemented in
 `MeetingDiarizationModelCatalog.swift`, `MeetingDiarizationModelSelection.swift`,
-`MeetingDiarizationReconciliation.swift`, capture types, and their tests. New runs capture the
-concrete open stable ID (or disabled when nothing is selectable); recovery maps captured stable
-IDs back through the catalog and unknown future values fail safely. Milestone D and later remain
-pending.
+`MeetingDiarizationReconciliation.swift`, capture types, runtime, and their tests. New runs capture
+the concrete open stable ID (or disabled when nothing is selectable); recovery maps captured stable
+IDs back through the catalog and unknown future values fail safely. Live preparation is
+capability-gated on the captured profile with a typed unsupported-Live error. Milestone E and later
+remain pending.
 
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
@@ -59,17 +60,17 @@ because the app builds.
 
 ## Milestone D - Capability-aware Final and Live runtime
 
-- [ ] T019 Change Live engine preparation to accept an exact captured stable ID/descriptor and use
+- [x] T019 Change Live engine preparation to accept an exact captured stable ID/descriptor and use
   its allowlisted adapter.
-- [ ] T020 Add typed unsupported-Live, unsupported-adapter, and missing/invalid-asset errors; never
+- [x] T020 Add typed unsupported-Live, unsupported-adapter, and missing/invalid-asset errors; never
   substitute one model for another.
-- [ ] T021 Capture Live profile/capability at meeting start independently of Final On/Off policy.
-- [ ] T022 Disable active-meeting Live speaker control for every captured descriptor with
+- [x] T021 Capture Live profile/capability at meeting start independently of Final On/Off policy.
+- [x] T022 Disable active-meeting Live speaker control for every captured descriptor with
   `supportsLive == false` or unavailable state and show the exact required message.
-- [ ] T023 Preserve Live ASR/raw recording on every Live capability/asset/preparation failure.
-- [ ] T024 Keep one-time Re-transcribe/Re-diarize choices independent and filter them to ready
+- [x] T023 Preserve Live ASR/raw recording on every Live capability/asset/preparation failure.
+- [x] T024 Keep one-time Re-transcribe/Re-diarize choices independent and filter them to ready
   concrete profiles.
-- [ ] T025 Prove Homan Whisper Final uses the captured shared profile through the existing local
+- [x] T025 Prove Homan Whisper Final uses the captured shared profile through the existing local
   diarization stage.
 
 ## Milestone E - Models and Settings UX

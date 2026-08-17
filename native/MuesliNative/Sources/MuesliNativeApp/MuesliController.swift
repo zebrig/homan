@@ -6894,6 +6894,9 @@ final class MuesliController: NSObject {
                     meetingID: meetingID,
                     selection: selection
                 ),
+                liveDiarizationProfileID: capturedLiveDiarizationProfileID(
+                    selection: selection
+                ),
                 processingSupportDirectory: processingSupportDirectory,
                 meetingMicRecorder: meetingMicRecorder
             )
@@ -9258,6 +9261,27 @@ final class MuesliController: NSObject {
                 concreteModelID: nil
             )
         }
+    }
+
+    /// Captured Live profile for a new session. When the shared selection is a
+    /// Live-capable descriptor, its legacy pipeline profile is used; otherwise
+    /// nil lets the session fall back to the legacy Stable up to 4 gate so the
+    /// exact capability message or a not-installed error is surfaced without
+    /// touching Live ASR or raw recording.
+    private func capturedLiveDiarizationProfileID(
+        selection: MeetingDiarizationSelection
+    ) -> MeetingDiarizationProfileID? {
+        guard selection.state == .selected,
+              let modelID = selection.profileID,
+              let descriptor = selection.readyAlternatives.first(
+                where: { $0.id == modelID }
+              ),
+              descriptor.capabilities.supportsLive,
+              let alias = descriptor.legacyAliases.first,
+              let legacy = MeetingDiarizationProfileID(rawValue: alias) else {
+            return nil
+        }
+        return legacy
     }
 
     private func resolveRetranscriptionDiarization(

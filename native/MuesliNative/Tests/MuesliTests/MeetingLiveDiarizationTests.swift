@@ -1,3 +1,4 @@
+import Foundation
 import MuesliCore
 import Testing
 @testable import MuesliNativeApp
@@ -73,5 +74,44 @@ struct MeetingLiveDiarizationTests {
             end: 1,
             activity: internalLabel
         ) == "Others")
+    }
+
+    @Test("only the Sortformer adapter is accepted for Live preparation")
+    func livePreparationRequiresSortformerAdapter() {
+        #expect(
+            MeetingDiarizationProfiles.resolve(.stableFourSpeaker).engineID
+                == .sortformerBalanced
+        )
+        #expect(
+            MeetingDiarizationProfiles.resolve(.offlineQuality).engineID
+                != .sortformerBalanced
+        )
+    }
+
+    @Test("Final-only models throw the typed unsupported-Live error")
+    func finalOnlyModelRejectedForLive() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-live-gate-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let engine = MeetingLiveDiarizationEngine(
+            assets: MeetingDiarizationAssetStore(rootURL: root)
+        )
+
+        do {
+            try await engine.prepare(profileID: .offlineQuality)
+            Issue.record("expected unsupportedLiveModel")
+        } catch let error as MeetingDiarizationAssetError {
+            guard case .unsupportedLiveModel(let name) = error else {
+                Issue.record("unexpected error: \(error)")
+                return
+            }
+            #expect(name == "Offline quality")
+            #expect(
+                error.localizedDescription
+                    == "This model doesn't support Live speaker diarization: Offline quality."
+            )
+        } catch {
+            Issue.record("unexpected error type: \(error)")
+        }
     }
 }
