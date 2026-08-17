@@ -22,6 +22,7 @@ struct ModelsView: View {
 
     // Local meeting-speaker model state
     @State private var speakerAssetStatuses: [MeetingDiarizationAssetStatus] = []
+    @State private var speakerAssetsLoaded = false
     @State private var speakerInstallProgress: [MeetingDiarizationProfileID: Double] = [:]
     @State private var speakerModelToDelete: MeetingDiarizationProfileID?
     @State private var speakerModelError: String?
@@ -94,6 +95,11 @@ struct ModelsView: View {
         }
         .onChange(of: appState.selectedBackend.model) { _, _ in
             syncSelectionsFromActiveBackend()
+        }
+        .onChange(of: appState.selectedModelsCategory) { _, category in
+            if category == .speakerSeparation {
+                refreshSpeakerAssets()
+            }
         }
         .alert(
             "Delete \"\(modelToDelete?.label ?? "")\"?",
@@ -496,6 +502,19 @@ struct ModelsView: View {
         let progress = speakerInstallProgress[profile]
         let isReady = status?.state == .ready
         let isBusy = progress != nil || status?.state == .installing
+        let isChecking = !speakerAssetsLoaded
+        let statusText: String
+        if isChecking {
+            statusText = "Checking…"
+        } else if isReady {
+            statusText = "Downloaded"
+        } else if isBusy {
+            statusText = "Downloading"
+        } else if status?.state == .failed {
+            statusText = "Needs attention"
+        } else {
+            statusText = "Not downloaded"
+        }
 
         return AnyView(VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
             HStack(alignment: .top, spacing: MuesliTheme.spacing12) {
@@ -538,22 +557,16 @@ struct ModelsView: View {
 
                 Spacer()
 
-                Text(
-                    isReady
-                        ? "Downloaded"
-                        : (isBusy
-                            ? "Downloading"
-                            : (status?.state == .failed
-                                ? "Needs attention"
-                                : "Not downloaded"))
-                )
+                Text(statusText)
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(
-                        isReady
-                            ? MuesliTheme.success
-                            : (status?.state == .failed
-                                ? Color.orange
-                                : MuesliTheme.textTertiary)
+                        isChecking
+                            ? MuesliTheme.textTertiary
+                            : (isReady
+                                ? MuesliTheme.success
+                                : (status?.state == .failed
+                                    ? Color.orange
+                                    : MuesliTheme.textTertiary))
                     )
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
@@ -586,7 +599,7 @@ struct ModelsView: View {
                     .font(.system(size: 12, weight: .medium))
                     .foregroundStyle(.red.opacity(0.75))
                     .disabled(appState.isMeetingRecording || appState.isMeetingStarting)
-                } else if !isBusy {
+                } else if !isBusy && !isChecking {
                     Button(status?.state == .failed ? "Retry installation" : "Install") {
                         installSpeakerModel(
                             profile,
@@ -623,6 +636,7 @@ struct ModelsView: View {
     private func refreshSpeakerAssets() {
         Task {
             speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
+            speakerAssetsLoaded = true
         }
     }
 
