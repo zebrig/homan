@@ -84,6 +84,54 @@ struct OnboardingProgressTests {
         #expect(decoded.modelDownloadStatus == "189 MB of 450 MB")
     }
 
+    @Test("schema 5 round-trips speaker-separation intent and progress")
+    func schema5RoundTripsDiarizationIntent() throws {
+        let progress = OnboardingProgress(
+            currentStep: 1,
+            userName: "Test User",
+            selectedBackendKey: "fluidaudio",
+            selectedModelKey: "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+            hotkeyKeyCode: 55,
+            hotkeyLabel: "Left Cmd",
+            selectedDiarizationModelID: "homan.diarization.offline-quality.v2",
+            diarizationModelDownloadProgress: 0.33,
+            diarizationModelDownloadStatus: "33%"
+        )
+
+        let data = try JSONEncoder().encode(progress)
+        let decoded = try JSONDecoder().decode(OnboardingProgress.self, from: data)
+
+        #expect(decoded.schemaVersion == OnboardingProgress.currentSchemaVersion)
+        #expect(decoded.selectedDiarizationModelID == "homan.diarization.offline-quality.v2")
+        #expect(decoded.diarizationModelDownloadProgress == 0.33)
+        #expect(decoded.diarizationModelDownloadStatus == "33%")
+    }
+
+    @Test("schema 4 payload decodes with nil diarization fields")
+    func schema4DecodesWithoutDiarization() throws {
+        let json = """
+        {
+          "schemaVersion": 4,
+          "currentStep": 3,
+          "userName": "Legacy",
+          "selectedBackendKey": "fluidaudio",
+          "selectedModelKey": "FluidInference/parakeet-tdt-0.6b-v3-coreml",
+          "hotkeyKeyCode": 55,
+          "hotkeyLabel": "Left Cmd"
+        }
+        """
+
+        let progress = try JSONDecoder().decode(
+            OnboardingProgress.self,
+            from: Data(json.utf8)
+        )
+
+        #expect(progress.schemaVersion == 4)
+        #expect(progress.selectedDiarizationModelID == nil)
+        #expect(progress.diarizationModelDownloadProgress == nil)
+        #expect(progress.diarizationModelDownloadStatus == nil)
+    }
+
     @Test("meeting permissions do not block dictation step resume")
     func meetingPermissionsDoNotBlockDictationResume() {
         let permissions = OnboardingPermissionSnapshot(

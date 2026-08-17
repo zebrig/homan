@@ -46,7 +46,7 @@ enum OnboardingPermissionGate {
 }
 
 struct OnboardingProgress: Codable {
-    static let currentSchemaVersion = 4
+    static let currentSchemaVersion = 5
 
     var schemaVersion: Int = currentSchemaVersion
     var currentStep: Int
@@ -60,6 +60,9 @@ struct OnboardingProgress: Codable {
     var onboardingUseCaseRawValue: String = OnboardingUseCase.dictation.rawValue
     var modelDownloadProgress: Double?
     var modelDownloadStatus: String?
+    var selectedDiarizationModelID: String?
+    var diarizationModelDownloadProgress: Double?
+    var diarizationModelDownloadStatus: String?
 
     init(
         schemaVersion: Int = currentSchemaVersion,
@@ -73,7 +76,10 @@ struct OnboardingProgress: Codable {
         systemAudioRequested: Bool = false,
         onboardingUseCaseRawValue: String = OnboardingUseCase.dictation.rawValue,
         modelDownloadProgress: Double? = nil,
-        modelDownloadStatus: String? = nil
+        modelDownloadStatus: String? = nil,
+        selectedDiarizationModelID: String? = nil,
+        diarizationModelDownloadProgress: Double? = nil,
+        diarizationModelDownloadStatus: String? = nil
     ) {
         self.schemaVersion = schemaVersion
         self.currentStep = currentStep
@@ -87,6 +93,9 @@ struct OnboardingProgress: Codable {
         self.onboardingUseCaseRawValue = OnboardingUseCase.resolved(onboardingUseCaseRawValue).rawValue
         self.modelDownloadProgress = modelDownloadProgress
         self.modelDownloadStatus = modelDownloadStatus
+        self.selectedDiarizationModelID = selectedDiarizationModelID
+        self.diarizationModelDownloadProgress = diarizationModelDownloadProgress
+        self.diarizationModelDownloadStatus = diarizationModelDownloadStatus
     }
 
     init(from decoder: Decoder) throws {
@@ -107,6 +116,18 @@ struct OnboardingProgress: Codable {
         ).rawValue
         modelDownloadProgress = try c.decodeIfPresent(Double.self, forKey: .modelDownloadProgress)
         modelDownloadStatus = try c.decodeIfPresent(String.self, forKey: .modelDownloadStatus)
+        selectedDiarizationModelID = try c.decodeIfPresent(
+            String.self,
+            forKey: .selectedDiarizationModelID
+        )
+        diarizationModelDownloadProgress = try c.decodeIfPresent(
+            Double.self,
+            forKey: .diarizationModelDownloadProgress
+        )
+        diarizationModelDownloadStatus = try c.decodeIfPresent(
+            String.self,
+            forKey: .diarizationModelDownloadStatus
+        )
     }
 
     private static var fileURL: URL {

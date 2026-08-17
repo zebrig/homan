@@ -59,6 +59,13 @@ struct OnboardingView: View {
     @State private var modelReadyIndicatorBackend: BackendOption?
     @State private var modelReadyIndicatorTask: Task<Void, Never>?
 
+    // Optional speaker-separation model chosen on the model step.
+    @State private var selectedDiarizationModelID: String?
+    @State private var diarizationDownloadProgress: Double?
+    @State private var diarizationDownloadStatus: String?
+    @State private var diarizationDownloadError: String?
+    @State private var diarizationDownloadTask: Task<Void, Never>?
+
     // Google Calendar
     @State private var isSigningInGoogleCal = false
     @State private var googleCalSignInDone = false
@@ -102,7 +109,8 @@ struct OnboardingView: View {
         initialUseCase: OnboardingUseCase = .dictationAndMeetings,
         initialSummaryBackend: MeetingSummaryBackendOption = .gemmaLocal,
         initialModelDownloadProgress: Double? = nil,
-        initialModelDownloadStatus: String? = nil
+        initialModelDownloadStatus: String? = nil,
+        initialDiarizationModelID: String? = nil
     ) {
         self.controller = controller
         self.appState = appState
@@ -139,6 +147,7 @@ struct OnboardingView: View {
         _summaryBackend = State(initialValue: initialSummaryBackend)
         _modelDownloadProgress = State(initialValue: initialModelDownloadProgress)
         _modelDownloadStatus = State(initialValue: initialModelDownloadStatus)
+        _selectedDiarizationModelID = State(initialValue: initialDiarizationModelID)
         _micGranted = State(initialValue: initialMicGranted)
         _accessibilityGranted = State(initialValue: initialAccessibilityGranted)
         _inputMonitoringGranted = State(initialValue: initialInputMonitoringGranted)
@@ -607,12 +616,114 @@ struct OnboardingView: View {
                     if selectedBackend.backend == BackendOption.cohereTranscribe.backend {
                         cohereLanguageCard
                     }
+
+                    if selectedUseCase.includesMeetings {
+                        onboardingSpeakerSeparationSection
+                    }
                 }
                 .padding(.horizontal, MuesliTheme.spacing32)
             }
 
+            if diarizationDownloadError != nil || diarizationDownloadStatus != nil {
+                onboardingDiarizationStatus
+            }
         }
         .frame(maxWidth: .infinity)
+    }
+
+    private var onboardingSpeakerSeparationSection: some View {
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+            Text("Speaker separation")
+                .font(.system(size: 13, weight: .semibold))
+                .foregroundStyle(MuesliTheme.textPrimary)
+
+            Text("Optional local model that labels remote speakers in meeting transcripts. If one model is downloaded, Homan selects it automatically.")
+                .font(MuesliTheme.caption())
+                .foregroundStyle(MuesliTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            onboardingDiarizationChoiceButton(title: "Not now", descriptorID: nil)
+
+            ForEach(catalogSpeakerDescriptors, id: \.id) { descriptor in
+                onboardingDiarizationChoiceButton(
+                    title: descriptor.displayName,
+                    detail: descriptor.detailText,
+                    descriptorID: descriptor.id.rawValue
+                )
+            }
+        }
+        .padding(MuesliTheme.spacing16)
+        .background(MuesliTheme.backgroundRaised)
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium))
+        .overlay(
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium)
+                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+        )
+    }
+
+    private func onboardingDiarizationChoiceButton(
+        title: String,
+        detail: String? = nil,
+        descriptorID: String?
+    ) -> some View {
+        let isSelected = selectedDiarizationModelID == descriptorID
+        return Button {
+            selectedDiarizationModelID = descriptorID
+            diarizationDownloadError = nil
+        } label: {
+            HStack(spacing: MuesliTheme.spacing8) {
+                Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundStyle(
+                        isSelected ? MuesliTheme.accent : MuesliTheme.textTertiary
+                    )
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundStyle(MuesliTheme.textPrimary)
+                    if let detail {
+                        Text(detail)
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MuesliTheme.textTertiary)
+                    }
+                }
+                Spacer(minLength: 0)
+            }
+            .padding(.horizontal, MuesliTheme.spacing12)
+            .padding(.vertical, MuesliTheme.spacing8)
+            .background(MuesliTheme.surfacePrimary)
+            .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+        }
+        .buttonStyle(.plain)
+    }
+
+    private var onboardingDiarizationStatus: some View {
+        HStack(spacing: MuesliTheme.spacing8) {
+            if diarizationDownloadError == nil {
+                ProgressView()
+                    .controlSize(.small)
+            }
+            Text(
+                diarizationDownloadError
+                    ?? diarizationDownloadStatus
+                    ?? "Preparing speaker model…"
+            )
+            .font(MuesliTheme.caption())
+            .foregroundStyle(
+                diarizationDownloadError == nil
+                    ? MuesliTheme.textSecondary
+                    : MuesliTheme.recording
+            )
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, MuesliTheme.spacing32)
+        .padding(.bottom, MuesliTheme.spacing8)
+    }
+
+    private var catalogSpeakerDescriptors: [MeetingDiarizationModelDescriptor] {
+        MeetingDiarizationModelCatalog.loadBundled().descriptors.filter {
+            $0.isSelectable && $0.legacyProfileID != nil
+        }
     }
 
     private var cohereLanguageCard: some View {
@@ -1057,7 +1168,10 @@ struct OnboardingView: View {
             systemAudioRequested: systemAudioGranted,
             onboardingUseCaseRawValue: selectedUseCase.rawValue,
             modelDownloadProgress: modelDownloadProgress,
-            modelDownloadStatus: modelDownloadStatus
+            modelDownloadStatus: modelDownloadStatus,
+            selectedDiarizationModelID: selectedDiarizationModelID,
+            diarizationModelDownloadProgress: diarizationDownloadProgress,
+            diarizationModelDownloadStatus: diarizationDownloadStatus
         )
         OnboardingProgress.save(progress)
     }
@@ -1601,7 +1715,54 @@ struct OnboardingView: View {
 
     private func startDownload() {
         ensureModelDownloadStarted()
+        startDiarizationDownloadIfNeeded()
         goToNextStep()
+    }
+
+    private func startDiarizationDownloadIfNeeded() {
+        guard let rawID = selectedDiarizationModelID,
+              diarizationDownloadTask == nil else { return }
+        guard let descriptor = catalogSpeakerDescriptors.first(
+            where: { $0.id.rawValue == rawID }
+        ), let profileID = descriptor.legacyProfileID else { return }
+
+        diarizationDownloadProgress = 0
+        diarizationDownloadStatus = "Downloading \(descriptor.displayName)…"
+        diarizationDownloadError = nil
+
+        diarizationDownloadTask = Task {
+            defer {
+                Task { @MainActor in
+                    diarizationDownloadTask = nil
+                }
+            }
+            do {
+                try await controller.installMeetingDiarizationModel(
+                    profileID: profileID,
+                    progress: { update in
+                        Task { @MainActor in
+                            diarizationDownloadProgress = update.fractionCompleted
+                        }
+                    },
+                    trigger: .install
+                )
+                await MainActor.run {
+                    diarizationDownloadProgress = 1
+                    diarizationDownloadStatus = "\(descriptor.displayName) ready"
+                    diarizationDownloadError = nil
+                }
+            } catch is CancellationError {
+                await MainActor.run {
+                    diarizationDownloadStatus = nil
+                }
+            } catch {
+                await MainActor.run {
+                    diarizationDownloadProgress = nil
+                    diarizationDownloadStatus = nil
+                    diarizationDownloadError = error.localizedDescription
+                }
+            }
+        }
     }
 
     private func startDictationTestMonitorIfReady() {

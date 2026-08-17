@@ -80,7 +80,8 @@ final class OnboardingWindowController: NSObject, NSWindowDelegate {
                 initialUseCase: OnboardingUseCase.resolved(progress.onboardingUseCaseRawValue),
                 initialSummaryBackend: .gemmaLocal,
                 initialModelDownloadProgress: progress.modelDownloadProgress,
-                initialModelDownloadStatus: progress.modelDownloadStatus
+                initialModelDownloadStatus: progress.modelDownloadStatus,
+                initialDiarizationModelID: progress.selectedDiarizationModelID
             )
         } else {
             rootView = OnboardingView(

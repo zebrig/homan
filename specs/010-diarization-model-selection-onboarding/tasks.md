@@ -12,7 +12,9 @@ the concrete open stable ID (or disabled when nothing is selectable); recovery m
 IDs back through the catalog and unknown future values fail safely. Live preparation is
 capability-gated on the captured profile with a typed unsupported-Live error. Models is a
 catalog-driven asset manager and Settings owns zero/one/many model choice with the exact Live
-capability message. Milestones F–H remain pending.
+capability message. Onboarding schema 5 persists speaker-separation intent and the Wizard model
+step offers a catalog-driven optional download with Not now; the durable actor coordinator
+(T035–T042, T045, T049–T052) remains pending behind the pragmatic background-download approach.
 
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
@@ -110,16 +112,16 @@ because the app builds.
 
 ## Milestone G - Onboarding persistence and UI
 
-- [ ] T043 Bump `OnboardingProgress` to schema 5 with selected diarization intent and plan state;
+- [x] T043 Bump `OnboardingProgress` to schema 5 with selected diarization intent and plan state;
   preserve schema 1–4 decoding.
-- [ ] T044 Update `OnboardingWindowController` resume reconstruction and permission-repair path.
+- [x] T044 Update `OnboardingWindowController` resume reconstruction and permission-repair path.
 - [ ] T045 Replace the SwiftUI-owned single-backend task with observation/control of the app-owned
   preparation session.
-- [ ] T046 Rename the model-step heading and add Transcription/Speaker separation sections only for
+- [x] T046 Rename the model-step heading and add Transcription/Speaker separation sections only for
   relevant use cases.
-- [ ] T047 Add Not now plus catalog-driven onboarding-eligible single-choice cards, recommendation,
+- [x] T047 Add Not now plus catalog-driven onboarding-eligible single-choice cards, recommendation,
   capability/constraint/status copy, and no model-specific view branch or implicit selection.
-- [ ] T048 Make Download & Continue construct/persist/start the complete plan before advancing.
+- [x] T048 Make Download & Continue construct/persist/start the complete plan before advancing.
 - [ ] T049 Transfer the complete remaining plan to controller ownership on Wizard completion rather
   than reconstructing only the primary backend.
 - [ ] T050 Add relaunch tests that distrust saved percentage and revalidate authoritative stores.
