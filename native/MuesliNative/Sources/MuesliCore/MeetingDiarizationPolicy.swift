@@ -82,7 +82,8 @@ public enum MeetingDiarizationPolicyResolver {
 public enum MeetingProcessingRunPlan {
     public static func phases(
         operation: MeetingProcessingOperation,
-        diarizationMode: MeetingDiarizationRunMode = .disabled
+        diarizationMode: MeetingDiarizationRunMode = .disabled,
+        resumingAt resumePhase: MeetingProcessingPhase? = nil
     ) -> [MeetingProcessingPhase] {
         let analyzes: Bool
         let appliesLabels: Bool
@@ -101,6 +102,7 @@ public enum MeetingProcessingRunPlan {
             appliesLabels = false
         }
 
+        let fullPlan: [MeetingProcessingPhase]
         switch operation {
         case .finalization, .recovery:
             var result: [MeetingProcessingPhase] = [
@@ -115,7 +117,7 @@ public enum MeetingProcessingRunPlan {
                 result.append(.applyingSpeakerLabels)
             }
             result += [.generatingTitle, .summarizing, .encodingRecording, .saving]
-            return result
+            fullPlan = result
         case .retranscription:
             var result: [MeetingProcessingPhase] = [.preparingAudio, .transcribing]
             if analyzes {
@@ -125,9 +127,9 @@ public enum MeetingProcessingRunPlan {
                 result.append(.applyingSpeakerLabels)
             }
             result += [.summarizing, .saving]
-            return result
+            fullPlan = result
         case .rediarization:
-            return [
+            fullPlan = [
                 .preparingAudio,
                 .preparingDiarizer,
                 .diarizing,
@@ -135,7 +137,12 @@ public enum MeetingProcessingRunPlan {
                 .saving,
             ]
         case .resummarization:
-            return [.summarizing, .saving]
+            fullPlan = [.summarizing, .saving]
         }
+        guard let resumePhase,
+              let resumeIndex = fullPlan.firstIndex(of: resumePhase) else {
+            return fullPlan
+        }
+        return Array(fullPlan[resumeIndex...])
     }
 }

@@ -326,6 +326,18 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
         try await homanWhisperBatchClient.transcribe(items: items, requestID: requestID)
     }
 
+    func transcribeMeetingBatch(
+        items: [RemoteMeetingSpeechItem],
+        requestID: UUID,
+        responseCacheURL: URL?
+    ) async throws -> [RemoteMeetingSpeechResult] {
+        try await homanWhisperBatchClient.transcribe(
+            items: items,
+            requestID: requestID,
+            responseCacheURL: responseCacheURL
+        )
+    }
+
     func preloadMeetingHelpers() async {
         await preloadMeetingVAD()
     }

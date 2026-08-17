@@ -347,14 +347,12 @@ final class MeetingProcessingCapture: @unchecked Sendable {
 
     static func recoverableByteCount(
         meetingID: Int64,
-        supportDirectory: URL = AppIdentity.supportDirectoryURL
+        supportDirectory: URL = AppIdentity.supportDirectoryURL,
+        fileManager: FileManager = .default
     ) -> Int64 {
         recoverableSessions(meetingID: meetingID, supportDirectory: supportDirectory)
             .reduce(into: Int64(0)) { total, staged in
-                for url in [staged.microphoneURL, staged.systemURL, staged.manifestURL] {
-                    let attributes = try? FileManager.default.attributesOfItem(atPath: url.path)
-                    total += (attributes?[.size] as? NSNumber)?.int64Value ?? 0
-                }
+                total += directoryByteCount(staged.directoryURL, fileManager: fileManager)
             }
     }
 
@@ -561,5 +559,23 @@ final class MeetingProcessingCapture: @unchecked Sendable {
             try? FileManager.default.removeItem(at: candidate)
             candidate.deleteLastPathComponent()
         }
+    }
+
+    private static func directoryByteCount(
+        _ directory: URL,
+        fileManager: FileManager
+    ) -> Int64 {
+        guard let enumerator = fileManager.enumerator(
+            at: directory,
+            includingPropertiesForKeys: [.fileSizeKey, .isRegularFileKey]
+        ) else { return 0 }
+        var total: Int64 = 0
+        for case let url as URL in enumerator {
+            guard let values = try? url.resourceValues(
+                forKeys: [.fileSizeKey, .isRegularFileKey]
+            ), values.isRegularFile == true else { continue }
+            total += Int64(values.fileSize ?? 0)
+        }
+        return total
     }
 }

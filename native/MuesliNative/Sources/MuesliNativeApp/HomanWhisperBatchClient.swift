@@ -120,6 +120,22 @@ protocol MeetingBatchTranscriptionProviding: Sendable {
         items: [RemoteMeetingSpeechItem],
         requestID: UUID
     ) async throws -> [RemoteMeetingSpeechResult]
+
+    func transcribeMeetingBatch(
+        items: [RemoteMeetingSpeechItem],
+        requestID: UUID,
+        responseCacheURL: URL?
+    ) async throws -> [RemoteMeetingSpeechResult]
+}
+
+extension MeetingBatchTranscriptionProviding {
+    func transcribeMeetingBatch(
+        items: [RemoteMeetingSpeechItem],
+        requestID: UUID,
+        responseCacheURL: URL?
+    ) async throws -> [RemoteMeetingSpeechResult] {
+        try await transcribeMeetingBatch(items: items, requestID: requestID)
+    }
 }
 
 actor HomanWhisperBatchClient {
@@ -151,10 +167,29 @@ actor HomanWhisperBatchClient {
     private struct Response: Decodable {
         struct Item: Decodable {
             struct Segment: Decodable {
-                let id: String
-                let start: Double
-                let end: Double
-                let text: String
+                let id: String?
+                let start: Double?
+                let end: Double?
+                let text: String?
+
+                private enum CodingKeys: String, CodingKey {
+                    case id
+                    case start
+                    case end
+                    case text
+                }
+
+                init(from decoder: Decoder) throws {
+                    let container = try decoder.container(keyedBy: CodingKeys.self)
+                    // The Homan v1 server emits a numeric segment ID. Accept a
+                    // string as well so a representation-only server change
+                    // cannot invalidate an otherwise valid item transcript.
+                    id = (try? container.decode(String.self, forKey: .id))
+                        ?? (try? container.decode(Int.self, forKey: .id)).map(String.init)
+                    start = try? container.decode(Double.self, forKey: .start)
+                    end = try? container.decode(Double.self, forKey: .end)
+                    text = try? container.decode(String.self, forKey: .text)
+                }
             }
 
             let id: String
@@ -163,6 +198,31 @@ actor HomanWhisperBatchClient {
             let end: Double
             let text: String
             let segments: [Segment]?
+
+            private enum CodingKeys: String, CodingKey {
+                case id
+                case source
+                case start
+                case end
+                case text
+                case segments
+            }
+
+            init(from decoder: Decoder) throws {
+                let container = try decoder.container(keyedBy: CodingKeys.self)
+                id = try container.decode(String.self, forKey: .id)
+                source = try container.decode(String.self, forKey: .source)
+                start = try container.decode(Double.self, forKey: .start)
+                end = try container.decode(Double.self, forKey: .end)
+                text = try container.decode(String.self, forKey: .text)
+                // Fine-grained segments are subordinate to the authoritative
+                // item-level transcript. A malformed optional detail must not
+                // invalidate the complete item returned by the server.
+                segments = (try? container.decodeIfPresent(
+                    [Segment].self,
+                    forKey: .segments
+                )) ?? nil
+            }
         }
 
         let schemaVersion: Int
@@ -215,12 +275,17 @@ actor HomanWhisperBatchClient {
 
     func transcribe(
         items: [RemoteMeetingSpeechItem],
-        requestID: UUID
+        requestID: UUID,
+        responseCacheURL: URL? = nil
     ) async throws -> [RemoteMeetingSpeechResult] {
         try await Self.jobQueue.acquire()
         do {
             try Task.checkCancellation()
-            let result = try await transcribeExclusively(items: items, requestID: requestID)
+            let result = try await transcribeExclusively(
+                items: items,
+                requestID: requestID,
+                responseCacheURL: responseCacheURL
+            )
             await Self.jobQueue.release()
             return result
         } catch {
@@ -231,9 +296,19 @@ actor HomanWhisperBatchClient {
 
     private func transcribeExclusively(
         items: [RemoteMeetingSpeechItem],
-        requestID: UUID
+        requestID: UUID,
+        responseCacheURL: URL?
     ) async throws -> [RemoteMeetingSpeechResult] {
         try validate(items: items)
+        if let responseCacheURL,
+           let cachedData = try? Data(contentsOf: responseCacheURL),
+           let cached = try? decode(
+               cachedData,
+               requestID: requestID,
+               requestItems: items
+           ) {
+            return cached
+        }
         try validateCredential()
         let token = apiKey
         let bodyURL = try writeMultipart(items: items, requestID: requestID)
@@ -257,6 +332,12 @@ actor HomanWhisperBatchClient {
                 }
                 switch http.statusCode {
                 case 200:
+                    if let responseCacheURL {
+                        // Checkpointing must never turn a valid server response
+                        // into a transcription failure. A write error merely
+                        // means a later retry cannot reuse these response bytes.
+                        try? persistResponse(data, at: responseCacheURL)
+                    }
                     return try decode(data, requestID: requestID, requestItems: items)
                 case 401:
                     throw HomanWhisperError.unauthorized
@@ -291,6 +372,19 @@ actor HomanWhisperBatchClient {
             try await Task.sleep(for: .seconds(base + jitter))
         }
         throw lastRetryableError ?? HomanWhisperError.serverUnavailable(0)
+    }
+
+    private func persistResponse(_ data: Data, at url: URL) throws {
+        try FileManager.default.createDirectory(
+            at: url.deletingLastPathComponent(),
+            withIntermediateDirectories: true,
+            attributes: [.posixPermissions: 0o700]
+        )
+        try data.write(to: url, options: [.atomic])
+        try FileManager.default.setAttributes(
+            [.posixPermissions: 0o600],
+            ofItemAtPath: url.path
+        )
     }
 
     private func validate(items: [RemoteMeetingSpeechItem]) throws {
@@ -397,7 +491,9 @@ actor HomanWhisperBatchClient {
         do {
             response = try JSONDecoder().decode(Response.self, from: data)
         } catch {
-            throw HomanWhisperError.invalidResponse("malformed JSON")
+            throw HomanWhisperError.invalidResponse(
+                Self.responseDecodingReason(error)
+            )
         }
         guard response.schemaVersion == 1 else {
             throw HomanWhisperError.invalidResponse("unsupported schema")
@@ -421,9 +517,8 @@ actor HomanWhisperBatchClient {
                   abs(item.end - original.end) <= 0.001 else {
                 throw HomanWhisperError.invalidResponse("unknown, duplicate, or changed item")
             }
-            let validatedSegments = try validateResponseSegments(
+            let validatedSegments = validateResponseSegments(
                 item.segments,
-                outerID: item.id,
                 outerStart: original.start,
                 outerEnd: original.end
             )
@@ -455,39 +550,95 @@ actor HomanWhisperBatchClient {
 
     private func validateResponseSegments(
         _ segments: [Response.Item.Segment]?,
-        outerID: String,
         outerStart: TimeInterval,
         outerEnd: TimeInterval
-    ) throws -> [RemoteMeetingSpeechSubsegment]? {
+    ) -> [RemoteMeetingSpeechSubsegment]? {
         guard let segments, !segments.isEmpty else { return nil }
+        let complete = segments.enumerated().compactMap { index, segment -> (
+            id: String,
+            start: Double,
+            end: Double,
+            text: String
+        )? in
+            guard let start = segment.start,
+                  let end = segment.end,
+                  let rawText = segment.text else { return nil }
+            let text = rawText.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard start.isFinite, end.isFinite, end > start, !text.isEmpty else {
+                return nil
+            }
+            let id = segment.id?.trimmingCharacters(in: .whitespacesAndNewlines)
+            let resolvedID = id.flatMap { $0.isEmpty ? nil : $0 }
+                ?? String(format: "segment-%04d", index)
+            return (
+                resolvedID,
+                start,
+                end,
+                text
+            )
+        }
+        // Timestamp-only or malformed optional details cannot safely split the
+        // item text, so use the item as one coarse span instead of failing the
+        // complete transcription.
+        guard complete.count == segments.count else { return nil }
+
+        let duration = outerEnd - outerStart
+        let areRelative = complete.allSatisfy {
+            $0.start >= -0.001 && $0.end <= duration + 0.001
+        }
+        let areAbsolute = complete.allSatisfy {
+            $0.start >= outerStart - 0.001 && $0.end <= outerEnd + 0.001
+        }
+        guard areRelative || areAbsolute else { return nil }
+        // The published Homan v1 contract defines nested timestamps relative
+        // to their item. Accept absolute timestamps only as a compatibility
+        // fallback for older experimental endpoints.
+        let useRelativeCoordinates = areRelative
+
         var ids = Set<String>()
         var previousEnd = outerStart
         var result: [RemoteMeetingSpeechSubsegment] = []
         result.reserveCapacity(segments.count)
-        for segment in segments {
-            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
-            guard !segment.id.isEmpty,
-                  ids.insert(segment.id).inserted,
-                  segment.start.isFinite,
-                  segment.end.isFinite,
-                  segment.start >= outerStart - 0.001,
-                  segment.end <= outerEnd + 0.001,
-                  segment.end > segment.start,
-                  segment.start >= previousEnd - 0.001,
-                  !text.isEmpty else {
-                throw HomanWhisperError.invalidResponse(
-                    "invalid inner segment in \(outerID)"
-                )
-            }
+        for segment in complete {
+            let start = useRelativeCoordinates ? outerStart + segment.start : segment.start
+            let end = useRelativeCoordinates ? outerStart + segment.end : segment.end
+            guard ids.insert(segment.id).inserted,
+                  start >= outerStart - 0.001,
+                  end <= outerEnd + 0.001,
+                  end > start,
+                  start >= previousEnd - 0.001 else { return nil }
             result.append(RemoteMeetingSpeechSubsegment(
                 id: segment.id,
-                start: segment.start,
-                end: segment.end,
-                text: text
+                start: start,
+                end: end,
+                text: segment.text
             ))
-            previousEnd = segment.end
+            previousEnd = end
         }
         return result
+    }
+
+    private static func responseDecodingReason(_ error: Error) -> String {
+        guard let decoding = error as? DecodingError else {
+            return "malformed JSON"
+        }
+        switch decoding {
+        case .dataCorrupted:
+            return "malformed JSON"
+        case .keyNotFound(let key, let context):
+            return "missing required field \(codingPath(context.codingPath + [key]))"
+        case .typeMismatch(_, let context), .valueNotFound(_, let context):
+            return "invalid field \(codingPath(context.codingPath))"
+        @unknown default:
+            return "unsupported JSON schema"
+        }
+    }
+
+    private static func codingPath(_ path: [any CodingKey]) -> String {
+        let value = path.map { key in
+            key.intValue.map { "[\($0)]" } ?? key.stringValue
+        }.joined(separator: ".")
+        return value.isEmpty ? "response" : value.replacingOccurrences(of: ".[", with: "[")
     }
 
     private func boundary(for requestID: UUID) -> String {

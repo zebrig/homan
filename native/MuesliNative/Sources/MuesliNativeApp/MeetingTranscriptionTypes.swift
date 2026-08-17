@@ -167,6 +167,10 @@ struct MeetingTranscriptionRequest: Sendable {
     let diarizationProfileID: MeetingDiarizationProfileID
     let aecModel: MeetingAecModel
     let reusableDiarization: MeetingDiarizationRevision?
+    /// Present only for recovery/finalization from Homan's durable processing
+    /// capture. Homan Whisper may keep its VAD/AAC request checkpoint beside
+    /// that capture so a remote failure resumes without preparing audio again.
+    let persistentRemoteBatchAudio: MeetingStagedAudio?
     let progress: @Sendable (MeetingTranscriptionPipelineStage) -> Void
 
     init(
@@ -178,6 +182,7 @@ struct MeetingTranscriptionRequest: Sendable {
         diarizationProfileID: MeetingDiarizationProfileID = .automatic,
         aecModel: MeetingAecModel = .defaultModel,
         reusableDiarization: MeetingDiarizationRevision? = nil,
+        persistentRemoteBatchAudio: MeetingStagedAudio? = nil,
         progress: @escaping @Sendable (MeetingTranscriptionPipelineStage) -> Void = { _ in }
     ) {
         self.units = units
@@ -188,6 +193,7 @@ struct MeetingTranscriptionRequest: Sendable {
         self.diarizationProfileID = diarizationProfileID
         self.aecModel = aecModel
         self.reusableDiarization = reusableDiarization
+        self.persistentRemoteBatchAudio = persistentRemoteBatchAudio
         self.progress = progress
     }
 }

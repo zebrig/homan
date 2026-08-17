@@ -491,6 +491,66 @@ struct MeetingTranscriptionPipelineTests {
         #expect(Set(result.units[0].recognizedSegments.map(\.id)).count == 2)
     }
 
+    @Test("Homan Whisper retry reuses durable VAD and AAC preparation")
+    func homanWhisperRetryReusesPreparedBatch() async throws {
+        let supportDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-whisper-retry-checkpoint-tests", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: supportDirectory) }
+        let capture = try MeetingProcessingCapture(
+            meetingID: 501,
+            sessionID: UUID(),
+            startedAt: Date(timeIntervalSince1970: 5_000),
+            finalModelID: BackendOption.homanWhisper.asrModelID,
+            supportDirectory: supportDirectory
+        )
+        capture.appendMicrophone([Int16](repeating: 500, count: 1_600))
+        capture.appendSystem([Int16](repeating: 1_000, count: 1_600))
+        let staged = try capture.finalize(
+            endedAt: Date(timeIntervalSince1970: 5_000.1)
+        )
+        let provider = HomanWhisperBatchPipelineProvider()
+        let pipeline = MeetingTranscriptionPipeline(provider: provider)
+
+        _ = try await pipeline.process(
+            stagedAudio: staged,
+            backend: .homanWhisper,
+            languages: .init(),
+            purpose: .recovery,
+            systemDiarization: .disabled
+        )
+        #expect(await provider.speechSegmentationCount == 2)
+        #expect(await provider.batchCount == 1)
+        let firstCheckpoint = try HomanWhisperBatchCheckpoint.load(for: staged)
+        #expect(firstCheckpoint.items.count == 2)
+
+        _ = try await pipeline.process(
+            stagedAudio: staged,
+            backend: .homanWhisper,
+            languages: .init(),
+            purpose: .recovery,
+            systemDiarization: .disabled
+        )
+        #expect(await provider.speechSegmentationCount == 2)
+        #expect(await provider.batchCount == 2)
+        let secondCheckpoint = try HomanWhisperBatchCheckpoint.load(for: staged)
+        #expect(secondCheckpoint.requestID == firstCheckpoint.requestID)
+        #expect(secondCheckpoint.items.map(\.id) == firstCheckpoint.items.map(\.id))
+
+        try Data("corrupt".utf8).write(to: secondCheckpoint.items[0].audioURL)
+        _ = try await pipeline.process(
+            stagedAudio: staged,
+            backend: .homanWhisper,
+            languages: .init(),
+            purpose: .recovery,
+            systemDiarization: .disabled
+        )
+        #expect(await provider.speechSegmentationCount == 4)
+        #expect(await provider.batchCount == 3)
+        let repairedCheckpoint = try HomanWhisperBatchCheckpoint.load(for: staged)
+        #expect(repairedCheckpoint.requestID != firstCheckpoint.requestID)
+    }
+
     @Test(
         "a valid source remains usable when its peer is unavailable",
         arguments: [
@@ -912,8 +972,10 @@ private actor HomanWhisperBatchPipelineProvider:
     private(set) var batchCount = 0
     private(set) var submittedItems: [RemoteMeetingSpeechItem] = []
     private(set) var diarizationCount = 0
+    private(set) var speechSegmentationCount = 0
 
     func meetingSpeechSegments(at url: URL) async throws -> [VadSegment]? {
+        speechSegmentationCount += 1
         if url.lastPathComponent.contains("mic-cleaned") {
             return [VadSegment(startTime: 0.0, endTime: 0.03)]
         }

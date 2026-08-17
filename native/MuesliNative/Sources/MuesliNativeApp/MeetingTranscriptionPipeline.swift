@@ -134,8 +134,12 @@ struct MeetingTranscriptionPipeline: Sendable {
 
     private struct PreparedRemoteBatch: Sendable {
         let items: [RemoteMeetingSpeechItem]
+        let requestID: UUID
+        let responseCacheURL: URL?
+        let removesItemsAfterUse: Bool
 
         func removeTemporaryFiles() {
+            guard removesItemsAfterUse else { return }
             for item in items {
                 try? FileManager.default.removeItem(at: item.audioURL)
             }
@@ -327,6 +331,7 @@ struct MeetingTranscriptionPipeline: Sendable {
             purpose: purpose,
             systemDiarization: systemDiarization,
             diarizationProfileID: diarizationProfileID,
+            persistentRemoteBatchAudio: stagedAudio,
             progress: progress
         )
         let unitResult = try await processCanonical(unit, request: request)
@@ -390,7 +395,8 @@ struct MeetingTranscriptionPipeline: Sendable {
             }
             let remote = try await batchProvider.transcribeMeetingBatch(
                 items: prepared.batch.items,
-                requestID: UUID()
+                requestID: prepared.batch.requestID,
+                responseCacheURL: prepared.batch.responseCacheURL
             )
             let itemIDs = Set(remote.map(\.id))
             guard itemIDs.count == remote.count else {
@@ -477,7 +483,12 @@ struct MeetingTranscriptionPipeline: Sendable {
                 throw HomanWhisperError.tooManyItems(allItems.count)
             }
             return PreparedMeetingRemoteBatch(
-                batch: PreparedRemoteBatch(items: allItems),
+                batch: PreparedRemoteBatch(
+                    items: allItems,
+                    requestID: UUID(),
+                    responseCacheURL: nil,
+                    removesItemsAfterUse: true
+                ),
                 unitIDByItemID: unitIDByItemID,
                 timeOffsetByItemID: timeOffsetByItemID
             )
@@ -720,7 +731,8 @@ struct MeetingTranscriptionPipeline: Sendable {
                 sources: [
                     (.microphone, unit.microphoneURL, unit.microphoneSampleCount),
                     (.system, unit.systemURL, unit.systemSampleCount),
-                ]
+                ],
+                checkpointAudio: request.persistentRemoteBatchAudio
             )
             recognizedSegments = Self.sourceSegments(from: remote)
             microphoneSegments = Self.speechSegments(
@@ -800,23 +812,48 @@ struct MeetingTranscriptionPipeline: Sendable {
     }
 
     private func recognizeHomanWhisperBatch(
-        sources: [(MeetingAudioSourceRole, URL?, Int)]
+        sources: [(MeetingAudioSourceRole, URL?, Int)],
+        checkpointAudio: MeetingStagedAudio? = nil
     ) async throws -> [RemoteMeetingSpeechResult] {
         guard let batchProvider = provider as? any MeetingBatchTranscriptionProviding else {
             throw HomanWhisperError.invalidResponse("batch provider unavailable")
         }
-        let prepared = try await prepareHomanWhisperBatch(sources: sources)
+        let prepared = try await prepareHomanWhisperBatch(
+            sources: sources,
+            checkpointAudio: checkpointAudio
+        )
         defer { prepared.removeTemporaryFiles() }
         return try await batchProvider.transcribeMeetingBatch(
             items: prepared.items,
-            requestID: UUID()
+            requestID: prepared.requestID,
+            responseCacheURL: prepared.responseCacheURL
         )
     }
 
     private func prepareHomanWhisperBatch(
-        sources: [(MeetingAudioSourceRole, URL?, Int)]
+        sources: [(MeetingAudioSourceRole, URL?, Int)],
+        checkpointAudio: MeetingStagedAudio?
     ) async throws -> PreparedRemoteBatch {
+        if let checkpointAudio {
+            do {
+                let checkpoint = try HomanWhisperBatchCheckpoint.load(for: checkpointAudio)
+                return PreparedRemoteBatch(
+                    items: checkpoint.items,
+                    requestID: checkpoint.requestID,
+                    responseCacheURL: checkpoint.responseURL,
+                    removesItemsAfterUse: false
+                )
+            } catch {
+                // A partial or stale checkpoint is an internal cache miss. The
+                // application repairs it automatically from preserved audio.
+                HomanWhisperBatchCheckpoint.discard(for: checkpointAudio)
+            }
+        }
+
         var items: [RemoteMeetingSpeechItem] = []
+        let checkpointBuilder = try checkpointAudio.map {
+            try HomanWhisperBatchCheckpoint.begin(for: $0)
+        }
         do {
             for (source, optionalURL, sampleCount) in sources {
                 guard sampleCount > 0, let url = optionalURL else { continue }
@@ -840,7 +877,8 @@ struct MeetingTranscriptionPipeline: Sendable {
                     let id = String(format: "%@-%04d", source.rawValue, index)
                     let m4aURL = try await encodeRemoteSpeechItem(
                         samples: Array(samples[startSample..<endSample]),
-                        directoryName: "homan-whisper-stt-items"
+                        directoryName: "homan-whisper-stt-items",
+                        destinationURL: checkpointBuilder?.itemURL(at: items.count)
                     )
                     items.append(RemoteMeetingSpeechItem(
                         id: id,
@@ -853,7 +891,21 @@ struct MeetingTranscriptionPipeline: Sendable {
             }
             guard !items.isEmpty else { throw HomanWhisperError.noSpeechItems }
             guard items.count <= 2048 else { throw HomanWhisperError.tooManyItems(items.count) }
-            return PreparedRemoteBatch(items: items)
+            if let checkpointBuilder {
+                let checkpoint = try checkpointBuilder.commit(items: items)
+                return PreparedRemoteBatch(
+                    items: checkpoint.items,
+                    requestID: checkpoint.requestID,
+                    responseCacheURL: checkpoint.responseURL,
+                    removesItemsAfterUse: false
+                )
+            }
+            return PreparedRemoteBatch(
+                items: items,
+                requestID: UUID(),
+                responseCacheURL: nil,
+                removesItemsAfterUse: true
+            )
         } catch {
             for item in items {
                 try? FileManager.default.removeItem(at: item.audioURL)
@@ -864,7 +916,8 @@ struct MeetingTranscriptionPipeline: Sendable {
 
     private func encodeRemoteSpeechItem(
         samples: [Float],
-        directoryName: String = "homan-whisper-stt-items"
+        directoryName: String = "homan-whisper-stt-items",
+        destinationURL: URL? = nil
     ) async throws -> URL {
         let wavURL = try WavWriter.writeTemporaryWAV(
             samples: samples,
@@ -874,7 +927,8 @@ struct MeetingTranscriptionPipeline: Sendable {
             [.posixPermissions: 0o600],
             ofItemAtPath: wavURL.path
         )
-        let m4aURL = wavURL.deletingPathExtension().appendingPathExtension("m4a")
+        let m4aURL = destinationURL
+            ?? wavURL.deletingPathExtension().appendingPathExtension("m4a")
         do {
             try await HomanWhisperM4AEncoder.encode(
                 wavURL: wavURL,

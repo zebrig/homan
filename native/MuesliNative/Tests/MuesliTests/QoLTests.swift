@@ -266,6 +266,32 @@ struct MeetingProcessingProgressTests {
         #expect(MeetingProcessingOperation.resummarization.phases == [.summarizing, .saving])
     }
 
+    @Test("recovery with prepared audio starts at the remaining transcription work")
+    func resumedRecoveryPlan() {
+        let phases = MeetingProcessingRunPlan.phases(
+            operation: .recovery,
+            diarizationMode: .rerun(.stableFourSpeaker),
+            resumingAt: .transcribing
+        )
+        #expect(phases == [
+            .transcribing,
+            .preparingDiarizer,
+            .diarizing,
+            .applyingSpeakerLabels,
+            .generatingTitle,
+            .summarizing,
+            .encodingRecording,
+            .saving,
+        ])
+        let progress = MeetingProcessingProgress.starting(
+            operation: .recovery,
+            phases: phases
+        )
+        #expect(progress.phase == .transcribing)
+        #expect(progress.phaseIndex == 1)
+        #expect(progress.phaseCount == 8)
+    }
+
     @Test("progress advances monotonically and preserves both timers correctly")
     func progressAdvancesMonotonically() throws {
         let startedAt = Date(timeIntervalSince1970: 100)

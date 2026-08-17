@@ -5145,10 +5145,18 @@ final class MuesliController: NSObject {
             meetingID: meetingID,
             supportDirectory: processingSupportDirectory
         ).first
-        let legacyStagedAudio = MeetingProcessingCapture.recoverableSessions(
+        let recoverableDerivedAudio = MeetingProcessingCapture.recoverableSessions(
             meetingID: meetingID,
             supportDirectory: processingSupportDirectory
-        ).first
+        )
+        // A derived processing capture is reusable only for the exact raw
+        // session which produced it. It is immutable after finalization and has
+        // already paid the expensive full-duration AEC/rendering cost.
+        let legacyStagedAudio = stagedRawAudio.map { rawAudio in
+            recoverableDerivedAudio.first {
+                $0.manifest.sessionID == rawAudio.manifest.sessionID
+            }
+        } ?? recoverableDerivedAudio.first
         guard !meetingRecoveryInFlightIDs.contains(meetingID),
               let meeting = meeting(id: meetingID),
               stagedRawAudio != nil || legacyStagedAudio != nil else {
@@ -5176,7 +5184,8 @@ final class MuesliController: NSObject {
                     operation: .recovery,
                     diarizationMode: recoveryDiarizationPolicy.enabled
                         ? .rerun(recoveryDiarizationPolicy.profileID)
-                        : .disabled
+                        : .disabled,
+                    resumingAt: legacyStagedAudio == nil ? nil : .transcribing
                 )
             )
         } catch {
@@ -5201,25 +5210,23 @@ final class MuesliController: NSObject {
                         rawAudio
                     )
                     activeRawAudio = rawAudio
-                    if let oldDerived = legacyStagedAudio,
-                       oldDerived.manifest.sessionID == rawAudio.manifest.sessionID {
-                        MeetingProcessingCapture.discard(oldDerived)
-                    }
-                    activeStagedAudio = try await MeetingRawAudioPostProcessor
-                        .prepare(
-                            rawAudio,
-                            aec: MeetingNeuralAec(
-                                localVQEModel: self.config.resolvedMeetingAecModel
-                            ),
-                            supportDirectory: self.processingSupportDirectory,
-                            inferenceScheduler: .shared
+                    if activeStagedAudio == nil {
+                        activeStagedAudio = try await MeetingRawAudioPostProcessor
+                            .prepare(
+                                rawAudio,
+                                aec: MeetingNeuralAec(
+                                    localVQEModel: self.config.resolvedMeetingAecModel
+                                ),
+                                supportDirectory: self.processingSupportDirectory,
+                                inferenceScheduler: .shared
+                            )
+                        self.advanceMeetingProcessing(
+                            meetingID: meetingID,
+                            runID: processingRunID,
+                            phase: .preparingRecording
                         )
+                    }
                 }
-                self.advanceMeetingProcessing(
-                    meetingID: meetingID,
-                    runID: processingRunID,
-                    phase: .preparingRecording
-                )
                 guard let stagedAudio = activeStagedAudio else {
                     throw MeetingFinalProcessingError.noCapturedAudio
                 }

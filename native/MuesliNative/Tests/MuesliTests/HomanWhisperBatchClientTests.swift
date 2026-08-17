@@ -156,7 +156,9 @@ struct HomanWhisperBatchClientTests {
             _ = try await client.decode(changed, requestID: requestID, requestItems: requestItems)
         }
 
-        let withInnerSegments = Data("""
+        // This mirrors the production Homan v1 shape: segment IDs are JSON
+        // integers and segment timestamps are relative to their item.
+        let withServerSegments = Data("""
         {
           "schema_version": 1,
           "request_id": "\(requestID.uuidString)",
@@ -169,34 +171,51 @@ struct HomanWhisperBatchClientTests {
               "end": 6.25,
               "text": "hello there",
               "segments": [
-                {"id": "seg-1", "start": 2.6, "end": 3.1, "text": " hello "},
-                {"id": "seg-2", "start": 3.2, "end": 6.0, "text": "there"}
+                {"id": 0, "start": 0.1, "end": 0.6, "text": " hello "},
+                {"id": 1, "start": 0.7, "end": 3.5, "text": "there"}
               ]
             }
           ]
         }
         """.utf8)
         let precise = try await client.decode(
-            withInnerSegments,
+            withServerSegments,
             requestID: requestID,
             requestItems: requestItems
         )
         #expect(precise.first?.segments == [
             RemoteMeetingSpeechSubsegment(
-                id: "seg-1",
+                id: "0",
                 start: 2.6,
                 end: 3.1,
                 text: "hello"
             ),
             RemoteMeetingSpeechSubsegment(
-                id: "seg-2",
+                id: "1",
                 start: 3.2,
                 end: 6.0,
                 text: "there"
             ),
         ])
 
-        let mismatchedInnerText = Data(String(decoding: withInnerSegments, as: UTF8.self)
+        let withTimestampOnlySegments = Data(String(
+            decoding: withServerSegments,
+            as: UTF8.self
+        )
+            .replacingOccurrences(of: "\"id\": 0, ", with: "")
+            .replacingOccurrences(of: "\"id\": 1, ", with: "")
+            .replacingOccurrences(of: ", \"text\": \" hello \"", with: "")
+            .replacingOccurrences(of: ", \"text\": \"there\"", with: "")
+            .utf8)
+        let timestampOnly = try await client.decode(
+            withTimestampOnlySegments,
+            requestID: requestID,
+            requestItems: requestItems
+        )
+        #expect(timestampOnly.first?.text == "hello there")
+        #expect(timestampOnly.first?.segments == nil)
+
+        let mismatchedInnerText = Data(String(decoding: withServerSegments, as: UTF8.self)
             .replacingOccurrences(of: "\"text\": \"there\"", with: "\"text\": \"else\"")
             .utf8)
         let coarseFallback = try await client.decode(
@@ -207,16 +226,16 @@ struct HomanWhisperBatchClientTests {
         #expect(coarseFallback.first?.text == "hello there")
         #expect(coarseFallback.first?.segments == nil)
 
-        let invalidInnerSegments = Data(String(decoding: withInnerSegments, as: UTF8.self)
-            .replacingOccurrences(of: "\"start\": 3.2", with: "\"start\": 2.9")
+        let invalidInnerSegments = Data(String(decoding: withServerSegments, as: UTF8.self)
+            .replacingOccurrences(of: "\"start\": 0.7", with: "\"start\": 0.4")
             .utf8)
-        await #expect(throws: HomanWhisperError.self) {
-            _ = try await client.decode(
-                invalidInnerSegments,
-                requestID: requestID,
-                requestItems: requestItems
-            )
-        }
+        let invalidOptionalFallback = try await client.decode(
+            invalidInnerSegments,
+            requestID: requestID,
+            requestItems: requestItems
+        )
+        #expect(invalidOptionalFallback.first?.text == "hello there")
+        #expect(invalidOptionalFallback.first?.segments == nil)
     }
 
     @Test("native encoder produces mono 32 kHz AAC")
@@ -244,5 +263,55 @@ struct HomanWhisperBatchClientTests {
         #expect(stream.pointee.mFormatID == kAudioFormatMPEG4AAC)
         #expect(stream.pointee.mSampleRate == 32_000)
         #expect(stream.pointee.mChannelsPerFrame == 1)
+    }
+
+    @Test("retry decodes a saved response before requiring network credentials")
+    func retryUsesSavedResponse() async throws {
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-whisper-response-checkpoint-test", isDirectory: true)
+            .appendingPathComponent(UUID().uuidString, isDirectory: true)
+        try FileManager.default.createDirectory(
+            at: directory,
+            withIntermediateDirectories: true
+        )
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let audioURL = directory.appendingPathComponent("item.m4a")
+        try Data("prepared-audio".utf8).write(to: audioURL)
+        let responseURL = directory.appendingPathComponent("response.json")
+        let requestID = UUID()
+        try Data("""
+        {
+          "schema_version": 1,
+          "request_id": "\(requestID.uuidString)",
+          "concurrency_used": 1,
+          "items": [
+            {
+              "id": "system-0000",
+              "source": "system",
+              "start": 1.0,
+              "end": 2.0,
+              "text": "saved response",
+              "segments": [{"start": 0.0, "end": 1.0}]
+            }
+          ]
+        }
+        """.utf8).write(to: responseURL)
+        let item = RemoteMeetingSpeechItem(
+            id: "system-0000",
+            source: .system,
+            start: 1,
+            end: 2,
+            audioURL: audioURL
+        )
+        let client = HomanWhisperBatchClient(apiKey: "")
+
+        let result = try await client.transcribe(
+            items: [item],
+            requestID: requestID,
+            responseCacheURL: responseURL
+        )
+
+        #expect(result.map(\.text) == ["saved response"])
+        #expect(result.first?.segments == nil)
     }
 }
