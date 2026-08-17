@@ -10,8 +10,9 @@
 `MeetingDiarizationReconciliation.swift`, capture types, runtime, and their tests. New runs capture
 the concrete open stable ID (or disabled when nothing is selectable); recovery maps captured stable
 IDs back through the catalog and unknown future values fail safely. Live preparation is
-capability-gated on the captured profile with a typed unsupported-Live error. Milestone E and later
-remain pending.
+capability-gated on the captured profile with a typed unsupported-Live error. Models is a
+catalog-driven asset manager and Settings owns zero/one/many model choice with the exact Live
+capability message. Milestones F–H remain pending.
 
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
@@ -75,20 +76,20 @@ because the app builds.
 
 ## Milestone E - Models and Settings UX
 
-- [ ] T026 Remove Models `Used by Automatic`, `Active`, `Use for Final`, and configuration-based
+- [x] T026 Remove Models `Used by Automatic`, `Active`, `Use for Final`, and configuration-based
   card borders/actions.
-- [ ] T027 Render Models by iterating catalog/tombstone descriptors with Download, Setting up,
+- [x] T027 Render Models by iterating catalog/tombstone descriptors with Download, Setting up,
   Downloaded, Update, Retry, Legacy model, No longer supported, Replace, and Remove states.
 - [ ] T028 Implement app-owned staging/resume/validation/quarantine/rollback/orphan cleanup and
   atomic update activation while retaining capture-active mutation guards and last-known-good asset.
-- [ ] T029 Add the Models explanatory text for automatic sole-model selection and Settings choice.
-- [ ] T030 Add Settings `Speaker separation model` zero/one/many states, `choiceRequired`, and
+- [x] T029 Add the Models explanatory text for automatic sole-model selection and Settings choice.
+- [x] T030 Add Settings `Speaker separation model` zero/one/many states, `choiceRequired`, and
   `Open Models` navigation.
-- [ ] T031 Populate the Settings picker from all ready/selectable descriptors, preserve a valid
+- [x] T031 Populate the Settings picker from all ready/selectable descriptors, preserve a valid
   selection after additional installs, and require a choice when several remain without one.
-- [ ] T032 Add exact `This model doesn't support Live speaker diarization` copy beside the disabled
+- [x] T032 Add exact `This model doesn't support Live speaker diarization` copy beside the disabled
   Live Settings control for every descriptor lacking Live capability.
-- [ ] T033 Add accessible toast/help for auto-select-after-remove and Live normalization.
+- [x] T033 Add accessible toast/help for auto-select-after-remove and Live normalization.
 - [ ] T034 Verify minimum window width, text wrapping, keyboard navigation, and VoiceOver order.
 
 ## Milestone F - Durable onboarding preparation plan

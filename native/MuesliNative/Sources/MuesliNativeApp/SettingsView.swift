@@ -963,47 +963,33 @@ struct SettingsView: View {
             }
             Divider().background(MuesliTheme.surfaceBorder)
             settingsRow(
-                "Analyze remote speakers in Final",
+                "Speaker separation model",
                 description: "Runs locally on system audio only. The microphone always remains You and Homan Whisper remains the ASR provider."
             ) {
+                speakerModelSelectionControl
+            }
+            Divider().background(MuesliTheme.surfaceBorder)
+            settingsRow(
+                "Analyze remote speakers in Final",
+                description: finalSpeakerAnalysisDescription
+            ) {
                 settingsSwitch(
-                    isOn: appState.config.meetingFinalDiarizationEnabledByDefault
+                    isOn: appState.config.meetingFinalDiarizationEnabledByDefault,
+                    disabled: !finalSpeakerAnalysisAvailable
                 ) { newValue in
                     controller.updateConfig {
                         $0.meetingFinalDiarizationEnabledByDefault = newValue
                     }
                 }
             }
-            if appState.config.meetingFinalDiarizationEnabledByDefault {
-                Divider().background(MuesliTheme.surfaceBorder)
-                settingsRow(
-                    "Final speaker profile",
-                    description: "Automatic favors offline quality. Stable 4-speaker uses Sortformer and has a hard four-remote-speaker limit.",
-                    controlWidth: meetingControlWidth
-                ) {
-                    let profiles = MeetingDiarizationProfileID.allCases
-                    settingsMenu(
-                        selection: diarizationProfileLabel(
-                            appState.config.resolvedMeetingFinalDiarizationProfile
-                        ),
-                        options: profiles.map(diarizationProfileLabel)
-                    ) { label in
-                        guard let profile = profiles.first(where: {
-                            diarizationProfileLabel($0) == label
-                        }) else { return }
-                        controller.updateConfig {
-                            $0.meetingFinalDiarizationProfile = profile.rawValue
-                        }
-                    }
-                }
-            }
             Divider().background(MuesliTheme.surfaceBorder)
             settingsRow(
                 "Live speaker analysis by default",
-                description: "Independent from Live transcription. Uses the installed Stable up to 4 model and can be toggled for one recording without changing this default."
+                description: liveSpeakerAnalysisDescription
             ) {
                 settingsSwitch(
-                    isOn: appState.config.meetingLiveDiarizationEnabledByDefault
+                    isOn: appState.config.meetingLiveDiarizationEnabledByDefault,
+                    disabled: !liveSpeakerAnalysisAvailable
                 ) { newValue in
                     controller.updateConfig {
                         $0.meetingLiveDiarizationEnabledByDefault = newValue
@@ -2982,13 +2968,18 @@ struct SettingsView: View {
     // MARK: - Controls
 
     @ViewBuilder
-    private func settingsSwitch(isOn: Bool, onChange: @escaping (Bool) -> Void) -> some View {
+    private func settingsSwitch(
+        isOn: Bool,
+        disabled: Bool = false,
+        onChange: @escaping (Bool) -> Void
+    ) -> some View {
         HStack {
             Spacer()
             Toggle("", isOn: Binding(get: { isOn }, set: { onChange($0) }))
                 .toggleStyle(.switch)
                 .tint(MuesliTheme.accent)
                 .labelsHidden()
+                .disabled(disabled)
         }
     }
 
@@ -3712,17 +3703,120 @@ struct SettingsView: View {
         }
     }
 
-    private func diarizationProfileLabel(
-        _ profile: MeetingDiarizationProfileID
-    ) -> String {
-        switch profile {
-        case .automatic:
-            return "Automatic"
-        case .offlineQuality:
-            return "Offline quality"
-        case .stableFourSpeaker:
-            return "Stable up to 4 speakers"
+    @ViewBuilder
+    private var speakerModelSelectionControl: some View {
+        if let selection = appState.meetingDiarizationSelection {
+            switch selection.state {
+            case .unavailable:
+                HStack(spacing: 10) {
+                    Text("No model downloaded")
+                        .font(MuesliTheme.body())
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                    Button("Open Models") {
+                        controller.showModels(category: .speakerSeparation)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(MuesliTheme.accent)
+                }
+            case .choiceRequired:
+                HStack(spacing: 10) {
+                    Text("Choose a model")
+                        .font(MuesliTheme.body())
+                        .foregroundStyle(MuesliTheme.textPrimary)
+                    settingsMenu(
+                        selection: "",
+                        options: selection.readyAlternatives.map(\.displayName)
+                    ) { name in
+                        guard let descriptor = selection.readyAlternatives.first(
+                            where: { $0.displayName == name }
+                        ) else { return }
+                        selectSpeakerModel(descriptor)
+                    }
+                }
+            case .selected:
+                if selection.readyAlternatives.count <= 1,
+                   let descriptor = selection.readyAlternatives.first {
+                    HStack(spacing: 8) {
+                        Text(descriptor.displayName)
+                            .font(MuesliTheme.body())
+                            .foregroundStyle(MuesliTheme.textPrimary)
+                        Text("Selected automatically — only downloaded model")
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MuesliTheme.textTertiary)
+                    }
+                } else {
+                    settingsMenu(
+                        selection: selectedSpeakerModelName(selection),
+                        options: selection.readyAlternatives.map(\.displayName)
+                    ) { name in
+                        guard let descriptor = selection.readyAlternatives.first(
+                            where: { $0.displayName == name }
+                        ) else { return }
+                        selectSpeakerModel(descriptor)
+                    }
+                }
+            }
+        } else {
+            Text("Checking installed models…")
+                .font(MuesliTheme.body())
+                .foregroundStyle(MuesliTheme.textTertiary)
         }
+    }
+
+    private func selectedSpeakerModelName(
+        _ selection: MeetingDiarizationSelection
+    ) -> String {
+        guard let profileID = selection.profileID else { return "" }
+        return selection.readyAlternatives.first { $0.id == profileID }?
+            .displayName ?? ""
+    }
+
+    private func selectSpeakerModel(
+        _ descriptor: MeetingDiarizationModelDescriptor
+    ) {
+        controller.updateConfig {
+            $0.meetingFinalDiarizationProfile = descriptor.id.rawValue
+        }
+        Task {
+            await controller.reconcileMeetingDiarizationSelection(trigger: .update)
+        }
+    }
+
+    private var finalSpeakerAnalysisAvailable: Bool {
+        guard let selection = appState.meetingDiarizationSelection else {
+            return false
+        }
+        return selection.state == .selected
+    }
+
+    private var finalSpeakerAnalysisDescription: String {
+        guard let selection = appState.meetingDiarizationSelection else {
+            return "Download a speaker model to enable Final separation."
+        }
+        switch selection.state {
+        case .unavailable:
+            return "No speaker model is downloaded. Open Models to install one."
+        case .choiceRequired:
+            return "Choose a speaker model above before enabling Final separation."
+        case .selected:
+            return "Runs locally on system audio only. The microphone always remains You."
+        }
+    }
+
+    private var liveSpeakerAnalysisAvailable: Bool {
+        guard let selection = appState.meetingDiarizationSelection,
+              selection.state == .selected else {
+            return false
+        }
+        return selection.capabilities?.supportsLive == true
+    }
+
+    private var liveSpeakerAnalysisDescription: String {
+        if !liveSpeakerAnalysisAvailable {
+            return "This model doesn't support Live speaker diarization."
+        }
+        return "Independent from Live transcription. Can be toggled for one recording without changing this default."
     }
 
     private func recordingSavePolicy(for label: String) -> MeetingRecordingSavePolicy? {

@@ -473,38 +473,31 @@ struct ModelsView: View {
                     .font(.system(size: 11, weight: .semibold))
                     .foregroundStyle(MuesliTheme.textTertiary)
 
-                Text("Optional local models analyze only the system-audio side after transcription. Your microphone remains You. Models are installed explicitly and are never downloaded while a meeting is being processed.")
+                Text("If one speaker model is downloaded, Homan selects it automatically. When multiple models are available, choose one in Settings.")
                     .font(MuesliTheme.caption())
                     .foregroundStyle(MuesliTheme.textSecondary)
             }
             .padding(.leading, 2)
             .padding(.top, MuesliTheme.spacing8)
 
-            ForEach(
-                [MeetingDiarizationProfileID.offlineQuality, .stableFourSpeaker],
-                id: \.rawValue
-            ) { profile in
-                speakerModelCard(profile)
+            ForEach(catalogSpeakerDescriptors, id: \.id) { descriptor in
+                speakerModelCard(descriptor)
             }
         }
     }
 
     private func speakerModelCard(
-        _ profile: MeetingDiarizationProfileID
+        _ descriptor: MeetingDiarizationModelDescriptor
     ) -> some View {
-        let definition = MeetingDiarizationProfiles.resolve(profile)
+        guard let profile = descriptor.legacyProfileID else {
+            return AnyView(EmptyView())
+        }
         let status = speakerAssetStatuses.first { $0.profileID == profile }
         let progress = speakerInstallProgress[profile]
         let isReady = status?.state == .ready
         let isBusy = progress != nil || status?.state == .installing
-        let isInUse = appState.config.meetingFinalDiarizationEnabledByDefault
-            && (
-                appState.config.resolvedMeetingFinalDiarizationProfile == profile
-                    || (profile == .offlineQuality
-                        && appState.config.resolvedMeetingFinalDiarizationProfile == .automatic)
-            )
 
-        return VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
+        return AnyView(VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
             HStack(alignment: .top, spacing: MuesliTheme.spacing12) {
                 Image(systemName: "person.2.wave.2")
                     .font(.system(size: 20, weight: .medium))
@@ -515,27 +508,17 @@ struct ModelsView: View {
 
                 VStack(alignment: .leading, spacing: MuesliTheme.spacing4) {
                     HStack(spacing: MuesliTheme.spacing8) {
-                        Text(definition.displayName)
+                        Text(descriptor.displayName)
                             .font(MuesliTheme.headline())
                             .foregroundStyle(MuesliTheme.textPrimary)
-
-                        if profile == .offlineQuality {
-                            Text("Used by Automatic")
-                                .font(.system(size: 10, weight: .semibold))
-                                .foregroundStyle(MuesliTheme.accent)
-                                .padding(.horizontal, 8)
-                                .padding(.vertical, 3)
-                                .background(MuesliTheme.accentSubtle)
-                                .clipShape(Capsule())
-                        }
                     }
 
-                    Text(definition.detail)
+                    Text(descriptor.detailText)
                         .font(MuesliTheme.caption())
                         .foregroundStyle(MuesliTheme.textSecondary)
 
                     HStack(spacing: MuesliTheme.spacing8) {
-                        Text("Revision \(definition.modelRevision)")
+                        Text("Revision \(descriptor.assetRevision)")
                         if let bytes = status?.sizeBytes, bytes > 0 {
                             Text("•")
                             Text(ByteCountFormatter.string(
@@ -544,7 +527,10 @@ struct ModelsView: View {
                             ))
                         }
                         Text("•")
-                        Link(definition.licenseName, destination: definition.licenseURL)
+                        Link(
+                            descriptor.license.displayName,
+                            destination: descriptor.license.noticeURL
+                        )
                     }
                     .font(.system(size: 11))
                     .foregroundStyle(MuesliTheme.textTertiary)
@@ -552,9 +538,23 @@ struct ModelsView: View {
 
                 Spacer()
 
-                Text(isReady ? (isInUse ? "Active" : "Ready") : (isBusy ? "Installing" : "Not installed"))
+                Text(
+                    isReady
+                        ? "Downloaded"
+                        : (isBusy
+                            ? "Downloading"
+                            : (status?.state == .failed
+                                ? "Needs attention"
+                                : "Not downloaded"))
+                )
                     .font(.system(size: 11, weight: .semibold))
-                    .foregroundStyle(isReady ? MuesliTheme.success : MuesliTheme.textTertiary)
+                    .foregroundStyle(
+                        isReady
+                            ? MuesliTheme.success
+                            : (status?.state == .failed
+                                ? Color.orange
+                                : MuesliTheme.textTertiary)
+                    )
                     .padding(.horizontal, 8)
                     .padding(.vertical, 3)
                     .background(MuesliTheme.surfacePrimary)
@@ -579,17 +579,6 @@ struct ModelsView: View {
 
             HStack(spacing: MuesliTheme.spacing8) {
                 if isReady {
-                    if !isInUse {
-                        Button("Use for Final") {
-                            controller.updateConfig {
-                                $0.meetingFinalDiarizationProfile = profile.rawValue
-                                $0.meetingFinalDiarizationEnabledByDefault = true
-                            }
-                        }
-                        .buttonStyle(.plain)
-                        .font(.system(size: 12, weight: .medium))
-                        .foregroundStyle(MuesliTheme.accent)
-                    }
                     Button("Remove", role: .destructive) {
                         speakerModelToDelete = profile
                     }
@@ -620,10 +609,15 @@ struct ModelsView: View {
         .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium))
         .overlay(
             RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium)
-                .strokeBorder(isInUse && isReady
-                    ? MuesliTheme.accent.opacity(0.6)
-                    : MuesliTheme.surfaceBorder, lineWidth: 1)
+                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
         )
+        )
+    }
+
+    private var catalogSpeakerDescriptors: [MeetingDiarizationModelDescriptor] {
+        MeetingDiarizationModelCatalog.loadBundled().descriptors.filter {
+            $0.isSelectable && $0.legacyProfileID != nil
+        }
     }
 
     private func refreshSpeakerAssets() {

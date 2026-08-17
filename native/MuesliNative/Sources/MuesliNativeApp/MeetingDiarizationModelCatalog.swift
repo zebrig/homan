@@ -77,6 +77,26 @@ struct MeetingDiarizationCatalogSnapshot: Codable, Sendable, Equatable {
     let descriptors: [MeetingDiarizationModelDescriptor]
 }
 
+extension MeetingDiarizationModelDescriptor {
+    /// Legacy pipeline profile bridged through the first catalog alias. Views
+    /// use this only to reach the runtime definitions, never to name models.
+    var legacyProfileID: MeetingDiarizationProfileID? {
+        legacyAliases.first.flatMap(MeetingDiarizationProfileID.init(rawValue:))
+    }
+
+    /// Product display name supplied by the runtime definition, keeping view
+    /// code free of hard-coded model names.
+    var displayName: String {
+        guard let profile = legacyProfileID else { return id.rawValue }
+        return MeetingDiarizationProfiles.resolve(profile).displayName
+    }
+
+    var detailText: String {
+        guard let profile = legacyProfileID else { return "" }
+        return MeetingDiarizationProfiles.resolve(profile).detail
+    }
+}
+
 /// Compile-time allowlist of executable runtime adapters. Catalog content may
 /// reference only these IDs; it can never select arbitrary code.
 enum MeetingDiarizationRuntimeAdapter {
