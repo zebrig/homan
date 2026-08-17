@@ -5,31 +5,35 @@
 **Prerequisites**: approval of `spec.md`, `flows-and-ux.md`, `plan.md`, `data-model.md`, and
 `contracts/model-selection.md`
 
+**Implementation status**: Milestone A and Milestone B core (T001–T004, T006–T009) are
+implemented in `MeetingDiarizationModelCatalog.swift`, `MeetingDiarizationModelSelection.swift`,
+and their tests. Reconciliation ownership (T010–T012) and all later milestones remain pending.
+
 Tasks are ordered so migration/runtime safety lands before UI cleanup. A task is not complete merely
 because the app builds.
 
 ## Milestone A - Characterize current behavior
 
-- [ ] T001 Add characterization tests proving current `.automatic` global resolution and historical
+- [x] T001 Add characterization tests proving current `.automatic` global resolution and historical
   evidence validation both map to Offline quality.
-- [ ] T002 Add characterization tests proving current Live preparation is hard-coded to Stable up
+- [x] T002 Add characterization tests proving current Live preparation is hard-coded to Stable up
   to 4 and that Live/Final enablement are independent.
-- [ ] T003 Add catalog/asset fixtures for zero/one/many ready, downloading, setting up,
+- [x] T003 Add catalog/asset fixtures for zero/one/many ready, downloading, setting up,
   update-available, failed, deprecated, unsupported, and interrupted setup states.
-- [ ] T004 Add onboarding characterization for primary/additional ASR ordering, progress schema 1–4,
+- [x] T004 Add onboarding characterization for primary/additional ASR ordering, progress schema 1–4,
   permission-repair resume, and current post-Wizard continuation behavior.
 - [ ] T005 Record signed Release smoke baseline for Final, Live, Homan Whisper, Re-transcribe,
   Re-diarize, start-next-meeting, and app quit during processing.
 
 ## Milestone B - Capability catalog and pure selection
 
-- [ ] T006 Add open `MeetingDiarizationModelID`, capabilities, lifecycle, asset revision, adapter,
+- [x] T006 Add open `MeetingDiarizationModelID`, capabilities, lifecycle, asset revision, adapter,
   localization, license, onboarding, replacement, and legacy-alias descriptor fields.
-- [ ] T007 Add a bundled versioned/schema-validated catalog plus last-valid/empty fallback,
+- [x] T007 Add a bundled versioned/schema-validated catalog plus last-valid/empty fallback,
   tombstones, unique-ID/alias checks, replacement-cycle checks, and allowlisted adapter validation.
-- [ ] T008 Implement the pure zero/one/many-ready selection resolver, `choiceRequired`, and
+- [x] T008 Implement the pure zero/one/many-ready selection resolver, `choiceRequired`, and
   transition reason without a fallback model constant.
-- [ ] T009 Cover the full generic truth table, idempotence, malformed/unknown/retired values, and
+- [x] T009 Cover the full generic truth table, idempotence, malformed/unknown/retired values, and
   synthetic catalogs containing 0, 1, 2, 3, and 10 descriptors.
 - [ ] T010 Add a serialized controller-owned reconciliation operation with stale-generation
   rejection.

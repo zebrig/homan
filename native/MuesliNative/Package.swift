@@ -51,6 +51,9 @@ let package = Package(
                 "LocalVQEBridge",
             ],
             path: "Sources/MuesliNativeApp",
+            resources: [
+                .copy("Resources/DiarizationModels.json"),
+            ],
             swiftSettings: [
                 .unsafeFlags(["-parse-as-library"]),
             ],

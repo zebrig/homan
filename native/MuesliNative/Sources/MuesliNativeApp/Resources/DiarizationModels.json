@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "revision": "2026-08-17.1",
+  "descriptors": [
+    {
+      "id": "homan.diarization.offline-quality.v2",
+      "displayNameKey": "speaker_model.offline_quality.name",
+      "detailKey": "speaker_model.offline_quality.detail",
+      "assetRevision": "2",
+      "runtimeAdapterID": "fluidaudio.offline-community-vbx",
+      "capabilities": {
+        "supportsFinal": true,
+        "supportsLive": false,
+        "maximumRemoteSpeakers": null,
+        "latencyClass": "finalOnly"
+      },
+      "lifecycle": "active",
+      "onboarding": "offered",
+      "license": {
+        "displayName": "FluidAudio and model licenses",
+        "noticeURL": "https://github.com/FluidInference/FluidAudio"
+      },
+      "replacementID": null,
+      "legacyAliases": ["offline_quality"]
+    },
+    {
+      "id": "homan.diarization.stable-four.v2",
+      "displayNameKey": "speaker_model.stable_four.name",
+      "detailKey": "speaker_model.stable_four.detail",
+      "assetRevision": "2",
+      "runtimeAdapterID": "fluidaudio.sortformer-balanced-v2.1",
+      "capabilities": {
+        "supportsFinal": true,
+        "supportsLive": true,
+        "maximumRemoteSpeakers": 4,
+        "latencyClass": "liveCapable"
+      },
+      "lifecycle": "active",
+      "onboarding": "offered",
+      "license": {
+        "displayName": "FluidAudio and NVIDIA Sortformer model licenses",
+        "noticeURL": "https://github.com/FluidInference/FluidAudio"
+      },
+      "replacementID": null,
+      "legacyAliases": ["stable_four_speaker"]
+    }
+  ]
+}
