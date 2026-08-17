@@ -28,6 +28,9 @@ struct MeetingDiarizationProfileTests {
         #expect(!installed.modelDigest.isEmpty)
         #expect(verified.snapshot.modelDigest == installed.modelDigest)
         #expect(await reopened.status(for: .stableFourSpeaker).state == .ready)
+        #expect(await MeetingDiarizationProfiles.installedConcreteProfiles(
+            from: reopened.statuses()
+        ) == [.stableFourSpeaker])
     }
 
     @Test("residual speaker model files become a retryable failed install after relaunch")

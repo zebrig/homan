@@ -70,6 +70,20 @@ enum MeetingDiarizationProfiles {
         }
     }
 
+    /// Concrete models that are validated and can be selected for a new run.
+    /// `automatic` is a legacy compatibility alias, not a separately installed
+    /// model, so it must never appear beside the concrete asset it resolves to.
+    static func installedConcreteProfiles(
+        from statuses: [MeetingDiarizationAssetStatus]
+    ) -> [MeetingDiarizationProfileID] {
+        MeetingDiarizationProfileID.allCases.filter { profile in
+            guard profile != .automatic else { return false }
+            return statuses.contains {
+                $0.profileID == profile && $0.state == .ready
+            }
+        }
+    }
+
     static let offlineQuality = MeetingDiarizationProfileDefinition(
         requestedID: .offlineQuality,
         effectiveID: .offlineQuality,

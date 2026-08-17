@@ -362,8 +362,6 @@ struct MeetingDetailView: View {
 
             activeMeetingMicrophoneControl(for: meeting)
 
-            meetingFinalSpeakerPolicyControl(for: meeting)
-
             meetingAudioSection(for: meeting)
 
             activeMeetingAudioWarningBanner(for: meeting)
@@ -600,148 +598,23 @@ struct MeetingDetailView: View {
         }
     }
 
-    @ViewBuilder
-    private func meetingFinalSpeakerPolicyControl(for meeting: MeetingRecord) -> some View {
-        let state = controller.meetingSpeakerControlsState(for: meeting)
-        let resolved = MeetingDiarizationPolicyResolver.resolve(
-            globalEnabled: appState.config.meetingFinalDiarizationEnabledByDefault,
-            globalProfileID: appState.config.resolvedMeetingFinalDiarizationProfile,
-            preference: state.preference
-        )
-        HStack(spacing: MuesliTheme.spacing12) {
-            Label("Final remote speakers", systemImage: "person.2.wave.2")
-                .font(.system(size: 12, weight: .semibold))
-                .foregroundStyle(MuesliTheme.textSecondary)
-
-            Menu {
-                Button {
-                    controller.setMeetingFinalDiarizationPolicy(
-                        meetingID: meeting.id,
-                        policy: .followSettings
-                    )
-                } label: {
-                    Label(
-                        "Follow Settings",
-                        systemImage: state.preference.finalPolicy == .followSettings
-                            ? "checkmark"
-                            : "gearshape"
-                    )
-                }
-                Button {
-                    controller.setMeetingFinalDiarizationPolicy(
-                        meetingID: meeting.id,
-                        policy: .enabled
-                    )
-                } label: {
-                    Label(
-                        "On",
-                        systemImage: state.preference.finalPolicy == .enabled
-                            ? "checkmark"
-                            : "person.2"
-                    )
-                }
-                Button {
-                    controller.setMeetingFinalDiarizationPolicy(
-                        meetingID: meeting.id,
-                        policy: .disabled
-                    )
-                } label: {
-                    Label(
-                        "Off — use Others",
-                        systemImage: state.preference.finalPolicy == .disabled
-                            ? "checkmark"
-                            : "person.2.slash"
-                    )
-                }
-            } label: {
-                HStack(spacing: 5) {
-                    Text(finalSpeakerPolicyLabel(state.preference, resolved: resolved))
-                    Image(systemName: "chevron.down")
-                        .font(.system(size: 8, weight: .semibold))
-                }
-                .font(.system(size: 12, weight: .medium))
-                .foregroundStyle(MuesliTheme.textPrimary)
-            }
-            .menuStyle(.borderlessButton)
-            .fixedSize()
-
-            if resolved.enabled {
-                Divider()
-                    .frame(height: 18)
-                    .background(MuesliTheme.surfaceBorder)
-
-                Menu {
-                    Button {
-                        controller.setMeetingDiarizationProfile(
-                            meetingID: meeting.id,
-                            profileID: nil
-                        )
-                    } label: {
-                        Label(
-                            "Follow Settings",
-                            systemImage: state.preference.preferredProfileID == nil
-                                ? "checkmark"
-                                : "gearshape"
-                        )
-                    }
-                    Divider()
-                    ForEach(MeetingDiarizationProfileID.allCases, id: \.self) { profile in
-                        Button {
-                            controller.setMeetingDiarizationProfile(
-                                meetingID: meeting.id,
-                                profileID: profile
-                            )
-                        } label: {
-                            Label(
-                                speakerProfileLabel(profile),
-                                systemImage: state.preference.preferredProfileID == profile
-                                    ? "checkmark"
-                                    : "waveform.badge.magnifyingglass"
-                            )
-                        }
-                    }
-                } label: {
-                    HStack(spacing: 5) {
-                        Text(speakerProfileLabel(resolved.profileID))
-                        Image(systemName: "chevron.down")
-                            .font(.system(size: 8, weight: .semibold))
-                    }
-                    .font(MuesliTheme.captionMedium())
-                    .foregroundStyle(MuesliTheme.textTertiary)
-                }
-                .menuStyle(.borderlessButton)
-                .fixedSize()
-            }
-
-            Spacer(minLength: 0)
-
-            Text("Applies to Final processing, not Live")
-                .font(MuesliTheme.caption())
-                .foregroundStyle(MuesliTheme.textTertiary)
-        }
-        .frame(maxWidth: 980, alignment: .leading)
-        .padding(.horizontal, MuesliTheme.spacing12)
-        .padding(.vertical, MuesliTheme.spacing8)
-        .background(MuesliTheme.surfacePrimary.opacity(0.55))
-        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
-        .overlay {
-            RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
-                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
-        }
-    }
-
-    private func finalSpeakerPolicyLabel(
+    private func finalSpeakerControlLabel(
         _ preference: MeetingDiarizationPreference,
         resolved: ResolvedMeetingDiarizationPolicy
     ) -> String {
+        let policy: String
         switch preference.finalPolicy {
         case .followSettings:
-            return "Follow Settings — \(resolved.enabled ? "On" : "Off")"
+            if resolved.enabled {
+                return "Settings · Separate with \(speakerProfileLabel(resolved.profileID))"
+            }
+            return "Settings · Keep as Others"
         case .enabled:
-            return "On"
+            policy = "Separate with"
         case .disabled:
-            return "Off"
+            return "Keep as Others"
         }
+        return "\(policy) \(speakerProfileLabel(resolved.profileID))"
     }
 
     private func speakerProfileLabel(_ profile: MeetingDiarizationProfileID) -> String {
@@ -2075,127 +1948,197 @@ struct MeetingDetailView: View {
     @ViewBuilder
     private func transcriptSpeakerControls(for meeting: MeetingRecord) -> some View {
         let state = controller.meetingSpeakerControlsState(for: meeting)
+        let resolved = MeetingDiarizationPolicyResolver.resolve(
+            globalEnabled: appState.config.meetingFinalDiarizationEnabledByDefault,
+            globalProfileID: appState.config.resolvedMeetingFinalDiarizationProfile,
+            preference: state.preference
+        )
         let selectableModes = state.availablePresentations.filter {
             $0 == .manual || $0 == .separated || $0 == .collapsed
         }
-        if !selectableModes.isEmpty || state.warning != nil || state.canAnalyzeAgain {
-            VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
-                HStack(spacing: MuesliTheme.spacing12) {
-                    if !selectableModes.isEmpty, let activeMode = state.activePresentation {
-                        Text("Transcript view")
-                            .font(.system(size: 12, weight: .semibold))
-                            .foregroundStyle(MuesliTheme.textSecondary)
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+            HStack(spacing: MuesliTheme.spacing12) {
+                Label("Remote speakers", systemImage: "person.2.wave.2")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(MuesliTheme.textSecondary)
 
-                        Picker(
-                            "",
-                            selection: Binding(
-                                get: { activeMode },
-                                set: { mode in
-                                    controller.activateMeetingTranscriptPresentation(
-                                        meetingID: meeting.id,
-                                        mode: mode
-                                    ) { result in
-                                        if case .failure(let error) = result {
-                                            speakerAnalysisErrorMessage = error.localizedDescription
-                                        }
-                                    }
-                                }
-                            )
-                        ) {
-                            ForEach(selectableModes, id: \.self) { mode in
-                                Text(transcriptPresentationLabel(
-                                    mode,
-                                    collapsedLabel: state.collapsedPresentationLabel
-                                )).tag(mode)
+                if isAnalyzingSpeakers {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Analyzing speakers…")
+                            .font(MuesliTheme.captionMedium())
+                            .foregroundStyle(MuesliTheme.textTertiary)
+                    }
+                } else {
+                    Menu {
+                        Section("Final transcript") {
+                            Button {
+                                controller.setMeetingFinalDiarizationPolicy(
+                                    meetingID: meeting.id,
+                                    policy: .followSettings
+                                )
+                            } label: {
+                                Label(
+                                    appState.config.meetingFinalDiarizationEnabledByDefault
+                                        ? "Follow Settings — separate speakers"
+                                        : "Follow Settings — keep as Others",
+                                    systemImage: state.preference.finalPolicy == .followSettings
+                                        ? "checkmark"
+                                        : "gearshape"
+                                )
+                            }
+
+                            Button {
+                                controller.setMeetingFinalDiarizationPolicy(
+                                    meetingID: meeting.id,
+                                    policy: .enabled
+                                )
+                            } label: {
+                                Label(
+                                    "Separate speakers in this meeting",
+                                    systemImage: state.preference.finalPolicy == .enabled
+                                        ? "checkmark"
+                                        : "person.2"
+                                )
+                            }
+
+                            Button {
+                                controller.setMeetingFinalDiarizationPolicy(
+                                    meetingID: meeting.id,
+                                    policy: .disabled
+                                )
+                            } label: {
+                                Label(
+                                    "Keep all remote speech as Others",
+                                    systemImage: state.preference.finalPolicy == .disabled
+                                        ? "checkmark"
+                                        : "person.2.slash"
+                                )
                             }
                         }
-                        .pickerStyle(.segmented)
-                        .frame(width: presentationPickerWidth(for: selectableModes))
-                    }
 
-                    Spacer(minLength: MuesliTheme.spacing12)
+                        if resolved.enabled {
+                            Section("Model") {
+                                Button {
+                                    controller.setMeetingDiarizationProfile(
+                                        meetingID: meeting.id,
+                                        profileID: nil
+                                    )
+                                } label: {
+                                    Label(
+                                        "Use model selected in Settings",
+                                        systemImage: state.preference.preferredProfileID == nil
+                                            ? "checkmark"
+                                            : "gearshape"
+                                    )
+                                }
 
-                    if isAnalyzingSpeakers {
-                        HStack(spacing: 6) {
-                            ProgressView().controlSize(.small)
-                            Text("Analyzing speakers…")
-                                .font(MuesliTheme.captionMedium())
-                                .foregroundStyle(MuesliTheme.textTertiary)
+                                ForEach(installedSpeakerProfiles, id: \.self) { profile in
+                                    Button {
+                                        controller.setMeetingDiarizationProfile(
+                                            meetingID: meeting.id,
+                                            profileID: profile
+                                        )
+                                    } label: {
+                                        Label(
+                                            speakerProfileLabel(profile),
+                                            systemImage: state.preference.preferredProfileID == profile
+                                                ? "checkmark"
+                                                : "waveform.badge.magnifyingglass"
+                                        )
+                                    }
+                                }
+
+                                if speakerAssetStatuses.isEmpty {
+                                    Button("Checking installed models…") {}
+                                        .disabled(true)
+                                } else if installedSpeakerProfiles.isEmpty {
+                                    Button("No installed speaker models") {}
+                                        .disabled(true)
+                                }
+                            }
                         }
-                    } else {
-                        analyzeSpeakersMenu(for: meeting, state: state)
+
+                        if !selectableModes.isEmpty, let activeMode = state.activePresentation {
+                            Section("Transcript view") {
+                                ForEach(selectableModes, id: \.self) { mode in
+                                    Button {
+                                        controller.activateMeetingTranscriptPresentation(
+                                            meetingID: meeting.id,
+                                            mode: mode
+                                        ) { result in
+                                            if case .failure(let error) = result {
+                                                speakerAnalysisErrorMessage = error.localizedDescription
+                                            }
+                                        }
+                                    } label: {
+                                        Label(
+                                            transcriptPresentationLabel(
+                                                mode,
+                                                collapsedLabel: state.collapsedPresentationLabel
+                                            ),
+                                            systemImage: mode == activeMode
+                                                ? "checkmark"
+                                                : "text.alignleft"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+
+                        if state.canAnalyzeAgain, !installedSpeakerProfiles.isEmpty {
+                            Section("Analyze again") {
+                                ForEach(installedSpeakerProfiles, id: \.self) { profile in
+                                    Button {
+                                        startSpeakerAnalysis(for: meeting, profileID: profile)
+                                    } label: {
+                                        Label(
+                                            "Analyze again — \(speakerProfileLabel(profile))",
+                                            systemImage: "person.2.badge.gearshape"
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        HStack(spacing: 5) {
+                            Text(finalSpeakerControlLabel(state.preference, resolved: resolved))
+                            Image(systemName: "chevron.down")
+                                .font(.system(size: 8, weight: .semibold))
+                        }
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(MuesliTheme.textPrimary)
                     }
+                    .menuStyle(.borderlessButton)
+                    .menuIndicator(.hidden)
+                    .fixedSize()
                 }
 
-                if let warning = state.warning {
-                    Label(warning, systemImage: "exclamationmark.triangle")
-                        .font(MuesliTheme.captionMedium())
-                        .foregroundStyle(Color.orange)
-                        .fixedSize(horizontal: false, vertical: true)
-                } else if state.activePresentation == .collapsed,
-                          state.hasCompatibleAnalysis {
-                    Text("Speaker analysis is saved. \(state.collapsedPresentationLabel) is only the current presentation and can be reversed instantly.")
-                        .font(MuesliTheme.caption())
-                        .foregroundStyle(MuesliTheme.textTertiary)
-                }
+                Spacer(minLength: 0)
             }
-            .padding(MuesliTheme.spacing12)
-            .frame(maxWidth: 980, alignment: .leading)
-            .background(MuesliTheme.surfacePrimary.opacity(0.5))
-            .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
-            .overlay {
-                RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
-                    .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+
+            if let warning = state.warning {
+                Label(warning, systemImage: "exclamationmark.triangle")
+                    .font(MuesliTheme.captionMedium())
+                    .foregroundStyle(Color.orange)
+                    .fixedSize(horizontal: false, vertical: true)
             }
         }
-    }
-
-    @ViewBuilder
-    private func analyzeSpeakersMenu(
-        for meeting: MeetingRecord,
-        state: MeetingSpeakerControlsState
-    ) -> some View {
-        Menu {
-            ForEach(installedSpeakerProfiles, id: \.self) { profile in
-                Button {
-                    startSpeakerAnalysis(for: meeting, profileID: profile)
-                } label: {
-                    VStack(alignment: .leading) {
-                        Text(speakerProfileLabel(profile))
-                        if profile == .stableFourSpeaker {
-                            Text("Maximum 4 remote speakers")
-                        }
-                    }
-                }
-            }
-        } label: {
-            HStack(spacing: 6) {
-                Image(systemName: "person.2.badge.gearshape")
-                    .font(.system(size: 11, weight: .semibold))
-                Text("Analyze speakers again")
-                    .font(.system(size: 12, weight: .medium))
-                Image(systemName: "chevron.down")
-                    .font(.system(size: 8, weight: .semibold))
-            }
-            .foregroundStyle(MuesliTheme.textSecondary)
+        .frame(maxWidth: 980, alignment: .leading)
+        .padding(.horizontal, MuesliTheme.spacing12)
+        .padding(.vertical, MuesliTheme.spacing8)
+        .background(MuesliTheme.surfacePrimary.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+        .overlay {
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
+                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
         }
-        .menuStyle(.borderlessButton)
-        .fixedSize()
-        .disabled(!state.canAnalyzeAgain || installedSpeakerProfiles.isEmpty)
-        .help(
-            state.analyzeUnavailableReason
-                ?? (installedSpeakerProfiles.isEmpty
-                    ? "Install a speaker model from Models first."
-                    : "Run local speaker analysis without re-transcribing or re-summarizing")
-        )
     }
 
     private var installedSpeakerProfiles: [MeetingDiarizationProfileID] {
-        MeetingDiarizationProfileID.allCases.filter { profile in
-            speakerAssetStatuses.contains {
-                $0.profileID == profile && $0.state == .ready
-            }
-        }
+        MeetingDiarizationProfiles.installedConcreteProfiles(
+            from: speakerAssetStatuses
+        )
     }
 
     private func refreshSpeakerAssetStatuses() {
@@ -2230,12 +2173,6 @@ struct MeetingDetailView: View {
         case .collapsed: return collapsedLabel
         case .legacyRendered: return "Transcript"
         }
-    }
-
-    private func presentationPickerWidth(
-        for modes: [MeetingTranscriptPresentationMode]
-    ) -> CGFloat {
-        CGFloat(max(modes.count, 1)) * 88
     }
 
     private func staleSummaryBanner(for meeting: MeetingRecord) -> some View {
