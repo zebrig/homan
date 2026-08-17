@@ -1,5 +1,9 @@
 # Data Model: Local Meeting Diarization
 
+> **Planned follow-up**: [Specification 010](../010-diarization-model-selection-onboarding/spec.md)
+> materializes a concrete shared model preference for future Final/Live sessions while retaining
+> `.automatic` solely for legacy configuration/run/evidence decoding.
+
 The durable model separates recognized words, acoustic speaker activity, their join, and the text
 presentation selected by the user. `meetings.raw_transcript` remains an active materialized snapshot
 for backward compatibility; it is no longer the only source of truth.

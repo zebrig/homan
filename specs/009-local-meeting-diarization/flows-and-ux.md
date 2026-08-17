@@ -1,5 +1,9 @@
 # Processing Flows and UX: Local Meeting Diarization
 
+> **Planned follow-up**: [Specification 010](../010-diarization-model-selection-onboarding/spec.md)
+> replaces the user-facing Automatic/profile-install selection in this document once implemented.
+> Final/Live policy scope and all evidence/presentation flows below remain authoritative.
+
 This document is the product/flow contract for speaker separation. It complements the engine
 research. The central rule is that ASR text, acoustic speaker activity, attribution, and the text
 currently shown to the user are different objects with different lifecycles.

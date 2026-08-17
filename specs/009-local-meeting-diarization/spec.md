@@ -6,6 +6,10 @@
 
 **Status**: Implemented behind opt-in Final and Live defaults; quality/default rollout gate pending
 
+**Planned UX follow-up**: [Specification 010](../010-diarization-model-selection-onboarding/spec.md)
+replaces the user-facing Automatic/Models/Settings selection model and adds onboarding download
+planning. Until 010 is implemented, the behavior documented below remains the shipping behavior.
+
 **Input**: "Run remote-participant diarization on the Mac under Homan's control, independently of
 the selected transcription provider. Understand and deliberately integrate the currently unused
 FluidAudio Sortformer engines and presets without weakening source roles, recovery, or existing

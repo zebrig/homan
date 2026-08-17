@@ -5,6 +5,11 @@ rollout approval remain open
 
 **Specification**: [spec.md](spec.md)
 
+**Planned selection/onboarding follow-up**:
+[Specification 010](../010-diarization-model-selection-onboarding/spec.md) replaces only the
+user-facing Automatic/Models/Settings selection plan and adds Wizard preparation. It does not
+replace this plan's provider, evidence, source-role, scheduling, or processing contracts.
+
 ## Summary
 
 Refactor meeting diarization from a concrete helper hidden inside `TranscriptionCoordinator` into
