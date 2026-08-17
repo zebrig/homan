@@ -24,6 +24,7 @@ enum MeetingProcessingPurpose: String, Codable, Sendable, Hashable {
 
 enum SystemDiarizationPolicy: String, Codable, Sendable, Hashable {
     case disabled
+    case reuseCompatible = "reuse_compatible"
     case optionalPost = "optional_post"
 }
 
@@ -54,11 +55,13 @@ struct MeetingLanguageSnapshot: Codable, Equatable, Sendable {
 }
 
 struct SourceRecognizedSegment: Equatable, Sendable {
+    let id: String
     let source: MeetingAudioSourceRole
     let startSeconds: TimeInterval
     let endSeconds: TimeInterval
     let text: String
     let confidence: Float?
+    let timestampPrecision: ASRTimestampPrecision
 }
 
 struct AttributedTurn: Equatable, Sendable {
@@ -161,7 +164,10 @@ struct MeetingTranscriptionRequest: Sendable {
     let languages: MeetingLanguageSnapshot
     let purpose: MeetingProcessingPurpose
     let systemDiarization: SystemDiarizationPolicy
+    let diarizationProfileID: MeetingDiarizationProfileID
     let aecModel: MeetingAecModel
+    let reusableDiarization: MeetingDiarizationRevision?
+    let progress: @Sendable (MeetingTranscriptionPipelineStage) -> Void
 
     init(
         units: [MeetingRecordingUnitInput],
@@ -169,22 +175,38 @@ struct MeetingTranscriptionRequest: Sendable {
         languages: MeetingLanguageSnapshot,
         purpose: MeetingProcessingPurpose,
         systemDiarization: SystemDiarizationPolicy,
-        aecModel: MeetingAecModel = .defaultModel
+        diarizationProfileID: MeetingDiarizationProfileID = .automatic,
+        aecModel: MeetingAecModel = .defaultModel,
+        reusableDiarization: MeetingDiarizationRevision? = nil,
+        progress: @escaping @Sendable (MeetingTranscriptionPipelineStage) -> Void = { _ in }
     ) {
         self.units = units
         self.backend = backend
         self.languages = languages
         self.purpose = purpose
         self.systemDiarization = systemDiarization
+        self.diarizationProfileID = diarizationProfileID
         self.aecModel = aecModel
+        self.reusableDiarization = reusableDiarization
+        self.progress = progress
     }
 }
 
+enum MeetingTranscriptionPipelineStage: Sendable, Equatable {
+    case transcribing
+    case preparingDiarizer
+    case diarizing
+    case applyingSpeakerLabels
+}
+
 struct MeetingUnitTranscriptionResult: Sendable {
+    let unitID: String
     let sessionID: UUID?
+    let startedAt: Date
     let attributedTurns: [AttributedTurn]
     let formattedTranscript: String
     let degradations: [MeetingProcessingDegradation]
+    let recognizedSegments: [SourceRecognizedSegment]
     let microphoneSegments: [SpeechSegment]
     let systemSegments: [SpeechSegment]
     let diarizationSegments: [TimedSpeakerSegment]?
@@ -195,12 +217,17 @@ struct MeetingTranscriptionResult: Sendable {
     let attributedTurns: [AttributedTurn]
     let formattedTranscript: String
     let degradations: [MeetingProcessingDegradation]
+    let systemTimelineMap: MeetingSystemTimelineMap?
+    let diarizationProfile: MeetingDiarizationProfileSnapshot?
+    let diarizationTimings: MeetingDiarizationTimings?
+    let reusedDiarizationRevisionID: UUID?
 }
 
 enum MeetingTranscriptionPipelineError: Error, LocalizedError, Equatable {
     case noRecordingUnits
     case noUsableAudio
     case emptyTranscript
+    case compatibleDiarizationUnavailable
     case sourceBundleVersionUnsupported(Int)
 
     var errorDescription: String? {
@@ -211,6 +238,8 @@ enum MeetingTranscriptionPipelineError: Error, LocalizedError, Equatable {
             return "The retained meeting recording does not contain usable audio."
         case .emptyTranscript:
             return "The selected model did not produce any meeting transcript."
+        case .compatibleDiarizationUnavailable:
+            return "The saved speaker analysis no longer matches this recording or the current speaker profile."
         case .sourceBundleVersionUnsupported(let version):
             return "This meeting uses a newer source-audio format (version \(version)). Playback is still available."
         }

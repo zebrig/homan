@@ -36,7 +36,7 @@ enum TranscriptFormatter {
     ) -> [AttributedTurn] {
         let speakerLabelMap = remoteSpeakerLabelMap(for: diarizationSegments ?? [])
         let microphoneTurns = micSegments.map {
-            AttributedTurn(
+            return AttributedTurn(
                 sourceRole: .you,
                 remoteSpeaker: nil,
                 startSeconds: $0.start,
@@ -82,16 +82,29 @@ enum TranscriptFormatter {
 
     static func legacyAttributedTurns(
         segments: [SpeechSegment],
+        diarizationSegments: [TimedSpeakerSegment]? = nil,
         recordingSessionID: UUID?,
         isProvisional: Bool
     ) -> [AttributedTurn] {
-        consolidateTurns(segments.map {
-            AttributedTurn(
+        let speakerLabelMap = remoteSpeakerLabelMap(for: diarizationSegments ?? [])
+        return consolidateTurns(segments.map { segment in
+            let speaker: String?
+            if let diarizationSegments, !diarizationSegments.isEmpty {
+                let resolved = findSpeaker(
+                    for: segment,
+                    in: diarizationSegments,
+                    labelMap: speakerLabelMap
+                )
+                speaker = resolved == "Others" ? nil : resolved
+            } else {
+                speaker = nil
+            }
+            return AttributedTurn(
                 sourceRole: .legacyUnknown,
-                remoteSpeaker: nil,
-                startSeconds: $0.start,
-                endSeconds: $0.end,
-                text: $0.text,
+                remoteSpeaker: speaker,
+                startSeconds: segment.start,
+                endSeconds: segment.end,
+                text: segment.text,
                 isProvisional: isProvisional,
                 recordingSessionID: recordingSessionID
             )
@@ -177,7 +190,7 @@ enum TranscriptFormatter {
         case .others:
             return turn.remoteSpeaker ?? "Others"
         case .legacyUnknown:
-            return "Speaker"
+            return turn.remoteSpeaker ?? "Speaker"
         }
     }
 

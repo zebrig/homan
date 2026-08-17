@@ -239,6 +239,24 @@ enum LocalVQELibraryLocator {
     }
 }
 
+/// LocalVQE embeds a ggml runtime whose process-wide initialization and
+/// teardown are not safe to enter from two independent contexts at once.
+///
+/// Meeting capture itself never takes this lock: raw callbacks only enqueue
+/// samples. The lock is acquired by model preparation and the bounded AEC
+/// worker on `MeetingSession.chunkRotationQueue` / post-processing workers.
+/// This keeps a newly started Live session from racing an older meeting's
+/// post-AEC pass without putting native work on an audio callback.
+enum LocalVQENativeRuntimeGate {
+    private static let lock = NSLock()
+
+    static func withLock<T>(_ body: () throws -> T) rethrows -> T {
+        lock.lock()
+        defer { lock.unlock() }
+        return try body()
+    }
+}
+
 final class LocalVQEAudioProcessor: MeetingAecProcessor {
     let name: String
     let model: MeetingAecModel
@@ -278,15 +296,17 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
         modelPath = modelURL.path
         libraryPath = libraryURL.path
         var error = [CChar](repeating: 0, count: 2048)
-        context = modelPath.withCString { modelCString in
-            libraryPath.withCString { libraryCString in
-                muesli_localvqe_create(
-                    modelCString,
-                    libraryCString,
-                    Int32(threads),
-                    &error,
-                    Int32(error.count)
-                )
+        context = LocalVQENativeRuntimeGate.withLock {
+            modelPath.withCString { modelCString in
+                libraryPath.withCString { libraryCString in
+                    muesli_localvqe_create(
+                        modelCString,
+                        libraryCString,
+                        Int32(threads),
+                        &error,
+                        Int32(error.count)
+                    )
+                }
             }
         }
 
@@ -294,8 +314,12 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
             throw LocalVQEError.loadFailed(String(cString: error))
         }
 
-        sampleRate = Int(muesli_localvqe_sample_rate(context))
-        frameSize = Int(muesli_localvqe_hop_length(context))
+        (sampleRate, frameSize) = LocalVQENativeRuntimeGate.withLock {
+            (
+                Int(muesli_localvqe_sample_rate(context)),
+                Int(muesli_localvqe_hop_length(context))
+            )
+        }
         guard sampleRate == 16_000, frameSize == 256 else {
             throw LocalVQEError.invalidRuntime(sampleRate: sampleRate, hopLength: frameSize)
         }
@@ -303,13 +327,17 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
 
     deinit {
         if let context {
-            muesli_localvqe_destroy(context)
+            LocalVQENativeRuntimeGate.withLock {
+                muesli_localvqe_destroy(context)
+            }
         }
     }
 
     func reset() {
         guard let context else { return }
-        muesli_localvqe_reset(context)
+        LocalVQENativeRuntimeGate.withLock {
+            muesli_localvqe_reset(context)
+        }
     }
 
     func processFrame(mic: [Float], reference: [Float]) throws -> [Float] {
@@ -319,22 +347,28 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
         }
 
         var output = [Float](repeating: 0, count: frameSize)
-        let status = mic.withUnsafeBufferPointer { micBuffer in
-            reference.withUnsafeBufferPointer { referenceBuffer in
-                output.withUnsafeMutableBufferPointer { outputBuffer in
-                    muesli_localvqe_process_frame_f32(
-                        context,
-                        micBuffer.baseAddress,
-                        referenceBuffer.baseAddress,
-                        Int32(frameSize),
-                        outputBuffer.baseAddress
-                    )
+        let result: (status: Int32, error: String?) = LocalVQENativeRuntimeGate.withLock {
+            let status = mic.withUnsafeBufferPointer { micBuffer in
+                reference.withUnsafeBufferPointer { referenceBuffer in
+                    output.withUnsafeMutableBufferPointer { outputBuffer in
+                        muesli_localvqe_process_frame_f32(
+                            context,
+                            micBuffer.baseAddress,
+                            referenceBuffer.baseAddress,
+                            Int32(frameSize),
+                            outputBuffer.baseAddress
+                        )
+                    }
                 }
             }
+            let message = status == 0
+                ? nil
+                : String(cString: muesli_localvqe_last_error(context))
+            return (status, message)
         }
 
-        guard status == 0 else {
-            throw LocalVQEError.processFailed(String(cString: muesli_localvqe_last_error(context)))
+        guard result.status == 0 else {
+            throw LocalVQEError.processFailed(result.error ?? "unknown native error")
         }
         return output
     }

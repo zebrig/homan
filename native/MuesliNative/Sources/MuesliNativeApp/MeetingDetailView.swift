@@ -11,6 +11,22 @@ private enum RecordingContentMode: Hashable {
     case live
 }
 
+private enum MeetingRetranscriptionSpeakerChoice: Hashable {
+    case meetingDefault
+    case reuseCompatible
+    case rerun(MeetingDiarizationProfileID)
+    case disabled
+
+    var runMode: MeetingDiarizationRunMode {
+        switch self {
+        case .meetingDefault: return .meetingDefault
+        case .reuseCompatible: return .reuseCompatible
+        case .rerun(let profile): return .rerun(profile)
+        case .disabled: return .disabled
+        }
+    }
+}
+
 private enum ManualNotesSaveStatus {
     case saved
     case saving
@@ -78,6 +94,7 @@ struct MeetingDetailView: View {
     let backLabel: String
     @State private var isSummarizing = false
     @State private var isRetranscribing = false
+    @State private var isAnalyzingSpeakers = false
     @State private var isEditingNotes = false
     @State private var isEditingTranscript = false
     @State private var editableTitle: String
@@ -96,6 +113,10 @@ struct MeetingDetailView: View {
     @State private var manualNotesSaveStatusTask: DispatchWorkItem?
     @State private var summaryErrorMessage: String?
     @State private var retranscriptionErrorMessage: String?
+    @State private var speakerAnalysisErrorMessage: String?
+    @State private var showRetranscriptionOptions = false
+    @State private var retranscriptionBackendKey = ""
+    @State private var retranscriptionSpeakerChoice: MeetingRetranscriptionSpeakerChoice = .meetingDefault
     @State private var showDeleteConfirmation = false
     @State private var recordingPendingDeletion: MeetingRecordingRecord?
     @State private var showDeleteAllAudioConfirmation = false
@@ -110,6 +131,7 @@ struct MeetingDetailView: View {
     @State private var isMeetingAudioExpanded = false
     @State private var isManualNotesExpanded: Bool
     @State private var manualNotesChangedLocally = false
+    @State private var speakerAssetStatuses: [MeetingDiarizationAssetStatus] = []
 
     init(
         meeting: MeetingRecord?,
@@ -168,9 +190,11 @@ struct MeetingDetailView: View {
                     .background(MuesliTheme.backgroundBase)
                     .onAppear {
                         threadContext = controller.meetingThreadContext(for: meeting.id)
+                        refreshSpeakerAssetStatuses()
                     }
                     .onChange(of: meeting.id) { _, _ in
                         syncLocalState(with: meeting)
+                        refreshSpeakerAssetStatuses()
                     }
                     .onChange(of: meeting.status) { _, _ in
                         isManualNotesExpanded = Self.defaultManualNotesExpansion(for: meeting)
@@ -222,6 +246,18 @@ struct MeetingDetailView: View {
             }
         } message: {
             Text(retranscriptionErrorMessage ?? "The saved recording could not be re-transcribed.")
+        }
+        .alert("Couldn't Analyze Speakers", isPresented: speakerAnalysisErrorBinding) {
+            Button("OK", role: .cancel) {
+                speakerAnalysisErrorMessage = nil
+            }
+        } message: {
+            Text(speakerAnalysisErrorMessage ?? "Remote speakers could not be analyzed.")
+        }
+        .sheet(isPresented: $showRetranscriptionOptions) {
+            if let meeting {
+                retranscriptionOptionsSheet(for: meeting)
+            }
         }
         .alert("Re-summarize Notes?", isPresented: transcriptResummaryPromptBinding) {
             Button("Re-summarize") {
@@ -326,6 +362,8 @@ struct MeetingDetailView: View {
 
             activeMeetingMicrophoneControl(for: meeting)
 
+            meetingFinalSpeakerPolicyControl(for: meeting)
+
             meetingAudioSection(for: meeting)
 
             activeMeetingAudioWarningBanner(for: meeting)
@@ -345,6 +383,9 @@ struct MeetingDetailView: View {
         }
         if meeting.status == .recording,
            appState.activeMeetingMicrophone?.meetingID == meeting.id {
+            return true
+        }
+        if meeting.status == .recording {
             return true
         }
         if !controller.meetingRecordingUnits(for: meeting.id).isEmpty {
@@ -556,6 +597,158 @@ struct MeetingDetailView: View {
                         lineWidth: 1
                     )
             )
+        }
+    }
+
+    @ViewBuilder
+    private func meetingFinalSpeakerPolicyControl(for meeting: MeetingRecord) -> some View {
+        let state = controller.meetingSpeakerControlsState(for: meeting)
+        let resolved = MeetingDiarizationPolicyResolver.resolve(
+            globalEnabled: appState.config.meetingFinalDiarizationEnabledByDefault,
+            globalProfileID: appState.config.resolvedMeetingFinalDiarizationProfile,
+            preference: state.preference
+        )
+        HStack(spacing: MuesliTheme.spacing12) {
+            Label("Final remote speakers", systemImage: "person.2.wave.2")
+                .font(.system(size: 12, weight: .semibold))
+                .foregroundStyle(MuesliTheme.textSecondary)
+
+            Menu {
+                Button {
+                    controller.setMeetingFinalDiarizationPolicy(
+                        meetingID: meeting.id,
+                        policy: .followSettings
+                    )
+                } label: {
+                    Label(
+                        "Follow Settings",
+                        systemImage: state.preference.finalPolicy == .followSettings
+                            ? "checkmark"
+                            : "gearshape"
+                    )
+                }
+                Button {
+                    controller.setMeetingFinalDiarizationPolicy(
+                        meetingID: meeting.id,
+                        policy: .enabled
+                    )
+                } label: {
+                    Label(
+                        "On",
+                        systemImage: state.preference.finalPolicy == .enabled
+                            ? "checkmark"
+                            : "person.2"
+                    )
+                }
+                Button {
+                    controller.setMeetingFinalDiarizationPolicy(
+                        meetingID: meeting.id,
+                        policy: .disabled
+                    )
+                } label: {
+                    Label(
+                        "Off — use Others",
+                        systemImage: state.preference.finalPolicy == .disabled
+                            ? "checkmark"
+                            : "person.2.slash"
+                    )
+                }
+            } label: {
+                HStack(spacing: 5) {
+                    Text(finalSpeakerPolicyLabel(state.preference, resolved: resolved))
+                    Image(systemName: "chevron.down")
+                        .font(.system(size: 8, weight: .semibold))
+                }
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(MuesliTheme.textPrimary)
+            }
+            .menuStyle(.borderlessButton)
+            .fixedSize()
+
+            if resolved.enabled {
+                Divider()
+                    .frame(height: 18)
+                    .background(MuesliTheme.surfaceBorder)
+
+                Menu {
+                    Button {
+                        controller.setMeetingDiarizationProfile(
+                            meetingID: meeting.id,
+                            profileID: nil
+                        )
+                    } label: {
+                        Label(
+                            "Follow Settings",
+                            systemImage: state.preference.preferredProfileID == nil
+                                ? "checkmark"
+                                : "gearshape"
+                        )
+                    }
+                    Divider()
+                    ForEach(MeetingDiarizationProfileID.allCases, id: \.self) { profile in
+                        Button {
+                            controller.setMeetingDiarizationProfile(
+                                meetingID: meeting.id,
+                                profileID: profile
+                            )
+                        } label: {
+                            Label(
+                                speakerProfileLabel(profile),
+                                systemImage: state.preference.preferredProfileID == profile
+                                    ? "checkmark"
+                                    : "waveform.badge.magnifyingglass"
+                            )
+                        }
+                    }
+                } label: {
+                    HStack(spacing: 5) {
+                        Text(speakerProfileLabel(resolved.profileID))
+                        Image(systemName: "chevron.down")
+                            .font(.system(size: 8, weight: .semibold))
+                    }
+                    .font(MuesliTheme.captionMedium())
+                    .foregroundStyle(MuesliTheme.textTertiary)
+                }
+                .menuStyle(.borderlessButton)
+                .fixedSize()
+            }
+
+            Spacer(minLength: 0)
+
+            Text("Applies to Final processing, not Live")
+                .font(MuesliTheme.caption())
+                .foregroundStyle(MuesliTheme.textTertiary)
+        }
+        .frame(maxWidth: 980, alignment: .leading)
+        .padding(.horizontal, MuesliTheme.spacing12)
+        .padding(.vertical, MuesliTheme.spacing8)
+        .background(MuesliTheme.surfacePrimary.opacity(0.55))
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+        .overlay {
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
+                .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+        }
+    }
+
+    private func finalSpeakerPolicyLabel(
+        _ preference: MeetingDiarizationPreference,
+        resolved: ResolvedMeetingDiarizationPolicy
+    ) -> String {
+        switch preference.finalPolicy {
+        case .followSettings:
+            return "Follow Settings — \(resolved.enabled ? "On" : "Off")"
+        case .enabled:
+            return "On"
+        case .disabled:
+            return "Off"
+        }
+    }
+
+    private func speakerProfileLabel(_ profile: MeetingDiarizationProfileID) -> String {
+        switch profile {
+        case .automatic: return "Automatic"
+        case .offlineQuality: return "Offline quality"
+        case .stableFourSpeaker: return "Stable up to 4"
         }
     }
 
@@ -901,6 +1094,12 @@ struct MeetingDetailView: View {
         } else {
             VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
                 manualNotesSection(for: meeting)
+                if controller.meetingSpeakerControlsState(for: meeting).summaryIsStale {
+                    staleSummaryBanner(for: meeting)
+                }
+                if documentMode == .transcript {
+                    transcriptSpeakerControls(for: meeting)
+                }
                 contentToolbar(for: meeting)
                 processingMetadataView(for: meeting, mode: documentMode)
 
@@ -944,6 +1143,7 @@ struct MeetingDetailView: View {
     @ViewBuilder
     private func activeMeetingLiveControls(for meeting: MeetingRecord) -> some View {
         let state = appState.meetingLiveState
+        let diarizationState = appState.meetingLiveDiarizationState
         let descriptor = MeetingASRModelCatalog.resolve(id: state.selection)
         VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
             VStack(alignment: .leading, spacing: 5) {
@@ -972,6 +1172,53 @@ struct MeetingDetailView: View {
             Text(liveStatusDescription(state: state, descriptor: descriptor))
                 .font(MuesliTheme.captionMedium())
                 .foregroundStyle(state.phase == .failed ? MuesliTheme.recording : MuesliTheme.textTertiary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            Divider()
+
+            HStack(alignment: .center, spacing: MuesliTheme.spacing12) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Separate remote speakers")
+                        .font(MuesliTheme.captionMedium())
+                        .foregroundStyle(MuesliTheme.textPrimary)
+                    Text("Provisional Live labels for system audio only")
+                        .font(MuesliTheme.caption())
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                }
+                Spacer(minLength: MuesliTheme.spacing12)
+                Toggle(
+                    "",
+                    isOn: Binding(
+                        get: { diarizationState.enabled },
+                        set: { enabled in
+                            controller.setActiveMeetingLiveDiarizationEnabled(
+                                enabled,
+                                meetingID: meeting.id
+                            )
+                        }
+                    )
+                )
+                .labelsHidden()
+                .toggleStyle(.switch)
+            }
+
+            HStack(spacing: MuesliTheme.spacing8) {
+                liveDiarizationStatusBadge(state: diarizationState)
+                if diarizationState.epoch > 1,
+                   diarizationState.phase != .off {
+                    Text("Epoch \(diarizationState.epoch)")
+                        .font(MuesliTheme.caption())
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                }
+            }
+
+            Text(liveDiarizationStatusDescription(diarizationState))
+                .font(MuesliTheme.captionMedium())
+                .foregroundStyle(
+                    diarizationState.phase == .failed
+                        ? MuesliTheme.recording
+                        : MuesliTheme.textTertiary
+                )
                 .fixedSize(horizontal: false, vertical: true)
         }
         .padding(MuesliTheme.spacing12)
@@ -1072,6 +1319,55 @@ struct MeetingDetailView: View {
             .padding(.vertical, 4)
             .background(color.opacity(0.12))
             .clipShape(Capsule())
+    }
+
+    @ViewBuilder
+    private func liveDiarizationStatusBadge(
+        state: MeetingLiveDiarizationRuntimeState
+    ) -> some View {
+        switch state.phase {
+        case .off:
+            statusPill("Speaker labels off", color: MuesliTheme.textTertiary)
+        case .loading:
+            HStack(spacing: 5) {
+                ProgressView()
+                    .controlSize(.small)
+                    .frame(width: 12, height: 12)
+                Text("Loading speaker model")
+                    .font(.system(size: 11, weight: .semibold))
+            }
+            .foregroundStyle(MuesliTheme.textSecondary)
+        case .running:
+            statusPill("Remote speakers live", color: MuesliTheme.success)
+        case .suspended:
+            statusPill("Speaker labels paused", color: MuesliTheme.textSecondary)
+        case .lagging:
+            statusPill("Speaker labels catching up", color: .orange)
+        case .failed:
+            statusPill("Speaker labels unavailable", color: MuesliTheme.recording)
+        }
+    }
+
+    private func liveDiarizationStatusDescription(
+        _ state: MeetingLiveDiarizationRuntimeState
+    ) -> String {
+        if let message = state.message, !message.isEmpty {
+            return message
+        }
+        switch state.phase {
+        case .off:
+            return "Independent from Live transcription. Final speaker separation follows this meeting’s Final setting."
+        case .loading:
+            return "Loading the installed Stable up to 4 model. Earlier audio is not backfilled."
+        case .running:
+            return "Remote labels are provisional. Microphone speech always remains You."
+        case .suspended:
+            return "Speaker separation resumes with the meeting recording."
+        case .lagging:
+            return "Only provisional labels are delayed; raw recording and captions continue."
+        case .failed:
+            return "Install or repair Stable up to 4 in Models, then enable this again. Raw recording and captions are unaffected."
+        }
     }
 
     @ViewBuilder
@@ -1465,7 +1761,12 @@ struct MeetingDetailView: View {
                     || isSummarizing
                 HStack(spacing: 0) {
                     Button {
-                        startRetranscription(for: meeting)
+                        if controller.meetingSpeakerControlsState(for: meeting)
+                            .activePresentation == .manual {
+                            openRetranscriptionOptions(for: meeting)
+                        } else {
+                            startRetranscription(for: meeting)
+                        }
                     } label: {
                         HStack(spacing: 4) {
                             Image(systemName: "arrow.clockwise")
@@ -1503,22 +1804,8 @@ struct MeetingDetailView: View {
 
     private func retranscriptionBackendOverrideMenu(for meeting: MeetingRecord) -> some View {
         let options = controller.availableMeetingRetranscriptionBackends()
-        return Menu {
-            Section("Run once with") {
-                ForEach(options.indices, id: \.self) { index in
-                    let option = options[index]
-                    Button {
-                        startRetranscription(for: meeting, using: option)
-                    } label: {
-                        HStack {
-                            if index == 0 {
-                                Image(systemName: "checkmark")
-                            }
-                            Text(index == 0 ? "\(option.label) — Default" : option.label)
-                        }
-                    }
-                }
-            }
+        return Button {
+            openRetranscriptionOptions(for: meeting)
         } label: {
             Image(systemName: "chevron.down")
                 .font(.system(size: 8, weight: .bold))
@@ -1526,19 +1813,34 @@ struct MeetingDetailView: View {
                 .frame(width: 24)
                 .contentShape(Rectangle())
         }
-        .menuStyle(.borderlessButton)
-        .menuIndicator(.hidden)
+        .buttonStyle(.plain)
         .fixedSize()
         .disabled(options.isEmpty)
-        .help("Re-transcribe once with another downloaded model")
+        .help("Choose one-time transcription and remote-speaker options")
+    }
+
+    private func openRetranscriptionOptions(for meeting: MeetingRecord) {
+        let options = controller.availableMeetingRetranscriptionBackends()
+        guard let first = options.first else { return }
+        retranscriptionBackendKey = backendKey(first)
+        let state = controller.meetingSpeakerControlsState(for: meeting)
+        retranscriptionSpeakerChoice = state.hasCompatibleAnalysis
+            ? .reuseCompatible
+            : .meetingDefault
+        showRetranscriptionOptions = true
     }
 
     private func startRetranscription(
         for meeting: MeetingRecord,
-        using backend: BackendOption? = nil
+        using backend: BackendOption? = nil,
+        diarizationMode: MeetingDiarizationRunMode = .meetingDefault
     ) {
         isRetranscribing = true
-        controller.retranscribe(meeting: meeting, using: backend) { [meeting] result in
+        controller.retranscribe(
+            meeting: meeting,
+            using: backend,
+            diarizationMode: diarizationMode
+        ) { [meeting] result in
             isRetranscribing = false
             switch result {
             case .success:
@@ -1549,6 +1851,124 @@ struct MeetingDetailView: View {
                 retranscriptionErrorMessage = error.localizedDescription
             }
         }
+    }
+
+    @ViewBuilder
+    private func retranscriptionOptionsSheet(for meeting: MeetingRecord) -> some View {
+        let options = controller.availableMeetingRetranscriptionBackends()
+        let state = controller.meetingSpeakerControlsState(for: meeting)
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing20) {
+            VStack(alignment: .leading, spacing: 5) {
+                Text("Re-transcribe Meeting")
+                    .font(MuesliTheme.title3())
+                    .foregroundStyle(MuesliTheme.textPrimary)
+                Text("These choices apply to this run only and do not change Settings or this meeting's default.")
+                    .font(MuesliTheme.captionMedium())
+                    .foregroundStyle(MuesliTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            if state.activePresentation == .manual {
+                Label(
+                    "A manually edited transcript is active. Re-transcription will show a new generated version, but your Manual version will remain saved and can be restored from Transcript view.",
+                    systemImage: "exclamationmark.triangle"
+                )
+                .font(MuesliTheme.captionMedium())
+                .foregroundStyle(.orange)
+                .fixedSize(horizontal: false, vertical: true)
+                .padding(MuesliTheme.spacing12)
+                .background(Color.orange.opacity(0.08))
+                .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+            }
+
+            VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+                Text("Transcription")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(MuesliTheme.textSecondary)
+                Picker("", selection: $retranscriptionBackendKey) {
+                    ForEach(options.indices, id: \.self) { index in
+                        let option = options[index]
+                        Text(index == 0 ? "\(option.label) — Default" : option.label)
+                            .tag(backendKey(option))
+                    }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+            }
+
+            VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+                Text("Remote speakers")
+                    .font(.system(size: 12, weight: .semibold))
+                    .foregroundStyle(MuesliTheme.textSecondary)
+                Picker("", selection: $retranscriptionSpeakerChoice) {
+                    Text("Use meeting setting")
+                        .tag(MeetingRetranscriptionSpeakerChoice.meetingDefault)
+                    if state.hasCompatibleAnalysis {
+                        Text("Keep current speaker analysis")
+                            .tag(MeetingRetranscriptionSpeakerChoice.reuseCompatible)
+                    }
+                    if !installedSpeakerProfiles.isEmpty {
+                        Divider()
+                        ForEach(installedSpeakerProfiles, id: \.self) { profile in
+                            Text("Analyze again — \(speakerProfileLabel(profile))")
+                                .tag(MeetingRetranscriptionSpeakerChoice.rerun(profile))
+                        }
+                    }
+                    Divider()
+                    Text("Off — label remote audio as Others")
+                        .tag(MeetingRetranscriptionSpeakerChoice.disabled)
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity)
+
+                Text(retranscriptionSpeakerChoiceDescription)
+                    .font(MuesliTheme.caption())
+                    .foregroundStyle(MuesliTheme.textTertiary)
+                    .fixedSize(horizontal: false, vertical: true)
+            }
+
+            HStack(spacing: MuesliTheme.spacing8) {
+                Spacer()
+                Button("Cancel") {
+                    showRetranscriptionOptions = false
+                }
+                Button("Re-transcribe") {
+                    guard let backend = options.first(where: {
+                        backendKey($0) == retranscriptionBackendKey
+                    }) else { return }
+                    let mode = retranscriptionSpeakerChoice.runMode
+                    showRetranscriptionOptions = false
+                    startRetranscription(
+                        for: meeting,
+                        using: backend,
+                        diarizationMode: mode
+                    )
+                }
+                .keyboardShortcut(.defaultAction)
+                .disabled(options.isEmpty)
+            }
+        }
+        .padding(MuesliTheme.spacing24)
+        .frame(width: 520)
+    }
+
+    private var retranscriptionSpeakerChoiceDescription: String {
+        switch retranscriptionSpeakerChoice {
+        case .meetingDefault:
+            return "Resolves Follow Settings / On / Off for this meeting. A compatible saved analysis is reused automatically."
+        case .reuseCompatible:
+            return "Runs no diarizer. The saved analysis must still match the retained system-audio timeline."
+        case .rerun(.stableFourSpeaker):
+            return "Runs Sortformer locally once. Use only when there are no more than four remote speakers."
+        case .rerun:
+            return "Runs the selected local speaker model once after transcription."
+        case .disabled:
+            return "Runs no speaker model. Microphone remains You and all system audio is shown as Others."
+        }
+    }
+
+    private func backendKey(_ option: BackendOption) -> String {
+        "\(option.backend)\u{1f}\(option.model)"
     }
 
     @ViewBuilder
@@ -1650,6 +2070,199 @@ struct MeetingDetailView: View {
             .frame(maxWidth: .infinity, alignment: .trailing)
         }
         .frame(maxWidth: 980, alignment: .leading)
+    }
+
+    @ViewBuilder
+    private func transcriptSpeakerControls(for meeting: MeetingRecord) -> some View {
+        let state = controller.meetingSpeakerControlsState(for: meeting)
+        let selectableModes = state.availablePresentations.filter {
+            $0 == .manual || $0 == .separated || $0 == .collapsed
+        }
+        if !selectableModes.isEmpty || state.warning != nil || state.canAnalyzeAgain {
+            VStack(alignment: .leading, spacing: MuesliTheme.spacing8) {
+                HStack(spacing: MuesliTheme.spacing12) {
+                    if !selectableModes.isEmpty, let activeMode = state.activePresentation {
+                        Text("Transcript view")
+                            .font(.system(size: 12, weight: .semibold))
+                            .foregroundStyle(MuesliTheme.textSecondary)
+
+                        Picker(
+                            "",
+                            selection: Binding(
+                                get: { activeMode },
+                                set: { mode in
+                                    controller.activateMeetingTranscriptPresentation(
+                                        meetingID: meeting.id,
+                                        mode: mode
+                                    ) { result in
+                                        if case .failure(let error) = result {
+                                            speakerAnalysisErrorMessage = error.localizedDescription
+                                        }
+                                    }
+                                }
+                            )
+                        ) {
+                            ForEach(selectableModes, id: \.self) { mode in
+                                Text(transcriptPresentationLabel(
+                                    mode,
+                                    collapsedLabel: state.collapsedPresentationLabel
+                                )).tag(mode)
+                            }
+                        }
+                        .pickerStyle(.segmented)
+                        .frame(width: presentationPickerWidth(for: selectableModes))
+                    }
+
+                    Spacer(minLength: MuesliTheme.spacing12)
+
+                    if isAnalyzingSpeakers {
+                        HStack(spacing: 6) {
+                            ProgressView().controlSize(.small)
+                            Text("Analyzing speakers…")
+                                .font(MuesliTheme.captionMedium())
+                                .foregroundStyle(MuesliTheme.textTertiary)
+                        }
+                    } else {
+                        analyzeSpeakersMenu(for: meeting, state: state)
+                    }
+                }
+
+                if let warning = state.warning {
+                    Label(warning, systemImage: "exclamationmark.triangle")
+                        .font(MuesliTheme.captionMedium())
+                        .foregroundStyle(Color.orange)
+                        .fixedSize(horizontal: false, vertical: true)
+                } else if state.activePresentation == .collapsed,
+                          state.hasCompatibleAnalysis {
+                    Text("Speaker analysis is saved. \(state.collapsedPresentationLabel) is only the current presentation and can be reversed instantly.")
+                        .font(MuesliTheme.caption())
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                }
+            }
+            .padding(MuesliTheme.spacing12)
+            .frame(maxWidth: 980, alignment: .leading)
+            .background(MuesliTheme.surfacePrimary.opacity(0.5))
+            .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+            .overlay {
+                RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
+                    .strokeBorder(MuesliTheme.surfaceBorder, lineWidth: 1)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private func analyzeSpeakersMenu(
+        for meeting: MeetingRecord,
+        state: MeetingSpeakerControlsState
+    ) -> some View {
+        Menu {
+            ForEach(installedSpeakerProfiles, id: \.self) { profile in
+                Button {
+                    startSpeakerAnalysis(for: meeting, profileID: profile)
+                } label: {
+                    VStack(alignment: .leading) {
+                        Text(speakerProfileLabel(profile))
+                        if profile == .stableFourSpeaker {
+                            Text("Maximum 4 remote speakers")
+                        }
+                    }
+                }
+            }
+        } label: {
+            HStack(spacing: 6) {
+                Image(systemName: "person.2.badge.gearshape")
+                    .font(.system(size: 11, weight: .semibold))
+                Text("Analyze speakers again")
+                    .font(.system(size: 12, weight: .medium))
+                Image(systemName: "chevron.down")
+                    .font(.system(size: 8, weight: .semibold))
+            }
+            .foregroundStyle(MuesliTheme.textSecondary)
+        }
+        .menuStyle(.borderlessButton)
+        .fixedSize()
+        .disabled(!state.canAnalyzeAgain || installedSpeakerProfiles.isEmpty)
+        .help(
+            state.analyzeUnavailableReason
+                ?? (installedSpeakerProfiles.isEmpty
+                    ? "Install a speaker model from Models first."
+                    : "Run local speaker analysis without re-transcribing or re-summarizing")
+        )
+    }
+
+    private var installedSpeakerProfiles: [MeetingDiarizationProfileID] {
+        MeetingDiarizationProfileID.allCases.filter { profile in
+            speakerAssetStatuses.contains {
+                $0.profileID == profile && $0.state == .ready
+            }
+        }
+    }
+
+    private func refreshSpeakerAssetStatuses() {
+        Task {
+            speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
+        }
+    }
+
+    private func startSpeakerAnalysis(
+        for meeting: MeetingRecord,
+        profileID: MeetingDiarizationProfileID
+    ) {
+        isAnalyzingSpeakers = true
+        controller.analyzeMeetingSpeakersAgain(
+            meeting: meeting,
+            profileID: profileID
+        ) { result in
+            isAnalyzingSpeakers = false
+            if case .failure(let error) = result {
+                speakerAnalysisErrorMessage = error.localizedDescription
+            }
+        }
+    }
+
+    private func transcriptPresentationLabel(
+        _ mode: MeetingTranscriptPresentationMode,
+        collapsedLabel: String
+    ) -> String {
+        switch mode {
+        case .manual: return "Manual"
+        case .separated: return "Separated"
+        case .collapsed: return collapsedLabel
+        case .legacyRendered: return "Transcript"
+        }
+    }
+
+    private func presentationPickerWidth(
+        for modes: [MeetingTranscriptPresentationMode]
+    ) -> CGFloat {
+        CGFloat(max(modes.count, 1)) * 88
+    }
+
+    private func staleSummaryBanner(for meeting: MeetingRecord) -> some View {
+        HStack(spacing: MuesliTheme.spacing8) {
+            Label(
+                "This summary is based on a different transcript view.",
+                systemImage: "exclamationmark.arrow.triangle.2.circlepath"
+            )
+            .font(MuesliTheme.captionMedium())
+            .foregroundStyle(MuesliTheme.textSecondary)
+
+            Spacer(minLength: MuesliTheme.spacing8)
+
+            Button("Re-summarize") {
+                startSummary(for: meeting)
+            }
+            .buttonStyle(.borderless)
+            .disabled(isSummarizing || isTranscriptOnlyBackend)
+        }
+        .padding(MuesliTheme.spacing12)
+        .frame(maxWidth: 980, alignment: .leading)
+        .background(Color.orange.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+        .overlay {
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall)
+                .strokeBorder(Color.orange.opacity(0.25), lineWidth: 1)
+        }
     }
 
     @ViewBuilder
@@ -2747,6 +3360,17 @@ struct MeetingDetailView: View {
         )
     }
 
+    private var speakerAnalysisErrorBinding: Binding<Bool> {
+        Binding(
+            get: { speakerAnalysisErrorMessage != nil },
+            set: { isPresented in
+                if !isPresented {
+                    speakerAnalysisErrorMessage = nil
+                }
+            }
+        )
+    }
+
     private var recordingDeletionBinding: Binding<Bool> {
         Binding(
             get: { recordingPendingDeletion != nil },
@@ -2844,6 +3468,10 @@ struct MeetingDetailView: View {
             transcriptResummaryPromptMeetingID = nil
             transcriptEditOriginalTranscript = nil
             transcriptEditHadStructuredNotes = false
+            speakerAnalysisErrorMessage = nil
+            showRetranscriptionOptions = false
+            retranscriptionBackendKey = ""
+            retranscriptionSpeakerChoice = .meetingDefault
         } else {
             syncManualNotesState(with: meeting)
         }

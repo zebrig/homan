@@ -19,6 +19,22 @@ struct MeetingRenderedRawAudio: Sendable {
     }
 }
 
+/// A disposable system-only render used by the meeting-global diarization
+/// timeline. Keeping this separate avoids running microphone AEC (or even
+/// decoding microphone epochs) merely to analyze remote speakers.
+struct MeetingRenderedRawSystemAudio: Sendable {
+    let url: URL?
+    let timelineFrameCount: Int
+    let sourceFrameCount: Int
+    let sampleRate: Int
+
+    func removeTemporaryFile(fileManager: FileManager = .default) {
+        if let url {
+            try? fileManager.removeItem(at: url)
+        }
+    }
+}
+
 enum MeetingRawAudioRendererError: Error, LocalizedError {
     case unsafePayloadPath(String)
     case missingPayload(String)
@@ -90,6 +106,35 @@ enum MeetingRawAudioRenderer {
             }
             throw error
         }
+    }
+
+    static func renderSystemForProcessing(
+        _ stagedAudio: MeetingStagedRawAudio,
+        fileManager: FileManager = .default
+    ) throws -> MeetingRenderedRawSystemAudio {
+        let targetFrames = max(
+            0,
+            Int(
+                (
+                    Double(stagedAudio.manifest.timelineDurationNanoseconds)
+                        / 1_000_000_000
+                        * Double(targetSampleRate)
+                ).rounded(.up)
+            )
+        )
+        let system = try render(
+            epochs: stagedAudio.manifest.systemEpochs,
+            directoryURL: stagedAudio.directoryURL,
+            targetTimelineFrames: targetFrames,
+            role: .system,
+            fileManager: fileManager
+        )
+        return MeetingRenderedRawSystemAudio(
+            url: system.url,
+            timelineFrameCount: targetFrames,
+            sourceFrameCount: system.sourceFrameCount,
+            sampleRate: targetSampleRate
+        )
     }
 
     static func decodeEpochToMonoFloat(

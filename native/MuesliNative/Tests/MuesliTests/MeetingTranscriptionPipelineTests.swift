@@ -84,6 +84,31 @@ struct MeetingTranscriptionPipelineTests {
         #expect(result.formattedTranscript.contains("Others:") == scenario.expectedRoles.contains(.others))
     }
 
+    @Test("disabled speaker analysis retains source identity without invoking a diarizer")
+    func disabledDiarizationRetainsTimelineEvidence() async throws {
+        let fixture = try PipelineBundleFixture()
+        defer { fixture.cleanup() }
+        let provider = DiarizationCountingPipelineProvider()
+
+        let result = try await MeetingTranscriptionPipeline(provider: provider).process(
+            MeetingTranscriptionRequest(
+                units: [.sourceBundle(.init(
+                    recording: nil,
+                    playbackURL: nil,
+                    bundle: fixture.bundle
+                ))],
+                backend: .parakeetMultilingual,
+                languages: .init(),
+                purpose: .final,
+                systemDiarization: .disabled
+            )
+        )
+
+        #expect(result.systemTimelineMap != nil)
+        #expect(result.attributedTurns.map(\.sourceRole) == [.others])
+        #expect(await provider.diarizationCount == 0)
+    }
+
     @Test("optional diarization failure falls back to Others")
     func optionalDiarizationFailureFallsBack() async throws {
         let fixture = try PipelineBundleFixture()
@@ -117,6 +142,198 @@ struct MeetingTranscriptionPipelineTests {
         #expect(result.attributedTurns.first?.remoteSpeaker == nil)
         #expect(result.degradations.contains(.optionalDiarizationFailed))
         #expect(result.formattedTranscript.contains("Others: remote"))
+    }
+
+    @Test("compatible speaker evidence is reused without a diarizer pass")
+    func compatibleDiarizationIsReused() async throws {
+        let fixture = try PipelineBundleFixture()
+        defer { fixture.cleanup() }
+        let units: [MeetingRecordingUnitInput] = [.sourceBundle(.init(
+            recording: nil,
+            playbackURL: nil,
+            bundle: fixture.bundle
+        ))]
+        let reusable = try makeReusableDiarization(
+            units: units,
+            meetingStart: fixture.bundle.manifest.startedAt
+        )
+        let provider = PipelineTranscriptionProvider(results: [
+            "mic-cleaned.wav": .init(text: "", segments: []),
+            "system.wav": .init(
+                text: "remote",
+                segments: [.init(start: 0, end: 0.05, text: "remote")]
+            ),
+        ])
+
+        let result = try await MeetingTranscriptionPipeline(provider: provider).process(
+            MeetingTranscriptionRequest(
+                units: units,
+                backend: .parakeetMultilingual,
+                languages: .init(),
+                purpose: .retranscribe,
+                systemDiarization: .reuseCompatible,
+                diarizationProfileID: .automatic,
+                reusableDiarization: reusable
+            )
+        )
+
+        #expect(result.reusedDiarizationRevisionID == reusable.id)
+        #expect(result.diarizationProfile == reusable.profile)
+        #expect(result.attributedTurns.first?.remoteSpeaker != nil)
+    }
+
+    @Test("explicit reuse rejects a stale speaker profile instead of silently collapsing")
+    func explicitReuseRejectsStaleProfile() async throws {
+        let fixture = try PipelineBundleFixture()
+        defer { fixture.cleanup() }
+        let units: [MeetingRecordingUnitInput] = [.sourceBundle(.init(
+            recording: nil,
+            playbackURL: nil,
+            bundle: fixture.bundle
+        ))]
+        let current = try makeReusableDiarization(
+            units: units,
+            meetingStart: fixture.bundle.manifest.startedAt
+        )
+        let staleProfile = MeetingDiarizationProfileSnapshot(
+            profileID: current.profile.profileID,
+            profileRevision: current.profile.profileRevision - 1,
+            engineID: current.profile.engineID,
+            engineVersion: current.profile.engineVersion,
+            modelRevision: current.profile.modelRevision,
+            modelDigest: current.profile.modelDigest,
+            effectiveConfigurationDigest: current.profile.effectiveConfigurationDigest,
+            maximumSpeakers: current.profile.maximumSpeakers
+        )
+        let stale = MeetingDiarizationRevision(
+            meetingID: current.meetingID,
+            runID: current.runID,
+            timelineDigest: current.timelineDigest,
+            timelineMap: current.timelineMap,
+            sourceFingerprints: current.sourceFingerprints,
+            profile: staleProfile,
+            activitySegments: current.activitySegments,
+            audioDurationSeconds: current.audioDurationSeconds
+        )
+        let provider = PipelineTranscriptionProvider(results: [
+            "mic-cleaned.wav": .init(text: "", segments: []),
+            "system.wav": .init(
+                text: "remote",
+                segments: [.init(start: 0, end: 0.05, text: "remote")]
+            ),
+        ])
+
+        await #expect(throws: MeetingTranscriptionPipelineError.compatibleDiarizationUnavailable) {
+            _ = try await MeetingTranscriptionPipeline(provider: provider).process(
+                MeetingTranscriptionRequest(
+                    units: units,
+                    backend: .parakeetMultilingual,
+                    languages: .init(),
+                    purpose: .retranscribe,
+                    systemDiarization: .reuseCompatible,
+                    diarizationProfileID: .automatic,
+                    reusableDiarization: stale
+                )
+            )
+        }
+    }
+
+    @Test("opportunistic reuse reruns the diarizer when captured evidence is stale")
+    func opportunisticReuseFallsBackToFreshAnalysis() async throws {
+        let fixture = try PipelineBundleFixture()
+        defer { fixture.cleanup() }
+        let units: [MeetingRecordingUnitInput] = [.sourceBundle(.init(
+            recording: nil,
+            playbackURL: nil,
+            bundle: fixture.bundle
+        ))]
+        let current = try makeReusableDiarization(
+            units: units,
+            meetingStart: fixture.bundle.manifest.startedAt
+        )
+        let staleProfile = MeetingDiarizationProfileSnapshot(
+            profileID: current.profile.profileID,
+            profileRevision: current.profile.profileRevision - 1,
+            engineID: current.profile.engineID,
+            engineVersion: current.profile.engineVersion,
+            modelRevision: current.profile.modelRevision,
+            modelDigest: current.profile.modelDigest,
+            effectiveConfigurationDigest: current.profile.effectiveConfigurationDigest,
+            maximumSpeakers: current.profile.maximumSpeakers
+        )
+        let stale = MeetingDiarizationRevision(
+            meetingID: current.meetingID,
+            runID: current.runID,
+            timelineDigest: current.timelineDigest,
+            timelineMap: current.timelineMap,
+            sourceFingerprints: current.sourceFingerprints,
+            profile: staleProfile,
+            activitySegments: current.activitySegments,
+            audioDurationSeconds: current.audioDurationSeconds
+        )
+        let provider = PipelineTranscriptionProvider(
+            results: [
+                "mic-cleaned.wav": .init(text: "", segments: []),
+                "system.wav": .init(
+                    text: "remote",
+                    segments: [.init(start: 0, end: 0.05, text: "remote")]
+                ),
+            ],
+            diarizationSegments: [
+                TimedSpeakerSegment(
+                    speakerId: "fresh-speaker",
+                    embedding: [],
+                    startTimeSeconds: 0,
+                    endTimeSeconds: 0.05,
+                    qualityScore: 1
+                ),
+            ]
+        )
+
+        let result = try await MeetingTranscriptionPipeline(provider: provider).process(
+            MeetingTranscriptionRequest(
+                units: units,
+                backend: .parakeetMultilingual,
+                languages: .init(),
+                purpose: .retranscribe,
+                systemDiarization: .optionalPost,
+                diarizationProfileID: .automatic,
+                reusableDiarization: stale
+            )
+        )
+
+        #expect(result.reusedDiarizationRevisionID == nil)
+        #expect(result.diarizationProfile?.profileRevision
+            == MeetingDiarizationProfiles.resolve(.automatic).revision)
+        #expect(result.attributedTurns.first?.remoteSpeaker != nil)
+    }
+
+    private func makeReusableDiarization(
+        units: [MeetingRecordingUnitInput],
+        meetingStart: Date
+    ) throws -> MeetingDiarizationRevision {
+        let rendered = try MeetingSystemTimelineRenderer.render(
+            units: units,
+            meetingStart: meetingStart
+        )
+        defer { rendered.removeTemporaryFile() }
+        let definition = MeetingDiarizationProfiles.resolve(.automatic)
+        return MeetingDiarizationRevision(
+            meetingID: 42,
+            runID: UUID(),
+            timelineDigest: rendered.map.digest,
+            timelineMap: rendered.map,
+            sourceFingerprints: rendered.map.sourceFingerprints,
+            profile: definition.snapshot(modelDigest: "fixture-model-digest"),
+            activitySegments: [
+                MeetingDiarizationActivitySegment(
+                    speakerKey: "remote-a",
+                    startSeconds: 0,
+                    endSeconds: max(0.05, rendered.map.totalDurationSeconds)
+                ),
+            ],
+            audioDurationSeconds: rendered.map.totalDurationSeconds
+        )
     }
 
     @Test("units and equal-time source turns have stable chronological order")
@@ -201,7 +418,42 @@ struct MeetingTranscriptionPipelineTests {
         #expect(await provider.transcriptionCount == 3)
     }
 
-    @Test("Homan Whisper submits both canonical sources in one batch and preserves roles")
+    @Test("local Final ASR yields to capture before VAD and every bounded utterance")
+    func localFinalASRYieldsToCapture() async throws {
+        let fixture = try PipelineBundleFixture()
+        defer { fixture.cleanup() }
+        let provider = VADSegmentingPipelineProvider()
+        let scheduler = MeetingInferenceScheduler()
+        let captureOwner = UUID()
+        scheduler.beginCapture(ownerID: captureOwner)
+
+        let processing = Task {
+            try await MeetingTranscriptionPipeline(
+                provider: provider,
+                inferenceScheduler: scheduler
+            ).process(MeetingTranscriptionRequest(
+                units: [.sourceBundle(.init(
+                    recording: nil,
+                    playbackURL: nil,
+                    bundle: fixture.bundle
+                ))],
+                backend: .whisperSmall,
+                languages: .init(),
+                purpose: .final,
+                systemDiarization: .disabled
+            ))
+        }
+        try await Task.sleep(for: .milliseconds(25))
+        #expect(await provider.speechSegmentationCount == 0)
+
+        scheduler.endCapture(ownerID: captureOwner)
+        let result = try await processing.value
+        #expect(!result.attributedTurns.isEmpty)
+        #expect(await provider.speechSegmentationCount == 2)
+        #expect(await provider.transcriptionCount == 3)
+    }
+
+    @Test("Homan Whisper batches canonical sources and composes local speaker analysis")
     func homanWhisperUsesOneSourceAwareBatch() async throws {
         let fixture = try PipelineBundleFixture()
         defer { fixture.cleanup() }
@@ -223,10 +475,20 @@ struct MeetingTranscriptionPipelineTests {
 
         #expect(await provider.batchCount == 1)
         #expect(await provider.submittedItems.map(\.source) == [.microphone, .system])
-        #expect(await provider.submittedItems.map(\.id) == ["microphone-0000", "system-0000"])
+        #expect(await provider.submittedItems.map(\.id) == [
+            "u0000-microphone-0000",
+            "u0000-system-0000",
+        ])
+        #expect(await provider.diarizationCount == 1)
         #expect(result.attributedTurns.map(\.sourceRole) == [.you, .others])
         #expect(result.formattedTranscript.contains("You: local remote batch"))
-        #expect(result.formattedTranscript.contains("Others: system remote batch"))
+        #expect(result.formattedTranscript.contains("Speaker 1: system remote batch"))
+        #expect(result.units.count == 1)
+        #expect(result.units[0].recognizedSegments.map(\.id) == [
+            "u0000-microphone-0000/segment-0",
+            "u0000-system-0000/segment-0",
+        ])
+        #expect(Set(result.units[0].recognizedSegments.map(\.id)).count == 2)
     }
 
     @Test(
@@ -554,13 +816,16 @@ private final class RawPipelinePassThroughAec: MeetingAecProcessor {
 private final class PipelineTranscriptionProvider: MeetingTranscriptionProviding, @unchecked Sendable {
     private let results: [String: SpeechTranscriptionResult]
     private let diarizationError: Error?
+    private let diarizationSegments: [TimedSpeakerSegment]?
 
     init(
         results: [String: SpeechTranscriptionResult],
-        diarizationError: Error? = nil
+        diarizationError: Error? = nil,
+        diarizationSegments: [TimedSpeakerSegment]? = nil
     ) {
         self.results = results
         self.diarizationError = diarizationError
+        self.diarizationSegments = diarizationSegments
     }
 
     func transcribeMeeting(
@@ -579,14 +844,16 @@ private final class PipelineTranscriptionProvider: MeetingTranscriptionProviding
         if let diarizationError {
             throw diarizationError
         }
-        return nil
+        return diarizationSegments
     }
 }
 
 private actor VADSegmentingPipelineProvider: MeetingTranscriptionProviding {
     private(set) var transcriptionCount = 0
+    private(set) var speechSegmentationCount = 0
 
     func meetingSpeechSegments(at url: URL) async throws -> [VadSegment]? {
+        speechSegmentationCount += 1
         if url.lastPathComponent.contains("mic-cleaned") {
             return [
                 VadSegment(startTime: 0.0, endTime: 0.02),
@@ -614,12 +881,37 @@ private actor VADSegmentingPipelineProvider: MeetingTranscriptionProviding {
     }
 }
 
+private actor DiarizationCountingPipelineProvider: MeetingTranscriptionProviding {
+    private(set) var diarizationCount = 0
+
+    func transcribeMeeting(
+        at url: URL,
+        backend: BackendOption,
+        cohereLanguage: CohereTranscribeLanguage,
+        indicASRLanguage: IndicASRLanguage
+    ) async throws -> SpeechTranscriptionResult {
+        guard url.lastPathComponent == "system.wav" else {
+            return SpeechTranscriptionResult(text: "", segments: [])
+        }
+        return SpeechTranscriptionResult(
+            text: "remote",
+            segments: [SpeechSegment(start: 0, end: 0.05, text: "remote")]
+        )
+    }
+
+    func meetingDiarizationSegments(at url: URL) async throws -> [TimedSpeakerSegment]? {
+        diarizationCount += 1
+        return []
+    }
+}
+
 private actor HomanWhisperBatchPipelineProvider:
     MeetingTranscriptionProviding,
     MeetingBatchTranscriptionProviding
 {
     private(set) var batchCount = 0
     private(set) var submittedItems: [RemoteMeetingSpeechItem] = []
+    private(set) var diarizationCount = 0
 
     func meetingSpeechSegments(at url: URL) async throws -> [VadSegment]? {
         if url.lastPathComponent.contains("mic-cleaned") {
@@ -642,7 +934,17 @@ private actor HomanWhisperBatchPipelineProvider:
                 end: item.end,
                 text: item.source == .microphone
                     ? "local remote batch"
-                    : "system remote batch"
+                    : "system remote batch",
+                segments: [RemoteMeetingSpeechSubsegment(
+                    // IDs are intentionally item-local and therefore repeat
+                    // across the batch. The pipeline must namespace them.
+                    id: "segment-0",
+                    start: item.start,
+                    end: item.end,
+                    text: item.source == .microphone
+                        ? "local remote batch"
+                        : "system remote batch"
+                )]
             )
         }
     }
@@ -657,8 +959,14 @@ private actor HomanWhisperBatchPipelineProvider:
     }
 
     func meetingDiarizationSegments(at url: URL) async throws -> [TimedSpeakerSegment]? {
-        Issue.record("Homan Whisper final transcription must not invoke local diarization")
-        return nil
+        diarizationCount += 1
+        return [TimedSpeakerSegment(
+            speakerId: "remote-a",
+            embedding: [],
+            startTimeSeconds: 0.04,
+            endTimeSeconds: 0.07,
+            qualityScore: 0.95
+        )]
     }
 }
 

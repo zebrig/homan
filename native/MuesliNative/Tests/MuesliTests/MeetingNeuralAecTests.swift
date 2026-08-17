@@ -184,6 +184,31 @@ struct MeetingNeuralAecTests {
         #expect(String(cString: error).contains("simulated LocalVQE mutex failure"))
     }
 
+    @Test("LocalVQE native runtime calls are process-wide serialized")
+    func localVQENativeRuntimeIsSerialized() {
+        let probe = RuntimeGateProbe()
+        let group = DispatchGroup()
+        let queue = DispatchQueue(
+            label: "homan-tests.localvqe-runtime-gate",
+            attributes: .concurrent
+        )
+
+        for _ in 0..<8 {
+            group.enter()
+            queue.async {
+                LocalVQENativeRuntimeGate.withLock {
+                    probe.enter()
+                    Thread.sleep(forTimeInterval: 0.005)
+                    probe.leave()
+                }
+                group.leave()
+            }
+        }
+
+        group.wait()
+        #expect(probe.maximumConcurrentCalls == 1)
+    }
+
     @Test("streaming AEC emits original sample count after flush")
     func streamingAecFlushPreservesSampleCount() {
         let processor = PassthroughAecProcessor(frameSize: 256)
@@ -315,6 +340,29 @@ struct MeetingNeuralAecTests {
                 MeetingAecDelayCandidateScore(delayMs: delayMs, score: 0.8, comparedFrames: 100)
             ]
         )
+    }
+}
+
+private final class RuntimeGateProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var activeCalls = 0
+    private var maximum = 0
+
+    var maximumConcurrentCalls: Int {
+        lock.withLock { maximum }
+    }
+
+    func enter() {
+        lock.withLock {
+            activeCalls += 1
+            maximum = max(maximum, activeCalls)
+        }
+    }
+
+    func leave() {
+        lock.withLock {
+            activeCalls -= 1
+        }
     }
 }
 

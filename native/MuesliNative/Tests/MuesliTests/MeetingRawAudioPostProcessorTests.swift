@@ -86,6 +86,44 @@ struct MeetingRawAudioPostProcessorTests {
         #expect(FileManager.default.fileExists(atPath: raw.manifestURL.path))
     }
 
+    @Test("a new capture preempts post-AEC before native inference starts")
+    func capturePreemptsPostProcessing() async throws {
+        let support = try temporarySupportDirectory()
+        defer { try? FileManager.default.removeItem(at: support) }
+        let capture = try MeetingRawAudioCapture(
+            meetingID: 93,
+            startedAt: Date(),
+            timelineAnchorNanoseconds: 1_000,
+            finalModelID: .parakeetRealtimeEOU,
+            supportDirectory: support,
+            compactLosslessly: false
+        )
+        let samples = [Int16](repeating: 4_096, count: 16_000)
+        capture.append(chunk(samples: samples, timestamp: 1_000), role: .microphone)
+        capture.append(chunk(samples: samples, timestamp: 1_000), role: .system)
+        let raw = try capture.finalize(endedAt: Date())
+        let processor = SlowCancellationAecProcessor()
+        let scheduler = MeetingInferenceScheduler()
+        let captureOwner = UUID()
+        scheduler.beginCapture(ownerID: captureOwner)
+
+        let task = Task {
+            try await MeetingRawAudioPostProcessor.prepare(
+                raw,
+                aec: MeetingNeuralAec(preloadedProcessor: processor),
+                supportDirectory: support,
+                inferenceScheduler: scheduler
+            )
+        }
+        try await Task.sleep(nanoseconds: 50_000_000)
+        #expect(processor.processedFrameCount == 0)
+
+        scheduler.endCapture(ownerID: captureOwner)
+        let staged = try await task.value
+        MeetingProcessingCapture.discard(staged)
+        #expect(processor.processedFrameCount > 0)
+    }
+
     private func chunk(
         samples: [Int16],
         timestamp: UInt64

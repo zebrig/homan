@@ -96,6 +96,10 @@ enum MeetingAecProcessorSelection {
 final class MeetingNeuralAec {
     private var processor: MeetingAecProcessor?
     private var isLoaded = false
+    /// Rapid Live Off/On transitions can start more than one async preload.
+    /// Serialize them so one `MeetingNeuralAec` never replaces a native
+    /// processor while another task is still publishing it.
+    private let preloadGate = InferenceGate()
 
     private var frameSize = 256
     private let sampleRate = 16_000
@@ -147,6 +151,16 @@ final class MeetingNeuralAec {
 
     /// Pre-load the meeting AEC processor so it's ready for processing.
     func preload() async {
+        do {
+            try await preloadGate.acquire()
+        } catch {
+            return
+        }
+        await preloadWhileHoldingGate()
+        await preloadGate.release()
+    }
+
+    private func preloadWhileHoldingGate() async {
         guard !isLoaded else { return }
 
         if selection != .dtlnOnly {
@@ -407,10 +421,6 @@ final class MeetingNeuralAec {
     private func trimHistoryBuffersIfNeeded() {
         let maxCandidateDelaySamples = delayEstimator.maxCandidateDelaySamples
         let retentionSamples = delayEstimator.windowSamples + maxCandidateDelaySamples
-        let latestComparableSystemSample = min(systemAbsoluteEndSample, micSamplesReceived - maxCandidateDelaySamples)
-        let oldestNeededForEstimator = latestComparableSystemSample > 0
-            ? max(0, latestComparableSystemSample - delayEstimator.windowSamples)
-            : max(0, systemSamplesReceived - retentionSamples)
         // AEC constraint: only protect system samples that queued mic frames actually need.
         // When the pending buffer is empty there is nothing to protect, so trim freely.
         let oldestNeededForAec = pendingMicSamples.isEmpty

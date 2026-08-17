@@ -5,7 +5,9 @@ import MuesliCore
 /// meetings (transcript, notes, metadata) plus folders. No audio paths are ever carried.
 enum MeetingBackup {
     static let formatName = "homan-meetings-backup"
-    static let formatVersion = 1
+    /// v2 adds an optional structured transcript-evidence payload to each
+    /// meeting. v1 files remain valid and decode with `transcriptEvidence == nil`.
+    static let formatVersion = 2
 
     enum ImportError: LocalizedError {
         case unsupportedFormat(String)

@@ -63,7 +63,9 @@ struct MeetingSummaryClientTests {
 
         #expect(instructions.contains("The app owner's name is Yahor Zaleski."))
         #expect(instructions.contains("a line labeled \"You\" comes from the app owner's local microphone track"))
-        #expect(instructions.contains("Lines labeled \"Others\" or \"Speaker 1\""))
+        #expect(instructions.contains("A line labeled \"Others\" comes from the remote system-audio track"))
+        #expect(instructions.contains("in an imported mixed recording their side is unknown"))
+        #expect(instructions.contains("Never assume a numbered Speaker is Yahor Zaleski"))
         #expect(instructions.contains("must not be attributed to Yahor Zaleski"))
         #expect(!instructions.contains("{{user_name}}"))
     }

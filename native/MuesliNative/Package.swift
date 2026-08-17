@@ -13,7 +13,7 @@ let package = Package(
     ],
     dependencies: [
         .package(url: "https://github.com/apple/swift-argument-parser", from: "1.3.0"),
-        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.1"),
+        .package(url: "https://github.com/FluidInference/FluidAudio.git", exact: "0.15.2"),
         .package(url: "https://github.com/argmaxinc/WhisperKit.git", branch: "main"), // TODO: pin to tagged release once one ships post-PR #455 (swift-transformers removal)
         // mattt/llama.swift re-exports the llama.cpp C API; bundles llama.cpp b10280 (Metal,
         // fast long-context kernels). Single llama.cpp in the package — both the summarization

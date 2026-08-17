@@ -160,6 +160,65 @@ struct MeetingsBackupTests {
         #expect(restored.folderID == folders[0].id)
     }
 
+    @Test("version 2 backup restores compatible transcript evidence")
+    func backupRestoresTranscriptEvidence() throws {
+        let store = try makeStore()
+        var entry = makeEntry()
+        entry.transcriptEvidence = .legacy(rawTranscript: entry.rawTranscript)
+        let data = try MeetingBackup.exportData(meetings: [entry], folders: [])
+        let decoded = try MeetingBackup.decodeEnvelope(data)
+
+        #expect(decoded.version == 2)
+        #expect(decoded.meetings.first?.transcriptEvidence != nil)
+        _ = try MeetingBackup.importBackup(decoded, store: store)
+
+        let restored = try #require(store.recentMeetings(limit: nil).first)
+        let evidence = try #require(
+            try store.meetingTranscriptEvidence(meetingID: restored.id)
+        )
+        #expect(evidence.presentation.activeMode == .legacyRendered)
+        #expect(evidence.presentation.legacyText == entry.rawTranscript)
+        #expect(evidence.presentation.activeTextDigest
+            == MeetingTranscriptDigest.text(restored.rawTranscript))
+    }
+
+    @Test("legacy v1 backup remains text-only and decodes without evidence")
+    func legacyBackupRemainsCompatible() throws {
+        var envelope = MeetingBackup.Envelope(
+            exportedAt: Date(),
+            folders: [],
+            meetings: [makeEntry()]
+        )
+        envelope.version = 1
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        let data = try encoder.encode(envelope)
+        let decoded = try MeetingBackup.decodeEnvelope(data)
+
+        #expect(decoded.version == 1)
+        #expect(decoded.meetings.first?.transcriptEvidence == nil)
+    }
+
+    @Test("backup ignores evidence that does not materialize to its text")
+    func backupRejectsMismatchedEvidence() throws {
+        let store = try makeStore()
+        var entry = makeEntry()
+        entry.transcriptEvidence = .legacy(rawTranscript: "different transcript")
+
+        _ = try MeetingBackup.importBackup(
+            MeetingBackup.Envelope(
+                exportedAt: Date(),
+                folders: [],
+                meetings: [entry]
+            ),
+            store: store
+        )
+
+        let restored = try #require(store.recentMeetings(limit: nil).first)
+        #expect(try store.meetingTranscriptEvidence(meetingID: restored.id) == nil)
+        #expect(restored.rawTranscript == entry.rawTranscript)
+    }
+
     @Test("re-import onto the same store yields fresh rows (duplicates, accepted)")
     func reimportYieldsNewRows() throws {
         let store = try makeStore()

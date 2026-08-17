@@ -155,6 +155,68 @@ struct HomanWhisperBatchClientTests {
         await #expect(throws: HomanWhisperError.self) {
             _ = try await client.decode(changed, requestID: requestID, requestItems: requestItems)
         }
+
+        let withInnerSegments = Data("""
+        {
+          "schema_version": 1,
+          "request_id": "\(requestID.uuidString)",
+          "concurrency_used": 1,
+          "items": [
+            {
+              "id": "microphone-0000",
+              "source": "microphone",
+              "start": 2.5,
+              "end": 6.25,
+              "text": "hello there",
+              "segments": [
+                {"id": "seg-1", "start": 2.6, "end": 3.1, "text": " hello "},
+                {"id": "seg-2", "start": 3.2, "end": 6.0, "text": "there"}
+              ]
+            }
+          ]
+        }
+        """.utf8)
+        let precise = try await client.decode(
+            withInnerSegments,
+            requestID: requestID,
+            requestItems: requestItems
+        )
+        #expect(precise.first?.segments == [
+            RemoteMeetingSpeechSubsegment(
+                id: "seg-1",
+                start: 2.6,
+                end: 3.1,
+                text: "hello"
+            ),
+            RemoteMeetingSpeechSubsegment(
+                id: "seg-2",
+                start: 3.2,
+                end: 6.0,
+                text: "there"
+            ),
+        ])
+
+        let mismatchedInnerText = Data(String(decoding: withInnerSegments, as: UTF8.self)
+            .replacingOccurrences(of: "\"text\": \"there\"", with: "\"text\": \"else\"")
+            .utf8)
+        let coarseFallback = try await client.decode(
+            mismatchedInnerText,
+            requestID: requestID,
+            requestItems: requestItems
+        )
+        #expect(coarseFallback.first?.text == "hello there")
+        #expect(coarseFallback.first?.segments == nil)
+
+        let invalidInnerSegments = Data(String(decoding: withInnerSegments, as: UTF8.self)
+            .replacingOccurrences(of: "\"start\": 3.2", with: "\"start\": 2.9")
+            .utf8)
+        await #expect(throws: HomanWhisperError.self) {
+            _ = try await client.decode(
+                invalidInnerSegments,
+                requestID: requestID,
+                requestItems: requestItems
+            )
+        }
     }
 
     @Test("native encoder produces mono 32 kHz AAC")

@@ -107,6 +107,10 @@ struct MeetingSessionResult {
     var stagedRawAudio: MeetingStagedRawAudio? = nil
     let templateSnapshot: MeetingTemplateSnapshot
     var processingMetadata: MeetingProcessingMetadata = .empty
+    /// Provider-neutral ASR and speaker evidence is materialized only after
+    /// persistence assigns the definitive meeting id.
+    var transcriptionResult: MeetingTranscriptionResult? = nil
+    var transcriptEvidence: MeetingTranscriptEvidenceBundle? = nil
     /// Start of this recording segment. This remains distinct from `startTime`
     /// when a resumed meeting is merged back into the original meeting.
     var recordingStartedAt: Date? = nil
@@ -121,7 +125,8 @@ extension MeetingSessionResult {
         durationSeconds newDurationSeconds: Double? = nil,
         rawTranscript: String,
         formattedNotes: String,
-        processingMetadata newProcessingMetadata: MeetingProcessingMetadata? = nil
+        processingMetadata newProcessingMetadata: MeetingProcessingMetadata? = nil,
+        transcriptEvidence newTranscriptEvidence: MeetingTranscriptEvidenceBundle? = nil
     ) -> MeetingSessionResult {
         let resolvedStart = newStartTime ?? startTime
         let resolvedDuration = newDurationSeconds ?? durationSeconds
@@ -141,6 +146,8 @@ extension MeetingSessionResult {
             stagedRawAudio: stagedRawAudio,
             templateSnapshot: templateSnapshot,
             processingMetadata: newProcessingMetadata ?? processingMetadata,
+            transcriptionResult: transcriptionResult,
+            transcriptEvidence: newTranscriptEvidence ?? transcriptEvidence,
             recordingStartedAt: recordingStartedAt ?? startTime
         )
     }
@@ -150,6 +157,9 @@ enum MeetingProcessingStage {
     case cleaningWav
     case writingRecording
     case transcribingAudio
+    case preparingDiarizer
+    case diarizing
+    case applyingSpeakerLabels
     case generatingTitle
     case summarizingNotes
 }
@@ -174,6 +184,9 @@ final class MeetingSession: @unchecked Sendable {
     private let transcriptionCoordinator: TranscriptionCoordinator
     private let systemAudioRecorder: SystemAudioCapturing
     private let neuralAec: MeetingNeuralAec
+    private let inferenceScheduler: MeetingInferenceScheduler
+    private let inferenceCaptureOwnerID = UUID()
+    private let finalDiarizationPolicyStorage: OSAllocatedUnfairLock<ResolvedMeetingDiarizationPolicy>
 
     /// Route-aware mic recorder with real-time 16 kHz mono PCM access.
     private var meetingMicRecorder: MeetingMicRecording
@@ -209,6 +222,7 @@ final class MeetingSession: @unchecked Sendable {
     /// Empty text clears the source's tail. Called on a background thread.
     var onPartialTranscript: ((String, String, UInt64) -> Void)?
     var onLiveStateChanged: ((MeetingLiveRuntimeState) -> Void)?
+    var onLiveDiarizationStateChanged: ((MeetingLiveDiarizationRuntimeState) -> Void)?
     /// Lock-guarded because sessions are installed by an async model-loading
     /// task, fed on chunkRotationQueue, and committed by chunk-completion tasks.
     /// `isShutDown` closes the async-setup race with meeting teardown.
@@ -224,6 +238,27 @@ final class MeetingSession: @unchecked Sendable {
         var systemChunkedQueue: MeetingChunkedLiveQueue?
     }
     private let liveRuntimeStorage = OSAllocatedUnfairLock(initialState: LiveRuntimeStorage())
+    private struct LiveDiarizationStorage {
+        var state = MeetingLiveDiarizationRuntimeState.off()
+        var activity: [MeetingDiarizationActivitySegment] = []
+    }
+    private let liveDiarizationStorage = OSAllocatedUnfairLock(
+        initialState: LiveDiarizationStorage()
+    )
+    /// These fields are owned exclusively by `chunkRotationQueue`.
+    private var liveDiarizationEngine: MeetingLiveDiarizationEngine?
+    private var liveDiarizationPreparationTask: Task<Void, Never>?
+    private var liveDiarizationPreparationEpoch: UInt64?
+    private var liveDiarizationSamples: [Float] = []
+    /// The epoch which owns the currently executing native inference. Keeping
+    /// the epoch (instead of a Bool) prevents a late completion from an old
+    /// Off -> On cycle from clearing the new epoch's in-flight guard.
+    private var liveDiarizationInferenceEpoch: UInt64?
+    private var liveDiarizationInferenceTask: Task<Void, Never>?
+    private var liveDiarizationEpochStart: TimeInterval = 0
+    private static let liveDiarizationBatchSampleCount = 32_000
+    private static let liveDiarizationLagSampleCount = 64_000
+    private static let liveDiarizationMaximumBufferedSampleCount = 160_000
     private let screenContextCollector = MeetingScreenContextCollector()
     private var diagnostics: MeetingSessionDiagnostics?
 
@@ -253,8 +288,10 @@ final class MeetingSession: @unchecked Sendable {
         config: AppConfig,
         templateSnapshot: MeetingTemplateSnapshot,
         transcriptionCoordinator: TranscriptionCoordinator,
+        finalDiarizationPolicy: ResolvedMeetingDiarizationPolicy? = nil,
         processingSupportDirectory: URL = AppIdentity.supportDirectoryURL,
-        meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder()
+        meetingMicRecorder: MeetingMicRecording = RouteAwareMeetingMicRecorder(),
+        inferenceScheduler: MeetingInferenceScheduler = .shared
     ) {
         self.meetingID = meetingID
         self.title = title
@@ -264,11 +301,21 @@ final class MeetingSession: @unchecked Sendable {
         self.config = config
         self.templateSnapshot = templateSnapshot
         self.transcriptionCoordinator = transcriptionCoordinator
+        self.finalDiarizationPolicyStorage = OSAllocatedUnfairLock(
+            initialState: finalDiarizationPolicy ?? ResolvedMeetingDiarizationPolicy(
+                enabled: config.meetingFinalDiarizationEnabledByDefault,
+                profileID: config.resolvedMeetingFinalDiarizationProfile
+            )
+        )
         self.processingSupportDirectory = processingSupportDirectory
         self.meetingMicRecorder = meetingMicRecorder
+        self.inferenceScheduler = inferenceScheduler
         self.neuralAec = MeetingNeuralAec(localVQEModel: config.resolvedMeetingAecModel)
         liveRuntimeStorage.withLock {
             $0.state = .off(selection: config.resolvedMeetingLiveASRModelID)
+        }
+        liveDiarizationStorage.withLock {
+            $0.state = .off()
         }
         if config.useCoreAudioTap {
             self.systemAudioRecorder = CoreAudioSystemRecorder()
@@ -281,6 +328,24 @@ final class MeetingSession: @unchecked Sendable {
         micRecoveryCoordinator.onEpisodeEvent = { [weak self] event in
             self?.onMicHealthEpisode?(event)
         }
+    }
+
+    deinit {
+        // Idempotent safety net for a failed/abandoned lifecycle. Normal stop
+        // and discard release the same owner as soon as capture has ended.
+        inferenceScheduler.endCapture(ownerID: inferenceCaptureOwnerID)
+    }
+
+    func setFinalDiarizationPolicy(_ policy: ResolvedMeetingDiarizationPolicy) {
+        finalDiarizationPolicyStorage.withLock { $0 = policy }
+        try? rawAudioCapture?.setFinalDiarizationPolicy(
+            enabled: policy.enabled,
+            profileID: policy.profileID
+        )
+    }
+
+    func finalDiarizationPolicySnapshot() -> ResolvedMeetingDiarizationPolicy {
+        finalDiarizationPolicyStorage.withLock { $0 }
     }
 
     func setPreferredMicrophoneInputDeviceID(_ deviceID: AudioObjectID?) {
@@ -296,6 +361,9 @@ final class MeetingSession: @unchecked Sendable {
     }
 
     func start() async throws {
+        // Publishing capture ownership is synchronous and cannot wait on model
+        // work. Background diarization observes it at its next checkpoint.
+        inferenceScheduler.beginCapture(ownerID: inferenceCaptureOwnerID)
         let now = Date()
         diagnostics = MeetingSessionDiagnostics(title: title, startedAt: now)
 
@@ -308,6 +376,7 @@ final class MeetingSession: @unchecked Sendable {
         }
 
         do {
+            let finalDiarizationPolicy = finalDiarizationPolicySnapshot()
             let capture = try MeetingRawAudioCapture(
                 meetingID: meetingID,
                 startedAt: now,
@@ -315,6 +384,8 @@ final class MeetingSession: @unchecked Sendable {
                 cohereLanguage: config.resolvedCohereLanguage,
                 indicASRLanguage: config.resolvedIndicASRLanguage,
                 nemotron35Language: config.resolvedNemotron35Language,
+                finalDiarizationEnabled: finalDiarizationPolicy.enabled,
+                finalDiarizationProfileID: finalDiarizationPolicy.profileID,
                 supportDirectory: processingSupportDirectory
             )
             capture.onFailure = { [weak self] error in
@@ -329,6 +400,7 @@ final class MeetingSession: @unchecked Sendable {
             try await systemAudioRecorder.start()
             try meetingMicRecorder.start()
         } catch {
+            inferenceScheduler.endCapture(ownerID: inferenceCaptureOwnerID)
             vadController?.stop()
             vadController = nil
             systemVadController?.stop()
@@ -362,6 +434,10 @@ final class MeetingSession: @unchecked Sendable {
             await screenContextCollector.startPeriodicCapture(useOCR: config.useCoreAudioTap)
         }
         publishLiveState(liveStateSnapshot())
+        publishLiveDiarizationState(liveDiarizationStateSnapshot())
+        if config.meetingLiveDiarizationEnabledByDefault {
+            setLiveDiarizationEnabled(true)
+        }
         if config.meetingLiveEnabledByDefault {
             startLive()
         }
@@ -369,6 +445,168 @@ final class MeetingSession: @unchecked Sendable {
 
     func liveStateSnapshot() -> MeetingLiveRuntimeState {
         liveRuntimeStorage.withLock { $0.state }
+    }
+
+    func liveDiarizationStateSnapshot() -> MeetingLiveDiarizationRuntimeState {
+        liveDiarizationStorage.withLock { $0.state }
+    }
+
+    func setLiveDiarizationEnabled(_ enabled: Bool) {
+        if enabled {
+            startLiveDiarization()
+        } else {
+            stopLiveDiarization(userInitiated: true)
+        }
+    }
+
+    private func startLiveDiarization() {
+        guard chunkRotationQueue.sync(execute: { isRecording }) else { return }
+        let loading = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.phase == .off || storage.state.phase == .failed else {
+                return nil
+            }
+            let epoch = storage.state.epoch &+ 1
+            storage.activity.removeAll()
+            storage.state = MeetingLiveDiarizationRuntimeState(
+                enabled: true,
+                phase: .loading,
+                epoch: epoch,
+                profileID: .stableFourSpeaker,
+                message: epoch > 1 ? "Speaker labels restart with this Live epoch." : nil,
+                droppedAudioSeconds: 0
+            )
+            return storage.state
+        }
+        guard let loading else { return }
+        publishLiveDiarizationState(loading)
+
+        let engine = MeetingLiveDiarizationEngine()
+        chunkRotationQueue.sync {
+            liveDiarizationPreparationTask?.cancel()
+            liveDiarizationPreparationTask = nil
+            liveDiarizationPreparationEpoch = loading.epoch
+        }
+        let preparationTask = Task.detached(priority: .userInitiated) { [weak self, engine] in
+            guard let self else { return }
+            do {
+                try await engine.prepare()
+                self.chunkRotationQueue.async { [weak self, engine] in
+                    guard let self else {
+                        Task { await engine.stop() }
+                        return
+                    }
+                    guard self.liveDiarizationPreparationEpoch == loading.epoch,
+                          self.isRecording else {
+                        Task { await engine.stop() }
+                        return
+                    }
+                    self.liveDiarizationPreparationTask = nil
+                    self.liveDiarizationPreparationEpoch = nil
+                    let ready = self.liveDiarizationStorage.withLock {
+                        storage -> MeetingLiveDiarizationRuntimeState? in
+                        guard storage.state.enabled,
+                              storage.state.phase == .loading,
+                              storage.state.epoch == loading.epoch else {
+                            return nil
+                        }
+                        self.liveDiarizationEngine = engine
+                        self.liveDiarizationSamples.removeAll(keepingCapacity: true)
+                        self.liveDiarizationInferenceEpoch = nil
+                        self.liveDiarizationEpochStart = self.systemChunkTimingTracker
+                            .currentEndTimeSeconds
+                        storage.state.phase = self.isPaused ? .suspended : .running
+                        return storage.state
+                    }
+                    guard let ready else {
+                        Task { await engine.stop() }
+                        return
+                    }
+                    self.systemAudioRecorder.emitsProcessedAudio = true
+                    self.publishLiveDiarizationState(ready)
+                }
+            } catch is CancellationError {
+                self.failLiveDiarization(
+                    epoch: loading.epoch,
+                    message: "Live speaker separation was cancelled."
+                )
+            } catch {
+                self.failLiveDiarization(
+                    epoch: loading.epoch,
+                    message: error.localizedDescription
+                )
+            }
+        }
+        chunkRotationQueue.sync {
+            if liveDiarizationPreparationEpoch == loading.epoch {
+                liveDiarizationPreparationTask = preparationTask
+            } else {
+                preparationTask.cancel()
+            }
+        }
+    }
+
+    private func stopLiveDiarization(userInitiated: Bool) {
+        let stoppedState = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.phase != .off || storage.state.enabled else { return nil }
+            let priorEpoch = storage.state.epoch
+            storage.activity.removeAll()
+            storage.state = .off(
+                enabled: false,
+                epoch: priorEpoch,
+                message: userInitiated && priorEpoch > 0
+                    ? "Future remote speech uses Others. Labels restart if enabled again."
+                    : nil
+            )
+            return storage.state
+        }
+        guard let stoppedState else { return }
+        let engine = chunkRotationQueue.sync { () -> MeetingLiveDiarizationEngine? in
+            liveDiarizationPreparationTask?.cancel()
+            liveDiarizationPreparationTask = nil
+            liveDiarizationPreparationEpoch = nil
+            liveDiarizationInferenceTask?.cancel()
+            liveDiarizationInferenceTask = nil
+            let engine = liveDiarizationEngine
+            liveDiarizationEngine = nil
+            liveDiarizationSamples.removeAll(keepingCapacity: true)
+            liveDiarizationInferenceEpoch = nil
+            if activeLiveSnapshot() == nil {
+                systemAudioRecorder.emitsProcessedAudio = false
+            }
+            return engine
+        }
+        publishLiveDiarizationState(stoppedState)
+        if let engine {
+            Task { await engine.stop() }
+        }
+    }
+
+    private func finishLiveDiarizationForMeetingEnd() async {
+        let stoppedState = liveDiarizationStorage.withLock { storage in
+            let epoch = storage.state.epoch
+            storage.activity.removeAll()
+            storage.state = .off(epoch: epoch)
+            return storage.state
+        }
+        let engine = chunkRotationQueue.sync { () -> MeetingLiveDiarizationEngine? in
+            liveDiarizationPreparationTask?.cancel()
+            liveDiarizationPreparationTask = nil
+            liveDiarizationPreparationEpoch = nil
+            liveDiarizationInferenceTask?.cancel()
+            liveDiarizationInferenceTask = nil
+            let engine = liveDiarizationEngine
+            liveDiarizationEngine = nil
+            liveDiarizationSamples.removeAll(keepingCapacity: true)
+            liveDiarizationInferenceEpoch = nil
+            systemAudioRecorder.emitsProcessedAudio = false
+            return engine
+        }
+        if let engine {
+            await engine.stop()
+        }
+        publishLiveDiarizationState(stoppedState)
     }
 
     @discardableResult
@@ -715,7 +953,18 @@ final class MeetingSession: @unchecked Sendable {
         guard isLiveGeneration(generation, allowedPhases: [.running, .lagging]) else {
             return
         }
-        onChunkTranscribed?(segments, source.speakerLabel, generation)
+        switch source {
+        case .microphone:
+            onChunkTranscribed?(segments, source.speakerLabel, generation)
+        case .system:
+            for segment in segments {
+                onChunkTranscribed?(
+                    [segment],
+                    liveSpeakerLabel(source: source, segment: segment),
+                    generation
+                )
+            }
+        }
     }
 
     private func handleLiveLagChanged(
@@ -800,6 +1049,192 @@ final class MeetingSession: @unchecked Sendable {
         onLiveStateChanged?(state)
     }
 
+    private func publishLiveDiarizationState(
+        _ state: MeetingLiveDiarizationRuntimeState
+    ) {
+        onLiveDiarizationStateChanged?(state)
+    }
+
+    private func failLiveDiarization(epoch: UInt64, message: String) {
+        chunkRotationQueue.async { [weak self] in
+            self?.failLiveDiarizationOnQueue(epoch: epoch, message: message)
+        }
+    }
+
+    /// Must run on `chunkRotationQueue`. A Live diarizer failure is deliberately
+    /// isolated from captions, raw capture, and Final processing.
+    private func failLiveDiarizationOnQueue(epoch: UInt64, message: String) {
+        let failedState = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.enabled,
+                  storage.state.epoch == epoch,
+                  storage.state.phase != .failed,
+                  storage.state.phase != .off else {
+                return nil
+            }
+            storage.activity.removeAll()
+            storage.state.enabled = false
+            storage.state.phase = .failed
+            storage.state.message = message
+            return storage.state
+        }
+        guard let failedState else { return }
+
+        let engine = liveDiarizationEngine
+        liveDiarizationPreparationTask?.cancel()
+        liveDiarizationPreparationTask = nil
+        liveDiarizationPreparationEpoch = nil
+        liveDiarizationInferenceTask?.cancel()
+        liveDiarizationInferenceTask = nil
+        liveDiarizationEngine = nil
+        liveDiarizationSamples.removeAll(keepingCapacity: true)
+        liveDiarizationInferenceEpoch = nil
+        if activeLiveSnapshot() == nil {
+            systemAudioRecorder.emitsProcessedAudio = false
+        }
+        publishLiveDiarizationState(failedState)
+        if let engine {
+            Task { await engine.stop() }
+        }
+    }
+
+    /// Called only on `chunkRotationQueue`. The bounded queue prevents a
+    /// provisional feature from competing indefinitely with capture or Final
+    /// processing. We fail closed instead of dropping samples and compressing
+    /// the speaker timeline.
+    private func feedLiveDiarizationOnQueue(_ samples: [Float]) {
+        guard !samples.isEmpty else { return }
+        let state = liveDiarizationStorage.withLock { $0.state }
+        guard state.enabled,
+              state.phase == .running || state.phase == .lagging,
+              liveDiarizationEngine != nil else {
+            return
+        }
+
+        liveDiarizationSamples.append(contentsOf: samples)
+        guard liveDiarizationSamples.count
+                <= Self.liveDiarizationMaximumBufferedSampleCount else {
+            failLiveDiarizationOnQueue(
+                epoch: state.epoch,
+                message: "Live speaker separation could not keep up. Captions and the raw recording continue unchanged."
+            )
+            return
+        }
+        updateLiveDiarizationLagStateOnQueue(epoch: state.epoch)
+        scheduleLiveDiarizationInferenceOnQueue(epoch: state.epoch)
+    }
+
+    private func scheduleLiveDiarizationInferenceOnQueue(epoch: UInt64) {
+        guard liveDiarizationInferenceEpoch == nil,
+              liveDiarizationSamples.count >= Self.liveDiarizationBatchSampleCount,
+              let engine = liveDiarizationEngine else {
+            return
+        }
+        let batch = Array(
+            liveDiarizationSamples.prefix(Self.liveDiarizationBatchSampleCount)
+        )
+        liveDiarizationSamples.removeFirst(Self.liveDiarizationBatchSampleCount)
+        liveDiarizationInferenceEpoch = epoch
+
+        let inferenceTask = Task.detached(priority: .utility) { [weak self, engine] in
+            do {
+                let activity = try await engine.process(batch)
+                self?.chunkRotationQueue.async { [weak self] in
+                    self?.completeLiveDiarizationInferenceOnQueue(
+                        activity: activity,
+                        epoch: epoch
+                    )
+                }
+            } catch is CancellationError {
+                return
+            } catch {
+                self?.failLiveDiarization(epoch: epoch, message: error.localizedDescription)
+            }
+        }
+        liveDiarizationInferenceTask = inferenceTask
+    }
+
+    private func completeLiveDiarizationInferenceOnQueue(
+        activity: [MeetingDiarizationActivitySegment],
+        epoch: UInt64
+    ) {
+        // A completion from a discarded epoch must not mutate any scheduling
+        // state owned by a newer epoch.
+        guard liveDiarizationInferenceEpoch == epoch else { return }
+        let current = liveDiarizationStorage.withLock { $0.state }
+        guard current.enabled,
+              current.epoch == epoch,
+              current.phase == .running || current.phase == .lagging,
+              liveDiarizationEngine != nil else {
+            liveDiarizationInferenceTask = nil
+            liveDiarizationInferenceEpoch = nil
+            return
+        }
+
+        let epochStart = liveDiarizationEpochStart
+        let shifted = activity.map { segment in
+            MeetingDiarizationActivitySegment(
+                id: segment.id,
+                speakerKey: segment.speakerKey,
+                startSeconds: epochStart + segment.startSeconds,
+                endSeconds: epochStart + segment.endSeconds,
+                confidence: segment.confidence
+            )
+        }
+        liveDiarizationStorage.withLock { $0.activity = shifted }
+        liveDiarizationInferenceTask = nil
+        liveDiarizationInferenceEpoch = nil
+        updateLiveDiarizationLagStateOnQueue(epoch: epoch)
+        scheduleLiveDiarizationInferenceOnQueue(epoch: epoch)
+    }
+
+    private func updateLiveDiarizationLagStateOnQueue(epoch: UInt64) {
+        let bufferedCount = liveDiarizationSamples.count
+        let updated = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.enabled,
+                  storage.state.epoch == epoch,
+                  storage.state.phase == .running || storage.state.phase == .lagging else {
+                return nil
+            }
+            if bufferedCount >= Self.liveDiarizationLagSampleCount,
+               storage.state.phase != .lagging {
+                storage.state.phase = .lagging
+                storage.state.message = "Live speaker labels are catching up."
+                return storage.state
+            }
+            if bufferedCount < Self.liveDiarizationBatchSampleCount,
+               storage.state.phase == .lagging {
+                storage.state.phase = .running
+                storage.state.message = nil
+                return storage.state
+            }
+            return nil
+        }
+        if let updated {
+            publishLiveDiarizationState(updated)
+        }
+    }
+
+    private func liveSpeakerLabel(
+        source: MeetingLiveAudioSource,
+        segment: SpeechSegment
+    ) -> String {
+        guard source == .system else { return "You" }
+        let snapshot = liveDiarizationStorage.withLock {
+            ($0.state, $0.activity)
+        }
+        guard snapshot.0.enabled,
+              snapshot.0.phase == .running || snapshot.0.phase == .lagging else {
+            return "Others"
+        }
+        return MeetingLiveSpeakerResolver.label(
+            forStart: segment.start,
+            end: segment.end,
+            activity: snapshot.1
+        )
+    }
+
     /// Establishes an exact "Live starts now" boundary. Audio accumulated while
     /// Live was off or while a model was loading is deliberately discarded from
     /// the preview, but remains intact in the crash-safe full-session staging.
@@ -875,7 +1310,7 @@ final class MeetingSession: @unchecked Sendable {
 
     private func commitNativeStreamingPreview(
         partialSession: MeetingStreamingPartialSession?,
-        speaker: String,
+        source: MeetingLiveAudioSource,
         start: TimeInterval,
         end: TimeInterval,
         generation: UInt64
@@ -898,7 +1333,7 @@ final class MeetingSession: @unchecked Sendable {
         guard isLiveGeneration(generation, allowedPhases: [.running, .lagging]) else {
             return
         }
-        onChunkTranscribed?(segments, speaker, generation)
+        handleLiveSegments(segments, source: source, generation: generation)
     }
 
     private func suspendPartialSessions() {
@@ -972,6 +1407,19 @@ final class MeetingSession: @unchecked Sendable {
                 await suspended.2?.suspend()
             }
         }
+        let suspendedDiarization = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.enabled,
+                  storage.state.phase == .running || storage.state.phase == .lagging else {
+                return nil
+            }
+            storage.state.phase = .suspended
+            storage.state.message = "Live speaker separation is paused with the recording."
+            return storage.state
+        }
+        if let suspendedDiarization {
+            publishLiveDiarizationState(suspendedDiarization)
+        }
         meetingMicRecorder.pause()
         systemAudioRecorder.pause()
         Task { await screenContextCollector.setPaused(true) }
@@ -1003,6 +1451,18 @@ final class MeetingSession: @unchecked Sendable {
                 await resumed.2?.resume()
             }
         }
+        let resumedDiarization = liveDiarizationStorage.withLock {
+            storage -> MeetingLiveDiarizationRuntimeState? in
+            guard storage.state.enabled, storage.state.phase == .suspended else {
+                return nil
+            }
+            storage.state.phase = .running
+            storage.state.message = nil
+            return storage.state
+        }
+        if let resumedDiarization {
+            publishLiveDiarizationState(resumedDiarization)
+        }
         meetingMicRecorder.resume()
         systemAudioRecorder.resume()
         Task { await screenContextCollector.setPaused(false) }
@@ -1013,6 +1473,7 @@ final class MeetingSession: @unchecked Sendable {
     func discard() {
         Task { await screenContextCollector.stopAndDrain() }
         stopLive()
+        stopLiveDiarization(userInitiated: false)
         let (rawRecorder, systemRecorder) = chunkRotationQueue.sync { () -> (PCMChunkRecorder?, PCMChunkRecorder?) in
             isRecording = false
             setPausedStateOnQueue(false)
@@ -1044,6 +1505,7 @@ final class MeetingSession: @unchecked Sendable {
         }
         micChunkCollector.cancelAll()
         systemChunkCollector.cancelAll()
+        inferenceScheduler.endCapture(ownerID: inferenceCaptureOwnerID)
         fputs("[meeting] recording discarded\n", stderr)
     }
 
@@ -1052,6 +1514,7 @@ final class MeetingSession: @unchecked Sendable {
         let endTime = Date()
 
         await finishLiveForMeetingEnd()
+        await finishLiveDiarizationForMeetingEnd()
         vadController?.stop()
         vadController = nil
         systemVadController?.stop()
@@ -1062,39 +1525,42 @@ final class MeetingSession: @unchecked Sendable {
         systemAudioRecorder.onNativeAudioChunk = nil
         let rawStreamingMicURL = meetingMicRecorder.stop()
         let systemAudioURL = systemAudioRecorder.stop()
-        let (
-            meetingStart,
-            lastRawMicURL,
-            lastSystemChunkURL,
-            stagedRawAudio
-        ) = try chunkRotationQueue.sync { () throws -> (
-            Date,
-            URL?,
-            URL?,
-            MeetingStagedRawAudio?
-        ) in
-            isRecording = false
-            setPausedStateOnQueue(false)
+        let captureResult: (Date, URL?, URL?, MeetingStagedRawAudio?)
+        do {
+            captureResult = try chunkRotationQueue.sync { () throws -> (
+                Date,
+                URL?,
+                URL?,
+                MeetingStagedRawAudio?
+            ) in
+                isRecording = false
+                setPausedStateOnQueue(false)
 
-            // Flush partial AEC frame before stopping chunk recorder
-            appendFlushedStreamingMicOnQueue()
+                // Flush partial AEC frame before stopping chunk recorder
+                appendFlushedStreamingMicOnQueue()
 
-            let meetingStart = self.startTime ?? Date()
-            let lastRawMicURL = rawMicChunkRecorder?.stop()
-            let lastSystemChunkURL = systemChunkRecorder?.stop()
-            rawMicChunkRecorder = nil
-            systemChunkRecorder = nil
-            _ = chunkTimingTracker.finish()
-            _ = systemChunkTimingTracker.finish()
-            let stagedRawAudio = try rawAudioCapture?.finalize(endedAt: endTime)
-            rawAudioCapture = nil
-            return (
-                meetingStart,
-                lastRawMicURL,
-                lastSystemChunkURL,
-                stagedRawAudio
-            )
+                let meetingStart = self.startTime ?? Date()
+                let lastRawMicURL = rawMicChunkRecorder?.stop()
+                let lastSystemChunkURL = systemChunkRecorder?.stop()
+                rawMicChunkRecorder = nil
+                systemChunkRecorder = nil
+                _ = chunkTimingTracker.finish()
+                _ = systemChunkTimingTracker.finish()
+                let stagedRawAudio = try rawAudioCapture?.finalize(endedAt: endTime)
+                rawAudioCapture = nil
+                return (
+                    meetingStart,
+                    lastRawMicURL,
+                    lastSystemChunkURL,
+                    stagedRawAudio
+                )
+            }
+        } catch {
+            inferenceScheduler.endCapture(ownerID: inferenceCaptureOwnerID)
+            throw error
         }
+        inferenceScheduler.endCapture(ownerID: inferenceCaptureOwnerID)
+        let (meetingStart, lastRawMicURL, lastSystemChunkURL, stagedRawAudio) = captureResult
         micRecoveryCoordinator.finishMeeting()
         defer {
             if let rawStreamingMicURL {
@@ -1119,7 +1585,8 @@ final class MeetingSession: @unchecked Sendable {
         var stagedAudio = try await MeetingRawAudioPostProcessor.prepare(
             stagedRawAudio,
             aec: neuralAec,
-            supportDirectory: processingSupportDirectory
+            supportDirectory: processingSupportDirectory,
+            inferenceScheduler: inferenceScheduler
         )
         onProgress?(.writingRecording)
         let retainedRecordingURL: URL?
@@ -1168,6 +1635,7 @@ final class MeetingSession: @unchecked Sendable {
         try Task.checkCancellation()
         onProgress?(.transcribingAudio)
         fputs("[meeting] processing canonical microphone and system sources with \(finalBackend.label)\n", stderr)
+        let finalDiarizationPolicy = finalDiarizationPolicySnapshot()
         let pipelineResult = try await MeetingTranscriptionPipeline(
             coordinator: transcriptionCoordinator
         ).process(
@@ -1179,7 +1647,16 @@ final class MeetingSession: @unchecked Sendable {
                 nemotron35Language: stagedAudio.manifest.nemotron35Language
             ),
             purpose: .final,
-            systemDiarization: .optionalPost
+            systemDiarization: finalDiarizationPolicy.enabled ? .optionalPost : .disabled,
+            diarizationProfileID: finalDiarizationPolicy.profileID,
+            progress: { [weak self] stage in
+                switch stage {
+                case .transcribing: self?.onProgress?(.transcribingAudio)
+                case .preparingDiarizer: self?.onProgress?(.preparingDiarizer)
+                case .diarizing: self?.onProgress?(.diarizing)
+                case .applyingSpeakerLabels: self?.onProgress?(.applyingSpeakerLabels)
+                }
+            }
         )
         try Task.checkCancellation()
         guard let processedUnit = pipelineResult.units.first else {
@@ -1190,13 +1667,20 @@ final class MeetingSession: @unchecked Sendable {
             systemSegments: processedUnit.systemSegments,
             diarizationSegments: processedUnit.diarizationSegments
         )
-        let rawTranscript = pipelineResult.formattedTranscript
+        let evidencePublication = try MeetingTranscriptEvidenceFactory.makePublication(
+            meetingID: 0,
+            meetingStart: meetingStart,
+            result: pipelineResult,
+            backend: finalBackend,
+            purpose: .final,
+            runID: UUID()
+        )
+        let rawTranscript = evidencePublication.activeTranscript
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: finalBackend,
             startedAt: transcriptionStartedAt
         )
 
-        stagedAudio = try MeetingProcessingCapture.markState(.diarizing, for: stagedAudio)
         fputs(
             "[meeting] complete final pass produced \(protectedTranscriptInputs.micSegments.count) microphone and \(protectedTranscriptInputs.systemSegments.count) system segments\n",
             stderr
@@ -1294,8 +1778,17 @@ final class MeetingSession: @unchecked Sendable {
             templateSnapshot: templateSnapshot,
             processingMetadata: MeetingProcessingMetadata(
                 transcription: transcriptionMetadata,
-                summary: summaryMetadata
+                summary: summaryMetadata,
+                summaryInput: MeetingSummaryInputDescriptor(
+                    transcriptRevisionID: evidencePublication.transcriptRevision.id,
+                    attributionRevisionID: evidencePublication.attributionRevision.id,
+                    presentationMode: evidencePublication.evidence.presentation.activeMode,
+                    transcriptDigest: evidencePublication.evidence.presentation.activeTextDigest,
+                    ownerName: config.userName
+                )
             ),
+            transcriptionResult: pipelineResult,
+            transcriptEvidence: evidencePublication.evidence,
             recordingStartedAt: meetingStart
         )
     }
@@ -1355,7 +1848,7 @@ final class MeetingSession: @unchecked Sendable {
         if live.state.kind == .streaming {
             commitNativeStreamingPreview(
                 partialSession: micPartialSession(),
-                speaker: "You",
+                source: .microphone,
                 start: chunkOffset,
                 end: chunkEnd,
                 generation: live.state.generation
@@ -1404,7 +1897,7 @@ final class MeetingSession: @unchecked Sendable {
         if live.state.kind == .streaming {
             commitNativeStreamingPreview(
                 partialSession: systemPartialSession(),
-                speaker: "Others",
+                source: .system,
                 start: chunkOffset,
                 end: chunkOffset + max(chunkDuration, 0.1),
                 generation: live.state.generation
@@ -1490,7 +1983,10 @@ final class MeetingSession: @unchecked Sendable {
 
     private func deactivateLivePreviewPipelineOnQueue() {
         meetingMicRecorder.emitsProcessedAudio = false
-        systemAudioRecorder.emitsProcessedAudio = false
+        let diarizationState = liveDiarizationStorage.withLock { $0.state }
+        systemAudioRecorder.emitsProcessedAudio = diarizationState.enabled
+            && diarizationState.phase != .off
+            && diarizationState.phase != .failed
         vadController?.stop()
         vadController = nil
         systemVadController?.stop()
@@ -1538,11 +2034,20 @@ final class MeetingSession: @unchecked Sendable {
             let healthSnapshot = self.micHealthTracker.noteSystemSamples(samples)
             self.onMicHealthChanged?(healthSnapshot)
             self.micRecoveryCoordinator.process(healthSnapshot)
-            guard self.activeLiveSnapshot() != nil else { return }
-            self.systemChunkRecorder?.append(samples)
-            self.systemChunkTimingTracker.append(sampleCount: samples.count)
-
+            let live = self.activeLiveSnapshot()
+            let diarizationState = self.liveDiarizationStorage.withLock { $0.state }
+            let diarizationActive = diarizationState.enabled
+                && (diarizationState.phase == .running
+                    || diarizationState.phase == .lagging)
+            guard live != nil || diarizationActive else { return }
             let floatSamples = samples.map { Float($0) / 32767.0 }
+            self.systemChunkTimingTracker.append(sampleCount: samples.count)
+            if diarizationActive {
+                self.feedLiveDiarizationOnQueue(floatSamples)
+            }
+            guard live != nil else { return }
+
+            self.systemChunkRecorder?.append(samples)
             self.feedSystemPartialSession(floatSamples)
             self.neuralAec.feedSystemSamples(floatSamples)
             let cleanedFloat = self.neuralAec.processStreamingMic([])

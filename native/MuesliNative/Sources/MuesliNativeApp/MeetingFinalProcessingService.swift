@@ -26,6 +26,7 @@ struct RecoveredMeetingProcessingResult: Sendable {
     let templateSnapshot: MeetingTemplateSnapshot
     let stagedAudio: MeetingStagedAudio
     let processingMetadata: MeetingProcessingMetadata
+    let transcriptEvidence: MeetingTranscriptEvidenceBundle?
 }
 
 enum MeetingFinalProcessingService {
@@ -40,6 +41,8 @@ enum MeetingFinalProcessingService {
         let templateSnapshot: MeetingTemplateSnapshot
         let transcriptionMetadata: MeetingProcessingRunMetadata?
         let summaryMetadata: MeetingProcessingRunMetadata?
+        let summaryInput: MeetingSummaryInputDescriptor?
+        let transcriptEvidence: MeetingTranscriptEvidenceBundle?
     }
 
     static func process(
@@ -48,7 +51,8 @@ enum MeetingFinalProcessingService {
         config: AppConfig,
         templateSnapshot: MeetingTemplateSnapshot,
         coordinator: TranscriptionCoordinator,
-        progress: @Sendable (MeetingProcessingPhase) -> Void = { _ in }
+        priorEvidence: MeetingTranscriptEvidenceBundle? = nil,
+        progress: @escaping @Sendable (MeetingProcessingPhase) -> Void = { _ in }
     ) async throws -> RecoveredMeetingProcessingResult {
         var stagedAudio = try MeetingProcessingCapture.markProcessing(originalStagedAudio)
         if let cached = try loadCachedResult(for: stagedAudio),
@@ -66,8 +70,10 @@ enum MeetingFinalProcessingService {
                 processingMetadata: MeetingProcessingMetadata(
                     transcription: cached.transcriptionMetadata,
                     summary: cached.summaryMetadata,
-                    manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
-                )
+                    manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt,
+                    summaryInput: cached.summaryInput
+                ),
+                transcriptEvidence: cached.transcriptEvidence
             )
         }
         let modelID = stagedAudio.manifest.finalModelID
@@ -108,6 +114,11 @@ enum MeetingFinalProcessingService {
             includeMeetingHelpers: backend.backend == BackendOption.homanWhisper.backend
         )
 
+        let finalDiarizationPolicy = MeetingDiarizationPolicyResolver.resolveCaptured(
+            enabled: stagedAudio.manifest.finalDiarizationEnabled,
+            profileRawValue: stagedAudio.manifest.finalDiarizationProfileID
+        )
+
         let transcription = try await MeetingTranscriptionPipeline(
             coordinator: coordinator
         ).process(
@@ -122,24 +133,67 @@ enum MeetingFinalProcessingService {
                     ?? config.nemotron35Language
             ),
             purpose: .recovery,
-            systemDiarization: .optionalPost
+            systemDiarization: finalDiarizationPolicy.enabled ? .optionalPost : .disabled,
+            diarizationProfileID: finalDiarizationPolicy.profileID,
+            progress: { stage in
+                switch stage {
+                case .transcribing: progress(.transcribing)
+                case .preparingDiarizer: progress(.preparingDiarizer)
+                case .diarizing: progress(.diarizing)
+                case .applyingSpeakerLabels: progress(.applyingSpeakerLabels)
+                }
+            }
         )
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: backend,
             startedAt: transcriptionStartedAt
         )
-        stagedAudio = try MeetingProcessingCapture.markState(.diarizing, for: stagedAudio)
         let currentSessionTranscript = transcription.formattedTranscript
         let priorTranscript = meeting.rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)
         let combinedTranscript = MeetingResumePolicy.combinedResumeTranscript(
             prior: priorTranscript,
             new: currentSessionTranscript
         )
+        let isResume = !priorTranscript.isEmpty
+        let originalStart = ISO8601DateFormatter().date(from: meeting.startTime)
+        let startTime = isResume
+            ? (originalStart ?? stagedAudio.manifest.startedAt)
+            : stagedAudio.manifest.startedAt
+        let evidencePublication: MeetingTranscriptEvidencePublication?
+        if priorTranscript.isEmpty {
+            evidencePublication = try MeetingTranscriptEvidenceFactory.makePublication(
+                meetingID: meeting.id,
+                meetingStart: startTime,
+                result: transcription,
+                backend: backend,
+                purpose: .recovery,
+                runID: UUID(),
+                priorEvidence: priorEvidence
+            )
+        } else if let priorEvidence,
+                  priorEvidence.activeTranscriptRevision != nil {
+            evidencePublication = try MeetingTranscriptEvidenceFactory.makeAppendedPublication(
+                meetingID: meeting.id,
+                meetingStart: startTime,
+                result: transcription,
+                backend: backend,
+                purpose: .recovery,
+                runID: UUID(),
+                priorEvidence: priorEvidence
+            )
+        } else {
+            // Flat legacy text cannot be reconstructed into trustworthy timed,
+            // source-aware spans. Keep it readable without claiming reversible
+            // speaker controls.
+            evidencePublication = nil
+        }
+        let publishedTranscript = evidencePublication?.activeTranscript
+            ?? combinedTranscript
 
         progress(.generatingTitle)
         let title = await resolvedTitle(
             meeting: meeting,
-            transcript: combinedTranscript,
+            transcript: publishedTranscript,
             config: config
         )
         stagedAudio = try MeetingProcessingCapture.markState(.summarizing, for: stagedAudio)
@@ -156,7 +210,7 @@ enum MeetingFinalProcessingService {
             let summaryStartedAt = Date()
             do {
                 let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
-                    transcript: combinedTranscript,
+                    transcript: publishedTranscript,
                     meetingTitle: title,
                     config: config,
                     template: templateSnapshot,
@@ -171,7 +225,7 @@ enum MeetingFinalProcessingService {
                 )
             } catch {
                 formattedNotes = MeetingSummaryClient.summaryFailureNotes(
-                    transcript: combinedTranscript,
+                    transcript: publishedTranscript,
                     meetingTitle: title,
                     error: error,
                     manualNotes: meeting.manualNotes
@@ -187,11 +241,6 @@ enum MeetingFinalProcessingService {
             )),
             0
         )
-        let isResume = !priorTranscript.isEmpty
-        let originalStart = ISO8601DateFormatter().date(from: meeting.startTime)
-        let startTime = isResume
-            ? (originalStart ?? stagedAudio.manifest.startedAt)
-            : stagedAudio.manifest.startedAt
         let duration = isResume
             ? meeting.durationSeconds + sessionDuration
             : sessionDuration
@@ -202,11 +251,15 @@ enum MeetingFinalProcessingService {
             startTime: startTime,
             endTime: sessionEnd,
             durationSeconds: duration,
-            rawTranscript: combinedTranscript,
+            rawTranscript: publishedTranscript,
             formattedNotes: formattedNotes,
             templateSnapshot: templateSnapshot,
             transcriptionMetadata: transcriptionMetadata,
-            summaryMetadata: summaryMetadata
+            summaryMetadata: summaryMetadata,
+            summaryInput: evidencePublication?.evidence.summaryInputDescriptor(
+                ownerName: config.userName
+            ) ?? meeting.processingMetadata.summaryInput,
+            transcriptEvidence: evidencePublication?.evidence
         )
         try saveCachedResult(cachedResult, for: stagedAudio)
         stagedAudio = try MeetingProcessingCapture.markState(.committing, for: stagedAudio)
@@ -222,8 +275,10 @@ enum MeetingFinalProcessingService {
             processingMetadata: MeetingProcessingMetadata(
                 transcription: cachedResult.transcriptionMetadata,
                 summary: cachedResult.summaryMetadata,
-                manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
-            )
+                manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt,
+                summaryInput: cachedResult.summaryInput
+            ),
+            transcriptEvidence: cachedResult.transcriptEvidence
         )
     }
 

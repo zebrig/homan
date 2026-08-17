@@ -1,4 +1,5 @@
 import Foundation
+import MuesliCore
 import os
 
 enum MeetingProcessingCaptureError: Error, LocalizedError {
@@ -55,6 +56,8 @@ struct MeetingProcessingManifest: Codable, Equatable, Sendable {
     var cohereLanguage: String?
     var indicASRLanguage: String?
     var nemotron35Language: String?
+    var finalDiarizationEnabled: Bool?
+    var finalDiarizationProfileID: String?
     var timelinePolicy: MeetingRecordingTimelinePolicy?
     var preprocessing: MeetingRecordingPreprocessingDescriptor?
     var sampleFormat: String?
@@ -108,6 +111,8 @@ final class MeetingProcessingCapture: @unchecked Sendable {
         cohereLanguage: CohereTranscribeLanguage? = nil,
         indicASRLanguage: IndicASRLanguage? = nil,
         nemotron35Language: Nemotron35Language? = nil,
+        finalDiarizationEnabled: Bool? = nil,
+        finalDiarizationProfileID: MeetingDiarizationProfileID? = nil,
         supportDirectory: URL = AppIdentity.supportDirectoryURL
     ) throws {
         let root = supportDirectory
@@ -145,6 +150,8 @@ final class MeetingProcessingCapture: @unchecked Sendable {
                 cohereLanguage: cohereLanguage?.rawValue,
                 indicASRLanguage: indicASRLanguage?.rawValue,
                 nemotron35Language: nemotron35Language?.rawValue,
+                finalDiarizationEnabled: finalDiarizationEnabled,
+                finalDiarizationProfileID: finalDiarizationProfileID?.rawValue,
                 timelinePolicy: .activeCaptureCompacted,
                 preprocessing: .current,
                 sampleFormat: MeetingRecordingPreprocessingDescriptor.current.sampleFormat

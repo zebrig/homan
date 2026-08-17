@@ -1,3 +1,4 @@
+@preconcurrency import AVFoundation
 import FluidAudio
 import Foundation
 import MuesliCore
@@ -28,7 +29,7 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
     private var _gemma4LiteRTTranscriber: Any?
     private let senseVoiceTranscriber = SenseVoiceTranscriber()
     private var vadManager: VadManager?
-    private var diarizerManager: DiarizerManager?
+    private let meetingDiarizationRuntime = MeetingDiarizationRuntime()
     private var activeBackend: String?
     private let homanWhisperBatchClient = HomanWhisperBatchClient()
 
@@ -327,24 +328,6 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
 
     func preloadMeetingHelpers() async {
         await preloadMeetingVAD()
-
-        if diarizerManager == nil {
-            do {
-                let diarizer = DiarizerManager()
-                let policy = DiarizerRuntimePolicy.resolve(for: .current())
-                let models = try await DiarizerModels.download(
-                    configuration: policy.modelConfiguration
-                )
-                diarizer.initialize(models: models)
-                diarizerManager = diarizer
-                fputs(
-                    "[muesli-native] Speaker diarization loaded policy=\(policy.computePolicy.rawValue) rule=\(policy.compatibilityRule)\n",
-                    stderr
-                )
-            } catch {
-                fputs("[muesli-native] Diarization load failed (non-critical): \(error)\n", stderr)
-            }
-        }
     }
 
     func preloadMeetingVAD() async {
@@ -468,29 +451,77 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
         return cleanMeetingTranscript(try await route(url: url, backend: backend, cohereLanguage: cohereLanguage, indicASRLanguage: indicASRLanguage))
     }
 
-    func diarizeSystemAudio(at url: URL) async throws -> DiarizationResult? {
-        guard let diarizerManager, diarizerManager.isAvailable else {
-            fputs("[muesli-native] diarization not available, skipping\n", stderr)
-            return nil
-        }
-        fputs("[muesli-native] running speaker diarization on system audio...\n", stderr)
-        let converter = AudioConverter()
-        let samples = try converter.resampleAudioFile(url)
-        let result = try diarizerManager.performCompleteDiarization(samples, sampleRate: 16000)
-        let speakerCount = Set(result.segments.map(\.speakerId)).count
-        fputs("[muesli-native] diarization complete: \(result.segments.count) segments, \(speakerCount) speakers\n", stderr)
-        return result
+    func diarizeSystemAudio(
+        at url: URL,
+        profileID: MeetingDiarizationProfileID = .automatic
+    ) async throws -> DiarizationResult? {
+        let duration = Self.wavDuration(at: url) ?? 0
+        let fingerprint = MeetingTranscriptDigest.text(
+            "legacy-single-system|\(url.lastPathComponent)|\(duration)"
+        )
+        let map = MeetingSystemTimelineMap(
+            totalDurationSeconds: duration,
+            entries: [MeetingSystemTimelineMapEntry(
+                unitID: "legacy-single-system",
+                sourceFingerprint: fingerprint,
+                unitStartSeconds: 0,
+                unitEndSeconds: duration,
+                globalStartSeconds: 0,
+                globalEndSeconds: duration,
+                boundaryKind: .first
+            )]
+        )
+        let result = try await diarizeSystemTimeline(
+            MeetingSystemTimelineInput(url: url, map: map),
+            profileID: profileID,
+            progress: { _ in }
+        )
+        return DiarizationResult(segments: result.activitySegments.map {
+            TimedSpeakerSegment(
+                speakerId: $0.speakerKey,
+                embedding: [],
+                startTimeSeconds: Float($0.startSeconds),
+                endTimeSeconds: Float($0.endSeconds),
+                qualityScore: $0.confidence ?? 0
+            )
+        })
+    }
+
+    func diarizeSystemTimeline(
+        _ timeline: MeetingSystemTimelineInput,
+        profileID: MeetingDiarizationProfileID,
+        progress: @escaping @Sendable (MeetingDiarizationProgress) -> Void
+    ) async throws -> MeetingDiarizationTimelineResult {
+        try await meetingDiarizationRuntime.diarize(
+            timeline: timeline,
+            profileID: profileID,
+            progress: progress
+        )
+    }
+
+    func installMeetingDiarizationModel(
+        profileID: MeetingDiarizationProfileID,
+        progress: @escaping @Sendable (ModelPreparationProgress) -> Void = { _ in }
+    ) async throws -> MeetingDiarizationProfileSnapshot {
+        try await meetingDiarizationRuntime.install(profileID: profileID, progress: progress)
+    }
+
+    func removeMeetingDiarizationModel(
+        profileID: MeetingDiarizationProfileID
+    ) async throws {
+        try await meetingDiarizationRuntime.remove(profileID: profileID)
+    }
+
+    func meetingDiarizationAssetStatuses() async -> [MeetingDiarizationAssetStatus] {
+        await meetingDiarizationRuntime.assetStatuses()
     }
 
     func getVadManager() -> VadManager? {
         vadManager
     }
 
-    func getDiarizerManager() -> DiarizerManager? {
-        diarizerManager
-    }
-
     func shutdown() async {
+        await meetingDiarizationRuntime.unload()
         await fluidTranscriber.shutdown()
         await whisperTranscriber.shutdown()
         await senseVoiceTranscriber.shutdown()
@@ -508,6 +539,12 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
                 await gemma4.shutdown()
             }
         }
+    }
+
+    private static func wavDuration(at url: URL) -> TimeInterval? {
+        guard let file = try? AVAudioFile(forReading: url),
+              file.processingFormat.sampleRate > 0 else { return nil }
+        return Double(file.length) / file.processingFormat.sampleRate
     }
 
     private func removeFillers(_ result: SpeechTranscriptionResult) -> SpeechTranscriptionResult {

@@ -963,6 +963,55 @@ struct SettingsView: View {
             }
             Divider().background(MuesliTheme.surfaceBorder)
             settingsRow(
+                "Analyze remote speakers in Final",
+                description: "Runs locally on system audio only. The microphone always remains You and Homan Whisper remains the ASR provider."
+            ) {
+                settingsSwitch(
+                    isOn: appState.config.meetingFinalDiarizationEnabledByDefault
+                ) { newValue in
+                    controller.updateConfig {
+                        $0.meetingFinalDiarizationEnabledByDefault = newValue
+                    }
+                }
+            }
+            if appState.config.meetingFinalDiarizationEnabledByDefault {
+                Divider().background(MuesliTheme.surfaceBorder)
+                settingsRow(
+                    "Final speaker profile",
+                    description: "Automatic favors offline quality. Stable 4-speaker uses Sortformer and has a hard four-remote-speaker limit.",
+                    controlWidth: meetingControlWidth
+                ) {
+                    let profiles = MeetingDiarizationProfileID.allCases
+                    settingsMenu(
+                        selection: diarizationProfileLabel(
+                            appState.config.resolvedMeetingFinalDiarizationProfile
+                        ),
+                        options: profiles.map(diarizationProfileLabel)
+                    ) { label in
+                        guard let profile = profiles.first(where: {
+                            diarizationProfileLabel($0) == label
+                        }) else { return }
+                        controller.updateConfig {
+                            $0.meetingFinalDiarizationProfile = profile.rawValue
+                        }
+                    }
+                }
+            }
+            Divider().background(MuesliTheme.surfaceBorder)
+            settingsRow(
+                "Live speaker analysis by default",
+                description: "Independent from Live transcription. Uses the installed Stable up to 4 model and can be toggled for one recording without changing this default."
+            ) {
+                settingsSwitch(
+                    isOn: appState.config.meetingLiveDiarizationEnabledByDefault
+                ) { newValue in
+                    controller.updateConfig {
+                        $0.meetingLiveDiarizationEnabledByDefault = newValue
+                    }
+                }
+            }
+            Divider().background(MuesliTheme.surfaceBorder)
+            settingsRow(
                 "Homan Whisper API key",
                 description: "Stored in app configuration like other provider keys. Used only by Homan Whisper final transcription.",
                 controlWidth: meetingControlWidth
@@ -3660,6 +3709,19 @@ struct SettingsView: View {
             return "Ask every time"
         case .always:
             return "Always"
+        }
+    }
+
+    private func diarizationProfileLabel(
+        _ profile: MeetingDiarizationProfileID
+    ) -> String {
+        switch profile {
+        case .automatic:
+            return "Automatic"
+        case .offlineQuality:
+            return "Offline quality"
+        case .stableFourSpeaker:
+            return "Stable up to 4 speakers"
         }
     }
 

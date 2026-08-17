@@ -45,6 +45,7 @@ enum SettingsPane: String, CaseIterable, Identifiable {
 enum ModelsCategory: String, CaseIterable, Identifiable {
     case dictation
     case streaming
+    case speakerSeparation
     case postProcessing
     case meetingSummarization
 
@@ -54,6 +55,7 @@ enum ModelsCategory: String, CaseIterable, Identifiable {
         switch self {
         case .dictation: return "Dictation"
         case .streaming: return "Streaming"
+        case .speakerSeparation: return "Speakers"
         case .postProcessing: return "Post-processing"
         case .meetingSummarization: return "Meeting Summary"
         }
@@ -153,6 +155,7 @@ final class AppState {
     var liveMeetingPartialYou: String = ""
     var liveMeetingPartialOthers: String = ""
     var meetingLiveState: MeetingLiveRuntimeState = .off(selection: .parakeetRealtimeEOU)
+    var meetingLiveDiarizationState = MeetingLiveDiarizationRuntimeState.off()
     var activeMeetingAudioWarning: ActiveMeetingAudioWarning?
     var activeMeetingMicrophone: ActiveMeetingMicrophoneState?
     var dictationState: DictationState = .idle

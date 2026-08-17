@@ -89,6 +89,30 @@ struct RemoteMeetingSpeechResult: Sendable, Equatable {
     let start: TimeInterval
     let end: TimeInterval
     let text: String
+    let segments: [RemoteMeetingSpeechSubsegment]?
+
+    init(
+        id: String,
+        source: MeetingAudioSourceRole,
+        start: TimeInterval,
+        end: TimeInterval,
+        text: String,
+        segments: [RemoteMeetingSpeechSubsegment]? = nil
+    ) {
+        self.id = id
+        self.source = source
+        self.start = start
+        self.end = end
+        self.text = text
+        self.segments = segments
+    }
+}
+
+struct RemoteMeetingSpeechSubsegment: Sendable, Equatable {
+    let id: String
+    let start: TimeInterval
+    let end: TimeInterval
+    let text: String
 }
 
 protocol MeetingBatchTranscriptionProviding: Sendable {
@@ -126,11 +150,19 @@ actor HomanWhisperBatchClient {
 
     private struct Response: Decodable {
         struct Item: Decodable {
+            struct Segment: Decodable {
+                let id: String
+                let start: Double
+                let end: Double
+                let text: String
+            }
+
             let id: String
             let source: String
             let start: Double
             let end: Double
             let text: String
+            let segments: [Segment]?
         }
 
         let schemaVersion: Int
@@ -389,14 +421,73 @@ actor HomanWhisperBatchClient {
                   abs(item.end - original.end) <= 0.001 else {
                 throw HomanWhisperError.invalidResponse("unknown, duplicate, or changed item")
             }
+            let validatedSegments = try validateResponseSegments(
+                item.segments,
+                outerID: item.id,
+                outerStart: original.start,
+                outerEnd: original.end
+            )
+            let outerText = item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            let textPreservingSegments = validatedSegments.flatMap { segments in
+                let segmentedText = segments.map(\.text).joined(separator: " ")
+                return Self.normalizedTranscriptText(segmentedText)
+                    == Self.normalizedTranscriptText(outerText)
+                    ? segments
+                    : nil
+            }
             return RemoteMeetingSpeechResult(
                 id: item.id,
                 source: original.source,
                 start: original.start,
                 end: original.end,
-                text: item.text.trimmingCharacters(in: .whitespacesAndNewlines)
+                text: outerText,
+                // Fine timestamps are optional evidence. If they omit or add
+                // text, retain the authoritative outer item as one coarse span
+                // instead of silently changing the transcript.
+                segments: textPreservingSegments
             )
         }
+    }
+
+    private static func normalizedTranscriptText(_ value: String) -> String {
+        value.split(whereSeparator: { $0.isWhitespace }).joined(separator: " ")
+    }
+
+    private func validateResponseSegments(
+        _ segments: [Response.Item.Segment]?,
+        outerID: String,
+        outerStart: TimeInterval,
+        outerEnd: TimeInterval
+    ) throws -> [RemoteMeetingSpeechSubsegment]? {
+        guard let segments, !segments.isEmpty else { return nil }
+        var ids = Set<String>()
+        var previousEnd = outerStart
+        var result: [RemoteMeetingSpeechSubsegment] = []
+        result.reserveCapacity(segments.count)
+        for segment in segments {
+            let text = segment.text.trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !segment.id.isEmpty,
+                  ids.insert(segment.id).inserted,
+                  segment.start.isFinite,
+                  segment.end.isFinite,
+                  segment.start >= outerStart - 0.001,
+                  segment.end <= outerEnd + 0.001,
+                  segment.end > segment.start,
+                  segment.start >= previousEnd - 0.001,
+                  !text.isEmpty else {
+                throw HomanWhisperError.invalidResponse(
+                    "invalid inner segment in \(outerID)"
+                )
+            }
+            result.append(RemoteMeetingSpeechSubsegment(
+                id: segment.id,
+                start: segment.start,
+                end: segment.end,
+                text: text
+            ))
+            previousEnd = segment.end
+        }
+        return result
     }
 
     private func boundary(for requestID: UUID) -> String {

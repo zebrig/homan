@@ -2,6 +2,7 @@
 import AudioToolbox
 import CryptoKit
 import Foundation
+import MuesliCore
 
 enum MeetingRawAudioEncoding: String, Codable, Sendable {
     case pcmJournal = "pcm_journal"
@@ -50,6 +51,10 @@ struct MeetingRawAudioManifest: Codable, Equatable, Sendable {
     var cohereLanguage: String?
     var indicASRLanguage: String?
     var nemotron35Language: String?
+    /// Immutable Final speaker-analysis intent captured when recording starts.
+    /// Optional for manifests written by older builds.
+    var finalDiarizationEnabled: Bool?
+    var finalDiarizationProfileID: String?
     var microphoneEpochs: [MeetingRawAudioEpoch]
     var systemEpochs: [MeetingRawAudioEpoch]
 }
@@ -170,6 +175,8 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
         cohereLanguage: CohereTranscribeLanguage? = nil,
         indicASRLanguage: IndicASRLanguage? = nil,
         nemotron35Language: Nemotron35Language? = nil,
+        finalDiarizationEnabled: Bool? = nil,
+        finalDiarizationProfileID: MeetingDiarizationProfileID? = nil,
         supportDirectory: URL = AppIdentity.supportDirectoryURL,
         segmentDuration: TimeInterval = 60,
         discontinuityTolerance: TimeInterval = 0.020,
@@ -218,6 +225,8 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
             cohereLanguage: cohereLanguage?.rawValue,
             indicASRLanguage: indicASRLanguage?.rawValue,
             nemotron35Language: nemotron35Language?.rawValue,
+            finalDiarizationEnabled: finalDiarizationEnabled,
+            finalDiarizationProfileID: finalDiarizationProfileID?.rawValue,
             microphoneEpochs: [],
             systemEpochs: []
         )
@@ -249,6 +258,18 @@ final class MeetingRawAudioCapture: @unchecked Sendable {
         try writerQueue.sync {
             try checkpointOnQueue(force: true)
             return stagedAudioOnQueue()
+        }
+    }
+
+    func setFinalDiarizationPolicy(
+        enabled: Bool,
+        profileID: MeetingDiarizationProfileID
+    ) throws {
+        try writerQueue.sync {
+            guard !state.isFinalized, !state.isDiscarded else { return }
+            state.manifest.finalDiarizationEnabled = enabled
+            state.manifest.finalDiarizationProfileID = profileID.rawValue
+            try writeManifest(state.manifest)
         }
     }
 

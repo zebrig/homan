@@ -29,6 +29,11 @@ struct MeetingChunkTimingTracker: Sendable {
         currentChunkSampleCount += Int64(sampleCount)
     }
 
+    var currentEndTimeSeconds: TimeInterval {
+        guard let start = currentChunkStartSampleIndex else { return 0 }
+        return Double(start + currentChunkSampleCount) / Double(Self.sampleRate)
+    }
+
     mutating func rotate() -> MeetingChunkTimingSnapshot? {
         guard let currentChunkStartSampleIndex else { return nil }
         let snapshot = MeetingChunkTimingSnapshot(

@@ -1047,6 +1047,14 @@ final class MuesliICloudSyncEngine {
 
     private func save(records: [CKRecord]) async throws -> [CKRecord] {
         guard !records.isEmpty else { return [] }
+        let temporaryEvidenceURLs = records.compactMap {
+            ($0["transcriptEvidence"] as? CKAsset)?.fileURL
+        }.filter(Self.isOwnedTemporaryEvidenceURL)
+        defer {
+            for url in temporaryEvidenceURLs {
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
         return try await ICloudSyncCallbackDeadline.wait { finish in
             let operation = CKModifyRecordsOperation(recordsToSave: records, recordIDsToDelete: nil)
             operation.savePolicy = .changedKeys
@@ -1126,6 +1134,9 @@ final class MuesliICloudSyncEngine {
         cloud["meetingStatus"] = record.meetingStatus?.rawValue as NSString?
         cloud["followUpToRecordName"] = record.followUpToRecordName as NSString?
         cloud["processingMetadataJSON"] = record.processingMetadataJSON as NSString?
+        cloud["transcriptEvidence"] = evidenceAsset(
+            for: record.transcriptEvidence
+        )
         cloud["engineIdentifier"] = record.engineIdentifier as NSString?
         cloud["createdAt"] = record.createdAt as NSDate
         cloud["updatedAt"] = record.updatedAt as NSDate
@@ -1143,6 +1154,7 @@ final class MuesliICloudSyncEngine {
             cloud["manualNotes"] = nil as NSString?
             cloud["followUpToRecordName"] = nil as NSString?
             cloud["processingMetadataJSON"] = nil as NSString?
+            cloud["transcriptEvidence"] = nil as CKAsset?
             return cloud
         }
         cloud["title"] = record.title as NSString?
@@ -1192,8 +1204,71 @@ final class MuesliICloudSyncEngine {
             isDeleted: isDeleted,
             cloudChangeTag: record.recordChangeTag,
             followUpToRecordName: record["followUpToRecordName"] as? String,
-            processingMetadataJSON: record["processingMetadataJSON"] as? String
+            processingMetadataJSON: record["processingMetadataJSON"] as? String,
+            transcriptEvidence: decodeTranscriptEvidence(
+                from: record["transcriptEvidence"] as? CKAsset
+            )
         )
+    }
+
+    private static let evidenceAssetDirectoryName = "homan-cloud-transcript-evidence-v1"
+    private static let maximumEvidenceAssetBytes = 64 * 1024 * 1024
+
+    private static func evidenceAsset(
+        for evidence: MeetingTranscriptEvidenceBundle?
+    ) -> CKAsset? {
+        guard let evidence,
+              evidence.schemaVersion <= MeetingTranscriptEvidenceBundle.currentSchemaVersion else {
+            return nil
+        }
+        let encoder = JSONEncoder()
+        encoder.outputFormatting = [.sortedKeys, .withoutEscapingSlashes]
+        encoder.dateEncodingStrategy = .iso8601
+        guard let data = try? encoder.encode(evidence),
+              data.count <= maximumEvidenceAssetBytes else {
+            return nil
+        }
+        let directory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(evidenceAssetDirectoryName, isDirectory: true)
+        do {
+            try FileManager.default.createDirectory(
+                at: directory,
+                withIntermediateDirectories: true
+            )
+            let url = directory
+                .appendingPathComponent(UUID().uuidString)
+                .appendingPathExtension("json")
+            try data.write(to: url, options: .atomic)
+            return CKAsset(fileURL: url)
+        } catch {
+            return nil
+        }
+    }
+
+    private static func decodeTranscriptEvidence(
+        from asset: CKAsset?
+    ) -> MeetingTranscriptEvidenceBundle? {
+        guard let url = asset?.fileURL,
+              let values = try? url.resourceValues(forKeys: [.fileSizeKey]),
+              let size = values.fileSize,
+              size >= 0,
+              size <= maximumEvidenceAssetBytes,
+              let data = try? Data(contentsOf: url, options: .mappedIfSafe) else {
+            return nil
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let evidence = try? decoder.decode(
+            MeetingTranscriptEvidenceBundle.self,
+            from: data
+        ), evidence.schemaVersion <= MeetingTranscriptEvidenceBundle.currentSchemaVersion else {
+            return nil
+        }
+        return evidence
+    }
+
+    private static func isOwnedTemporaryEvidenceURL(_ url: URL) -> Bool {
+        url.deletingLastPathComponent().lastPathComponent == evidenceAssetDirectoryName
     }
 
     private static func kind(from record: CKRecord) -> SyncTextRecordKind? {
@@ -1321,6 +1396,7 @@ final class MuesliICloudSyncEngine {
             "meetingStatus",
             "followUpToRecordName",
             "processingMetadataJSON",
+            "transcriptEvidence",
             "engineIdentifier",
             "createdAt",
             "updatedAt",

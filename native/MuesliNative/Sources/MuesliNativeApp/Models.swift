@@ -369,6 +369,42 @@ struct MeetingLiveRuntimeState: Equatable, Sendable {
     }
 }
 
+enum MeetingLiveDiarizationPhase: String, Equatable, Sendable {
+    case off
+    case loading
+    case running
+    case suspended
+    case lagging
+    case failed
+}
+
+/// Session-only state for provisional remote-speaker labels. This is
+/// deliberately separate from Live ASR and is never persisted as Final or
+/// recovery evidence.
+struct MeetingLiveDiarizationRuntimeState: Equatable, Sendable {
+    var enabled: Bool
+    var phase: MeetingLiveDiarizationPhase
+    var epoch: UInt64
+    var profileID: MeetingDiarizationProfileID
+    var message: String?
+    var droppedAudioSeconds: TimeInterval
+
+    static func off(
+        enabled: Bool = false,
+        epoch: UInt64 = 0,
+        message: String? = nil
+    ) -> Self {
+        MeetingLiveDiarizationRuntimeState(
+            enabled: enabled,
+            phase: .off,
+            epoch: epoch,
+            profileID: .stableFourSpeaker,
+            message: message,
+            droppedAudioSeconds: 0
+        )
+    }
+}
+
 enum MeetingASRModelCatalog {
     private static let chunkedWindow = 3.0 ... 5.0
 
@@ -1551,6 +1587,12 @@ struct AppConfig: Codable {
     var meetingLiveEnabledByDefault: Bool = false
     var meetingLiveModelBackend: String = ASRModelID.parakeetRealtimeEOU.backend
     var meetingLiveModel: String = ASRModelID.parakeetRealtimeEOU.model
+    /// Speaker analysis is independent from the selected Final ASR model.
+    // Keep the new Final pipeline opt-in until Homan-specific quality and
+    // resource benchmarks approve a default profile revision.
+    var meetingFinalDiarizationEnabledByDefault: Bool = false
+    var meetingFinalDiarizationProfile: String = MeetingDiarizationProfileID.automatic.rawValue
+    var meetingLiveDiarizationEnabledByDefault: Bool = false
     /// Reveals a compact live transcript beside the meeting waveform while the
     /// pointer is over either floating surface.
     var showMeetingTranscriptOnIndicatorHover: Bool = true
@@ -1685,6 +1727,9 @@ struct AppConfig: Codable {
         case meetingLiveEnabledByDefault = "meeting_live_enabled_by_default"
         case meetingLiveModelBackend = "meeting_live_model_backend"
         case meetingLiveModel = "meeting_live_model"
+        case meetingFinalDiarizationEnabledByDefault = "meeting_final_diarization_enabled_by_default"
+        case meetingFinalDiarizationProfile = "meeting_final_diarization_profile"
+        case meetingLiveDiarizationEnabledByDefault = "meeting_live_diarization_enabled_by_default"
         case showMeetingTranscriptOnIndicatorHover = "show_meeting_transcript_on_indicator_hover"
         case meetingHookEnabled = "meeting_hook_enabled"
         case meetingHookPath = "meeting_hook_path"
@@ -1938,6 +1983,18 @@ struct AppConfig: Codable {
         enableLiveStreamingPartials = legacyLiveEnabled
         meetingLiveCaptionBackend = legacyLiveBackend.rawValue
         synchronizeLegacyMeetingLiveSettings()
+        meetingFinalDiarizationEnabledByDefault =
+            (try? c.decode(Bool.self, forKey: .meetingFinalDiarizationEnabledByDefault))
+            ?? defaults.meetingFinalDiarizationEnabledByDefault
+        let decodedDiarizationProfile =
+            (try? c.decode(String.self, forKey: .meetingFinalDiarizationProfile))
+            ?? defaults.meetingFinalDiarizationProfile
+        meetingFinalDiarizationProfile = MeetingDiarizationProfileID(
+            rawValue: decodedDiarizationProfile
+        )?.rawValue ?? defaults.meetingFinalDiarizationProfile
+        meetingLiveDiarizationEnabledByDefault =
+            (try? c.decode(Bool.self, forKey: .meetingLiveDiarizationEnabledByDefault))
+            ?? defaults.meetingLiveDiarizationEnabledByDefault
         showMeetingTranscriptOnIndicatorHover = (try? c.decode(Bool.self, forKey: .showMeetingTranscriptOnIndicatorHover)) ?? defaults.showMeetingTranscriptOnIndicatorHover
         meetingHookEnabled = (try? c.decode(Bool.self, forKey: .meetingHookEnabled)) ?? defaults.meetingHookEnabled
         meetingHookPath = (try? c.decode(String.self, forKey: .meetingHookPath)) ?? defaults.meetingHookPath
@@ -2008,6 +2065,10 @@ struct AppConfig: Codable {
 
     var resolvedMeetingAecModel: MeetingAecModel {
         MeetingAecModel.resolved(meetingAecModel)
+    }
+
+    var resolvedMeetingFinalDiarizationProfile: MeetingDiarizationProfileID {
+        MeetingDiarizationProfileID(rawValue: meetingFinalDiarizationProfile) ?? .automatic
     }
 }
 

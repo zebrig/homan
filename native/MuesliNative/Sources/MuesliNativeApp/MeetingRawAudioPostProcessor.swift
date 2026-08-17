@@ -1,5 +1,6 @@
 @preconcurrency import AVFoundation
 import Foundation
+import MuesliCore
 
 enum MeetingRawAudioPostProcessorError: Error, LocalizedError {
     case unsupportedDerivedFormat(String)
@@ -38,15 +39,24 @@ struct MeetingPreparedRawAudio: Sendable {
 /// microphone-derived source, but it never changes the system-derived source or
 /// any canonical raw payload.
 enum MeetingRawAudioPostProcessor {
-    private static let processingBlockFrames: AVAudioFrameCount = 16_000
+    /// Keep post-capture AEC work interruptible. 4,096 frames are exactly
+    /// divisible by both bundled processor frame sizes (256 and 512), while
+    /// limiting the interval before a newly-started recording can preempt this
+    /// background work to roughly a quarter second of source audio.
+    private static let processingBlockFrames: AVAudioFrameCount = 4_096
 
     static func prepare(
         _ rawAudio: MeetingStagedRawAudio,
         aec: MeetingNeuralAec,
-        supportDirectory: URL
+        supportDirectory: URL,
+        inferenceScheduler: MeetingInferenceScheduler = .shared
     ) async throws -> MeetingStagedAudio {
         let manifest = rawAudio.manifest
-        let prepared = try await renderProcessingView(rawAudio, aec: aec)
+        let prepared = try await renderProcessingView(
+            rawAudio,
+            aec: aec,
+            inferenceScheduler: inferenceScheduler
+        )
         defer { prepared.removeTemporaryFiles() }
         let derived = try MeetingProcessingCapture(
             meetingID: manifest.meetingID,
@@ -56,6 +66,10 @@ enum MeetingRawAudioPostProcessor {
             cohereLanguage: manifest.cohereLanguage.flatMap(CohereTranscribeLanguage.init(rawValue:)),
             indicASRLanguage: manifest.indicASRLanguage.flatMap(IndicASRLanguage.init(rawValue:)),
             nemotron35Language: manifest.nemotron35Language.flatMap(Nemotron35Language.init(rawValue:)),
+            finalDiarizationEnabled: manifest.finalDiarizationEnabled,
+            finalDiarizationProfileID: manifest.finalDiarizationProfileID.flatMap(
+                MeetingDiarizationProfileID.init(rawValue:)
+            ),
             supportDirectory: supportDirectory
         )
 
@@ -81,13 +95,17 @@ enum MeetingRawAudioPostProcessor {
 
     static func renderProcessingView(
         _ rawAudio: MeetingStagedRawAudio,
-        aec: MeetingNeuralAec
+        aec: MeetingNeuralAec,
+        inferenceScheduler: MeetingInferenceScheduler = .shared
     ) async throws -> MeetingPreparedRawAudio {
+        try await inferenceScheduler.waitUntilCaptureAllowsInference()
         try Task.checkCancellation()
         let rendered = try MeetingRawAudioRenderer.renderForProcessing(rawAudio)
         var microphoneWriter: PCMChunkRecorder?
         do {
+            try await inferenceScheduler.waitUntilCaptureAllowsInference()
             await aec.preload()
+            try await inferenceScheduler.waitUntilCaptureAllowsInference()
             try Task.checkCancellation()
             aec.resetForStreaming()
 
@@ -103,6 +121,7 @@ enum MeetingRawAudioPostProcessor {
             var microphoneSamplesWritten = 0
 
             while processedFrames < targetFrames {
+                try await inferenceScheduler.waitUntilCaptureAllowsInference()
                 try Task.checkCancellation()
                 let requestedFrames = min(
                     Int(processingBlockFrames),
@@ -128,6 +147,7 @@ enum MeetingRawAudioPostProcessor {
             }
 
             if microphoneReader != nil {
+                try await inferenceScheduler.waitUntilCaptureAllowsInference()
                 try Task.checkCancellation()
                 let flushed = aec.flushStreamingMic().map(pcm16Sample)
                 microphoneWriter?.append(flushed)

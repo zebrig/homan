@@ -157,6 +157,7 @@ enum MeetingRetranscriptionError: Error, LocalizedError {
     case recordingUnavailable
     case noDownloadedTranscriptionModel
     case emptyTranscript
+    case compatibleSpeakerAnalysisUnavailable
     case failedToSave(underlying: Error)
 
     var errorDescription: String? {
@@ -169,10 +170,31 @@ enum MeetingRetranscriptionError: Error, LocalizedError {
             return "Configure the selected cloud transcription provider or download a local model before re-transcribing this meeting."
         case .emptyTranscript:
             return "Re-transcription finished, but no speech was detected in the saved recording."
+        case .compatibleSpeakerAnalysisUnavailable:
+            return "The saved speaker analysis no longer matches this recording. Choose Analyze again or Off."
         case .failedToSave(let underlying):
             return "The re-transcribed meeting could not be saved. \(underlying.localizedDescription)"
         }
     }
+}
+
+private struct ResolvedRetranscriptionDiarization {
+    let pipelinePolicy: SystemDiarizationPolicy
+    let profileID: MeetingDiarizationProfileID
+    let reusableRevision: MeetingDiarizationRevision?
+    let planMode: MeetingDiarizationRunMode
+}
+
+struct MeetingSpeakerControlsState: Equatable {
+    let preference: MeetingDiarizationPreference
+    let activePresentation: MeetingTranscriptPresentationMode?
+    let availablePresentations: [MeetingTranscriptPresentationMode]
+    let summaryIsStale: Bool
+    let warning: String?
+    let canAnalyzeAgain: Bool
+    let analyzeUnavailableReason: String?
+    let hasCompatibleAnalysis: Bool
+    let collapsedPresentationLabel: String
 }
 
 enum MeetingLifecycleError: Error, LocalizedError {
@@ -1506,7 +1528,14 @@ final class MuesliController: NSObject {
     /// Serialize all non-deleted meetings (text only, no audio) + folders as a backup file.
     func exportMeetingsBackupData() throws -> Data {
         let meetings = try dictationStore.recentMeetings(limit: nil)
-            .map { MeetingBackupEntry(record: $0) }
+            .map { meeting in
+                MeetingBackupEntry(
+                    record: meeting,
+                    transcriptEvidence: try dictationStore.meetingTranscriptEvidence(
+                        meetingID: meeting.id
+                    )
+                )
+            }
         let folders = (try? dictationStore.listFolders()) ?? []
         return try MeetingBackup.exportData(meetings: meetings, folders: folders)
     }
@@ -1584,6 +1613,7 @@ final class MuesliController: NSObject {
         appState.liveMeetingPartialOthers = ""
         appState.liveMeetingTranscriptOwnerID = nil
         appState.meetingLiveState = .off(selection: config.resolvedMeetingLiveASRModelID)
+        appState.meetingLiveDiarizationState = .off()
         liveMeetingTranscriptGeneration = nil
         indicator.updateMeetingTranscript(transcript: "", partialYou: "", partialOthers: "")
     }
@@ -4430,7 +4460,8 @@ final class MuesliController: NSObject {
     ) {
         Task { [weak self] in
             guard let self else { return }
-            let plan = MeetingResummarizationPolicy.plan(for: meeting)
+            let currentMeeting = self.meeting(id: meeting.id) ?? meeting
+            let plan = MeetingResummarizationPolicy.plan(for: currentMeeting)
             let runConfig = Self.configForOneTimeSummary(
                 baseConfig: self.config,
                 backend: summaryBackend
@@ -4444,20 +4475,33 @@ final class MuesliController: NSObject {
                 self.syncAppState()
                 let summaryStartedAt = Date()
                 let summaryResult = try await MeetingSummaryClient.summarizeWithMetadata(
-                    transcript: meeting.rawTranscript,
+                    transcript: currentMeeting.rawTranscript,
                     meetingTitle: plan.promptTitle,
                     config: runConfig,
                     template: templateSnapshot,
-                    manualNotesToRetain: meeting.manualNotes
+                    manualNotesToRetain: currentMeeting.manualNotes
+                )
+                let evidence = try self.dictationStore.meetingTranscriptEvidence(
+                    meetingID: currentMeeting.id
+                )
+                let summaryInput = evidence?.summaryInputDescriptor(
+                    ownerName: runConfig.userName
+                ) ?? MeetingSummaryInputDescriptor(
+                    transcriptRevisionID: nil,
+                    attributionRevisionID: nil,
+                    presentationMode: .legacyRendered,
+                    transcriptDigest: MeetingTranscriptDigest.text(currentMeeting.rawTranscript),
+                    ownerName: runConfig.userName
                 )
                 let processingMetadata = MeetingProcessingMetadata(
-                    transcription: meeting.processingMetadata.transcription,
+                    transcription: currentMeeting.processingMetadata.transcription,
                     summary: MeetingProcessingMetadataFactory.summary(
                         config: runConfig,
                         startedAt: summaryStartedAt,
                         thinkingStatus: summaryResult.thinkingStatus
                     ),
-                    manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
+                    manualNotesUpdatedAt: currentMeeting.processingMetadata.manualNotesUpdatedAt,
+                    summaryInput: summaryInput
                 )
                 if let processingRunID {
                     self.advanceMeetingProcessing(
@@ -4514,6 +4558,7 @@ final class MuesliController: NSObject {
     func retranscribe(
         meeting: MeetingRecord,
         using requestedBackend: BackendOption? = nil,
+        diarizationMode requestedDiarizationMode: MeetingDiarizationRunMode = .meetingDefault,
         completion: @escaping (Result<Void, Error>) -> Void
     ) {
         Task { @MainActor [weak self] in
@@ -4540,6 +4585,21 @@ final class MuesliController: NSObject {
                 guard recordingUnits.contains(where: { $0.hasUsableAudio(onDisk: .default) }) else {
                     throw MeetingRetranscriptionError.recordingUnavailable
                 }
+                let meetingStart = ISO8601DateFormatter().date(from: meeting.startTime)
+                    ?? Date(timeIntervalSince1970: 0)
+                let priorEvidence = try self.dictationStore.meetingTranscriptEvidence(
+                    meetingID: meeting.id
+                )
+                let meetingDiarizationPolicy = self.resolvedFinalDiarizationPolicy(
+                    meetingID: meeting.id
+                )
+                let resolvedDiarization = try await self.resolveRetranscriptionDiarization(
+                    requestedMode: requestedDiarizationMode,
+                    meetingPolicy: meetingDiarizationPolicy,
+                    priorEvidence: priorEvidence,
+                    recordingUnits: recordingUnits,
+                    meetingStart: meetingStart
+                )
                 let backend: BackendOption
                 if let requestedBackend {
                     let isReady = requestedBackend.capabilitiesExecutionLocation == .cloud
@@ -4558,7 +4618,11 @@ final class MuesliController: NSObject {
 
                 processingRunID = try self.beginMeetingProcessing(
                     meetingID: meeting.id,
-                    operation: .retranscription
+                    operation: .retranscription,
+                    phases: MeetingProcessingRunPlan.phases(
+                        operation: .retranscription,
+                        diarizationMode: resolvedDiarization.planMode
+                    )
                 )
                 didSetProcessing = true
                 self.syncAppState()
@@ -4601,8 +4665,27 @@ final class MuesliController: NSObject {
                             nemotron35Language: self.config.resolvedNemotron35Language.rawValue
                         ),
                         purpose: .retranscribe,
-                        systemDiarization: .optionalPost,
-                        aecModel: self.config.resolvedMeetingAecModel
+                        systemDiarization: resolvedDiarization.pipelinePolicy,
+                        diarizationProfileID: resolvedDiarization.profileID,
+                        aecModel: self.config.resolvedMeetingAecModel,
+                        reusableDiarization: resolvedDiarization.reusableRevision,
+                        progress: { stage in
+                            Task { @MainActor [weak self] in
+                                guard let self, let processingRunID else { return }
+                                let phase: MeetingProcessingPhase
+                                switch stage {
+                                case .transcribing: phase = .transcribing
+                                case .preparingDiarizer: phase = .preparingDiarizer
+                                case .diarizing: phase = .diarizing
+                                case .applyingSpeakerLabels: phase = .applyingSpeakerLabels
+                                }
+                                self.advanceMeetingProcessing(
+                                    meetingID: meeting.id,
+                                    runID: processingRunID,
+                                    phase: phase
+                                )
+                            }
+                        }
                     ))
                 } catch MeetingTranscriptionPipelineError.emptyTranscript {
                     throw MeetingRetranscriptionError.emptyTranscript
@@ -4610,8 +4693,23 @@ final class MuesliController: NSObject {
                     throw MeetingRetranscriptionError.recordingUnavailable
                 } catch MeetingTranscriptionPipelineError.noRecordingUnits {
                     throw MeetingRetranscriptionError.recordingUnavailable
+                } catch MeetingTranscriptionPipelineError.compatibleDiarizationUnavailable {
+                    throw MeetingRetranscriptionError.compatibleSpeakerAnalysisUnavailable
                 }
-                let rawTranscript = transcription.formattedTranscript
+                let reusedDiarization = transcription.reusedDiarizationRevisionID.flatMap { id in
+                    priorEvidence?.diarizationRevisions.last { $0.id == id }
+                }
+                let evidencePublication = try MeetingTranscriptEvidenceFactory.makePublication(
+                    meetingID: meeting.id,
+                    meetingStart: meetingStart,
+                    result: transcription,
+                    backend: backend,
+                    purpose: .retranscribe,
+                    runID: processingRunID ?? UUID(),
+                    reusedDiarization: reusedDiarization,
+                    priorEvidence: priorEvidence
+                )
+                let rawTranscript = evidencePublication.activeTranscript
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                 guard !rawTranscript.isEmpty else {
                     throw MeetingRetranscriptionError.emptyTranscript
@@ -4675,8 +4773,16 @@ final class MuesliController: NSObject {
                         processingMetadata: MeetingProcessingMetadata(
                             transcription: transcriptionMetadata,
                             summary: summaryMetadata,
-                            manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt
-                        )
+                            manualNotesUpdatedAt: meeting.processingMetadata.manualNotesUpdatedAt,
+                            summaryInput: MeetingSummaryInputDescriptor(
+                                transcriptRevisionID: evidencePublication.transcriptRevision.id,
+                                attributionRevisionID: evidencePublication.attributionRevision.id,
+                                presentationMode: evidencePublication.evidence.presentation.activeMode,
+                                transcriptDigest: evidencePublication.evidence.presentation.activeTextDigest,
+                                ownerName: self.config.userName
+                            )
+                        ),
+                        transcriptEvidence: evidencePublication.evidence
                     )
                 } catch {
                     throw MeetingRetranscriptionError.failedToSave(underlying: error)
@@ -4715,6 +4821,283 @@ final class MuesliController: NSObject {
         }
     }
 
+    func meetingSpeakerControlsState(
+        for meeting: MeetingRecord
+    ) -> MeetingSpeakerControlsState {
+        let preference = (try? dictationStore.meetingDiarizationPreference(
+            meetingID: meeting.id
+        )) ?? MeetingDiarizationPreference(meetingID: meeting.id)
+        guard let evidence = try? dictationStore.meetingTranscriptEvidence(
+            meetingID: meeting.id
+        ) else {
+            return MeetingSpeakerControlsState(
+                preference: preference,
+                activePresentation: nil,
+                availablePresentations: [],
+                summaryIsStale: false,
+                warning: nil,
+                canAnalyzeAgain: false,
+                analyzeUnavailableReason: "Re-transcribe this meeting once before analyzing speakers.",
+                hasCompatibleAnalysis: false,
+                collapsedPresentationLabel: "Others"
+            )
+        }
+        let transcript = evidence.activeTranscriptRevision
+        let hasSystemEvidence = transcript?.spans.contains { $0.source == .system } == true
+        let hasLegacyOnly = transcript?.spans.contains { $0.source == .legacyMixed } == true
+            && !hasSystemEvidence
+        let units = meetingRecordingUnits(for: meeting.id)
+        let hasSourceAwareSystemAudio = units.contains { unit in
+            if unit.recording.sourceLayout?.hasSystem == true { return true }
+            return unit.sourceBundle != nil
+        }
+        let hasRetainedMixedAudio = hasLegacyOnly && units.contains { unit in
+            guard unit.recording.sourceLayout == nil,
+                  unit.sourceBundle == nil,
+                  let url = savedRecordingURL(from: unit.recording.path) else {
+                return false
+            }
+            return FileManager.default.fileExists(atPath: url.path)
+        }
+        let reason: String?
+        if transcript == nil {
+            reason = "Re-transcribe this meeting once before analyzing speakers."
+        } else if hasLegacyOnly, !hasRetainedMixedAudio {
+            reason = "Original mixed audio is no longer available."
+        } else if !hasLegacyOnly, (!hasSystemEvidence || !hasSourceAwareSystemAudio) {
+            reason = "Original system audio is no longer available."
+        } else if meeting.status == .recording || meeting.status == .processing {
+            reason = "Wait for the current meeting operation to finish."
+        } else {
+            reason = nil
+        }
+        let activeDiarization = evidence.activeAttributionRevision?
+            .diarizationRevisionID
+            .flatMap { id in evidence.diarizationRevisions.last { $0.id == id } }
+        let hasCompatibleAnalysis: Bool
+        if let transcript,
+           let diarization = activeDiarization,
+           let timeline = transcript.sourceTimelineMap,
+           let diarizationTimeline = diarization.timelineMap,
+           let capturedProfileID = MeetingDiarizationProfileID(
+               rawValue: diarization.profile.profileID
+           ) {
+            hasCompatibleAnalysis = diarization.status == .complete
+                && timeline.digest == transcript.sourceTimelineDigest
+                && diarizationTimeline.digest == diarization.timelineDigest
+                && timeline.digest == diarizationTimeline.digest
+                && timeline.sourceFingerprints == diarization.sourceFingerprints
+                && MeetingDiarizationProfiles.matchesActiveProvider(
+                    diarization.profile,
+                    requestedID: capturedProfileID
+                )
+        } else {
+            hasCompatibleAnalysis = false
+        }
+        return MeetingSpeakerControlsState(
+            preference: preference,
+            activePresentation: evidence.presentation.activeMode,
+            // A freshly imported mixed recording has structured anonymous
+            // speaker evidence even though it has no authoritative local/
+            // remote side. It can still switch between Speaker N, generic
+            // Speaker and Manual without claiming that anyone is You.
+            availablePresentations: evidence.availablePresentationModes,
+            summaryIsStale: evidence.summaryIsStale(
+                meeting.processingMetadata.summaryInput,
+                ownerName: config.userName
+            ),
+            warning: evidence.processingWarnings?.first,
+            canAnalyzeAgain: reason == nil,
+            analyzeUnavailableReason: reason,
+            hasCompatibleAnalysis: hasCompatibleAnalysis,
+            collapsedPresentationLabel: hasLegacyOnly ? "Speaker" : "Others"
+        )
+    }
+
+    func setMeetingFinalDiarizationPolicy(
+        meetingID: Int64,
+        policy: MeetingFinalDiarizationPolicy
+    ) {
+        do {
+            var preference = try dictationStore.meetingDiarizationPreference(
+                meetingID: meetingID
+            )
+            preference.finalPolicy = policy
+            preference.updatedAt = Date()
+            try dictationStore.setMeetingDiarizationPreference(preference)
+            if activeMeetingID == meetingID {
+                activeMeetingSession?.setFinalDiarizationPolicy(
+                    resolvedFinalDiarizationPolicy(meetingID: meetingID)
+                )
+            }
+            scheduleICloudSyncAfterLocalChange()
+            syncAppState()
+            historyWindowController?.reload()
+        } catch {
+            presentErrorAlert(title: "Speaker Separation", message: error.localizedDescription)
+        }
+    }
+
+    func setMeetingDiarizationProfile(
+        meetingID: Int64,
+        profileID: MeetingDiarizationProfileID?
+    ) {
+        do {
+            var preference = try dictationStore.meetingDiarizationPreference(
+                meetingID: meetingID
+            )
+            preference.preferredProfileID = profileID
+            preference.updatedAt = Date()
+            try dictationStore.setMeetingDiarizationPreference(preference)
+            if activeMeetingID == meetingID {
+                activeMeetingSession?.setFinalDiarizationPolicy(
+                    resolvedFinalDiarizationPolicy(meetingID: meetingID)
+                )
+            }
+            scheduleICloudSyncAfterLocalChange()
+            syncAppState()
+            historyWindowController?.reload()
+        } catch {
+            presentErrorAlert(title: "Speaker Separation", message: error.localizedDescription)
+        }
+    }
+
+    func activateMeetingTranscriptPresentation(
+        meetingID: Int64,
+        mode: MeetingTranscriptPresentationMode,
+        completion: ((Result<Void, Error>) -> Void)? = nil
+    ) {
+        do {
+            _ = try dictationStore.activateMeetingTranscriptPresentation(
+                meetingID: meetingID,
+                mode: mode
+            )
+            scheduleICloudSyncAfterLocalChange()
+            syncAppState()
+            historyWindowController?.reload()
+            completion?(.success(()))
+        } catch {
+            completion?(.failure(error))
+        }
+    }
+
+    /// Runs only the local system-audio diarizer and deterministic attribution.
+    /// ASR, title generation and summary providers are deliberately absent.
+    func analyzeMeetingSpeakersAgain(
+        meeting: MeetingRecord,
+        profileID: MeetingDiarizationProfileID,
+        completion: @escaping (Result<Void, Error>) -> Void
+    ) {
+        Task { @MainActor [weak self] in
+            guard let self else {
+                completion(.failure(MeetingSpeakerAnalysisError.controllerUnavailable))
+                return
+            }
+            var runID: UUID?
+            var renderedTimeline: MeetingRenderedSystemTimeline?
+            do {
+                guard let evidence = try self.dictationStore.meetingTranscriptEvidence(
+                    meetingID: meeting.id
+                ), evidence.activeTranscriptRevision != nil else {
+                    throw MeetingSpeakerAnalysisError.structuredTranscriptUnavailable
+                }
+                let units = try MeetingRecordingUnitResolver.resolve(
+                    meetingID: meeting.id,
+                    store: self.dictationStore,
+                    supportDirectory: self.configStore.supportDirectory()
+                )
+                // The shared renderer deliberately supports both authoritative
+                // microphone/system bundles and structured mixed imports. A
+                // mixed import never invents `You`; its presentation remains
+                // anonymous Speaker N / Speaker.
+                guard !units.isEmpty else {
+                    throw MeetingSpeakerAnalysisError.retainedSystemAudioUnavailable
+                }
+                let meetingStart = ISO8601DateFormatter().date(from: meeting.startTime)
+                    ?? Date(timeIntervalSince1970: 0)
+                let newRunID = try self.beginMeetingProcessing(
+                    meetingID: meeting.id,
+                    operation: .rediarization,
+                    phases: MeetingProcessingRunPlan.phases(operation: .rediarization)
+                )
+                runID = newRunID
+                self.syncAppState()
+                self.historyWindowController?.reload()
+
+                let timeline = try await Task.detached(priority: .utility) {
+                    try MeetingSystemTimelineRenderer.render(
+                        units: units,
+                        meetingStart: meetingStart
+                    )
+                }.value
+                renderedTimeline = timeline
+                self.advanceMeetingProcessing(
+                    meetingID: meeting.id,
+                    runID: newRunID,
+                    phase: .preparingDiarizer
+                )
+                self.advanceMeetingProcessing(
+                    meetingID: meeting.id,
+                    runID: newRunID,
+                    phase: .diarizing
+                )
+                let analysis = try await self.transcriptionCoordinator.diarizeSystemTimeline(
+                    MeetingSystemTimelineInput(url: timeline.url, map: timeline.map),
+                    profileID: profileID,
+                    progress: { _ in }
+                )
+                try Task.checkCancellation()
+                self.advanceMeetingProcessing(
+                    meetingID: meeting.id,
+                    runID: newRunID,
+                    phase: .applyingSpeakerLabels
+                )
+                let publication = try MeetingTranscriptEvidenceFactory
+                    .makeRediarizationPublication(
+                        meetingID: meeting.id,
+                        meetingStart: meetingStart,
+                        priorEvidence: evidence,
+                        timelineMap: timeline.map,
+                        analysis: analysis,
+                        runID: newRunID
+                    )
+                self.advanceMeetingProcessing(
+                    meetingID: meeting.id,
+                    runID: newRunID,
+                    phase: .saving
+                )
+                try self.dictationStore.publishMeetingTranscriptEvidence(
+                    meetingID: meeting.id,
+                    evidence: publication.evidence,
+                    activeTranscript: publication.activeTranscript
+                )
+                timeline.removeTemporaryFile()
+                renderedTimeline = nil
+                self.finishMeetingProcessing(
+                    meetingID: meeting.id,
+                    runID: newRunID,
+                    status: meeting.status
+                )
+                self.scheduleICloudSyncAfterLocalChange()
+                self.syncAppState()
+                self.historyWindowController?.reload()
+                completion(.success(()))
+            } catch {
+                renderedTimeline?.removeTemporaryFile()
+                if let runID {
+                    self.finishMeetingProcessing(
+                        meetingID: meeting.id,
+                        runID: runID,
+                        status: meeting.status
+                    )
+                }
+                self.syncAppState()
+                self.historyWindowController?.reload()
+                completion(.failure(error))
+            }
+        }
+    }
+
     static func retranscriptionFailureStatus(
         originalStatus: MeetingStatus,
         didSetProcessing: Bool,
@@ -4725,7 +5108,8 @@ final class MuesliController: NSObject {
             switch retranscriptionError {
             case .emptyTranscript, .failedToSave:
                 return originalStatus
-            case .controllerUnavailable, .recordingUnavailable, .noDownloadedTranscriptionModel:
+            case .controllerUnavailable, .recordingUnavailable, .noDownloadedTranscriptionModel,
+                 .compatibleSpeakerAnalysisUnavailable:
                 break
             }
         }
@@ -4771,11 +5155,29 @@ final class MuesliController: NSObject {
             return
         }
         meetingRecoveryInFlightIDs.insert(meetingID)
+        let recoveryDiarizationPolicy: ResolvedMeetingDiarizationPolicy = {
+            if let stagedRawAudio {
+                return MeetingDiarizationPolicyResolver.resolveCaptured(
+                    enabled: stagedRawAudio.manifest.finalDiarizationEnabled,
+                    profileRawValue: stagedRawAudio.manifest.finalDiarizationProfileID
+                )
+            }
+            return MeetingDiarizationPolicyResolver.resolveCaptured(
+                enabled: legacyStagedAudio?.manifest.finalDiarizationEnabled,
+                profileRawValue: legacyStagedAudio?.manifest.finalDiarizationProfileID
+            )
+        }()
         let processingRunID: UUID
         do {
             processingRunID = try beginMeetingProcessing(
                 meetingID: meetingID,
-                operation: .recovery
+                operation: .recovery,
+                phases: MeetingProcessingRunPlan.phases(
+                    operation: .recovery,
+                    diarizationMode: recoveryDiarizationPolicy.enabled
+                        ? .rerun(recoveryDiarizationPolicy.profileID)
+                        : .disabled
+                )
             )
         } catch {
             meetingRecoveryInFlightIDs.remove(meetingID)
@@ -4809,7 +5211,8 @@ final class MuesliController: NSObject {
                             aec: MeetingNeuralAec(
                                 localVQEModel: self.config.resolvedMeetingAecModel
                             ),
-                            supportDirectory: self.processingSupportDirectory
+                            supportDirectory: self.processingSupportDirectory,
+                            inferenceScheduler: .shared
                         )
                 }
                 self.advanceMeetingProcessing(
@@ -4826,6 +5229,9 @@ final class MuesliController: NSObject {
                     config: self.config,
                     templateSnapshot: templateSnapshot,
                     coordinator: self.transcriptionCoordinator,
+                    priorEvidence: try self.dictationStore.meetingTranscriptEvidence(
+                        meetingID: meetingID
+                    ),
                     progress: { [weak self] phase in
                         Task { @MainActor [weak self] in
                             self?.advanceMeetingProcessing(
@@ -4900,6 +5306,7 @@ final class MuesliController: NSObject {
                     stagedRawAudio: activeRawAudio,
                     templateSnapshot: recovered.templateSnapshot,
                     processingMetadata: recovered.processingMetadata,
+                    transcriptEvidence: recovered.transcriptEvidence,
                     recordingStartedAt: recovered.stagedAudio.manifest.startedAt
                 )
                 let recordingSaveDecision = await self.recordingSaveDecision(
@@ -5711,6 +6118,16 @@ final class MuesliController: NSObject {
         activeMeetingSession.stopLive()
     }
 
+    func setActiveMeetingLiveDiarizationEnabled(
+        _ enabled: Bool,
+        meetingID: Int64
+    ) {
+        guard activeMeetingID == meetingID,
+              let activeMeetingSession,
+              activeMeetingSession.isRecording else { return }
+        activeMeetingSession.setLiveDiarizationEnabled(enabled)
+    }
+
     func enableLiveCaptionsFromFloatingBar() {
         guard let session = activeMeetingSession,
               session.isRecording else { return }
@@ -6221,6 +6638,48 @@ final class MuesliController: NSObject {
         )
     }
 
+    func meetingDiarizationAssetStatuses() async -> [MeetingDiarizationAssetStatus] {
+        await transcriptionCoordinator.meetingDiarizationAssetStatuses()
+    }
+
+    func installMeetingDiarizationModel(
+        profileID: MeetingDiarizationProfileID,
+        progress: @escaping @Sendable (ModelPreparationProgress) -> Void
+    ) async throws {
+        guard !isMeetingRecording(),
+              !isStartingMeetingRecording,
+              backgroundMeetingProcessing.count == 0 else {
+            throw NSError(
+                domain: "HomanSpeakerModels",
+                code: 1,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Wait for recording and meeting processing to finish before installing a speaker model."]
+            )
+        }
+        _ = try await transcriptionCoordinator.installMeetingDiarizationModel(
+            profileID: profileID,
+            progress: progress
+        )
+    }
+
+    func removeMeetingDiarizationModel(
+        profileID: MeetingDiarizationProfileID
+    ) async throws {
+        guard !isMeetingRecording(),
+              !isStartingMeetingRecording,
+              backgroundMeetingProcessing.count == 0 else {
+            throw NSError(
+                domain: "HomanSpeakerModels",
+                code: 2,
+                userInfo: [NSLocalizedDescriptionKey:
+                    "Wait for recording and meeting processing to finish before removing a speaker model."]
+            )
+        }
+        try await transcriptionCoordinator.removeMeetingDiarizationModel(
+            profileID: profileID
+        )
+    }
+
     func persistImportedAudioMeeting(
         title: String,
         calendarEventID: String?,
@@ -6235,7 +6694,8 @@ final class MuesliController: NSObject {
         selectedTemplateName: String?,
         selectedTemplateKind: MeetingTemplateKind?,
         selectedTemplatePrompt: String?,
-        processingMetadata: MeetingProcessingMetadata
+        processingMetadata: MeetingProcessingMetadata,
+        transcriptEvidence: MeetingTranscriptEvidenceBundle? = nil
     ) throws -> Int64 {
         let meetingID = try dictationStore.insertMeeting(
             title: title,
@@ -6255,7 +6715,8 @@ final class MuesliController: NSObject {
             selectedTemplateKind: selectedTemplateKind,
             selectedTemplatePrompt: selectedTemplatePrompt,
             source: .audioImport,
-            processingMetadata: processingMetadata
+            processingMetadata: processingMetadata,
+            transcriptEvidence: transcriptEvidence
         )
         scheduleICloudSyncAfterLocalChange()
         return meetingID
@@ -6358,6 +6819,9 @@ final class MuesliController: NSObject {
                 config: config,
                 templateSnapshot: templateSnapshot,
                 transcriptionCoordinator: transcriptionCoordinator,
+                finalDiarizationPolicy: resolvedFinalDiarizationPolicy(
+                    meetingID: meetingID
+                ),
                 processingSupportDirectory: processingSupportDirectory,
                 meetingMicRecorder: meetingMicRecorder
             )
@@ -6415,6 +6879,14 @@ final class MuesliController: NSObject {
                             )
                         }
                         guard !entries.isEmpty else { return }
+                        // DictationStore deliberately collapses provisional
+                        // `Speaker N` labels to source-authoritative Others.
+                        // The in-memory transcript below keeps the provisional
+                        // labels for the current Live epoch only.
+                        try? self.dictationStore.appendLiveTranscriptCheckpoints(
+                            meetingID: meetingID,
+                            entries: entries
+                        )
                         let lines = entries.map { "[\($0.timestampLabel)] \($0.speaker): \($0.text)" }
                         self.appState.liveMeetingTranscript += lines.joined(separator: "\n") + "\n"
                         self.indicator.updateMeetingTranscript(
@@ -6467,12 +6939,24 @@ final class MuesliController: NSObject {
                         self.indicator.setLiveCaptionsActive(liveActive)
                     }
                 }
+                meetingSession.onLiveDiarizationStateChanged = { [weak self] state in
+                    Task { @MainActor [weak self] in
+                        guard let self,
+                              self.isCurrentLiveMeetingTranscriptSession(
+                                ownerID: meetingID,
+                                generation: transcriptGeneration
+                              ) else { return }
+                        self.appState.meetingLiveDiarizationState = state
+                    }
+                }
                 appState.liveMeetingTranscriptOwnerID = meetingID
                 liveMeetingTranscriptGeneration = transcriptGeneration
                 appState.liveMeetingTranscript = ""
                 appState.liveMeetingPartialYou = ""
                 appState.liveMeetingPartialOthers = ""
                 appState.meetingLiveState = meetingSession.liveStateSnapshot()
+                appState.meetingLiveDiarizationState = meetingSession
+                    .liveDiarizationStateSnapshot()
                 indicator.updateMeetingTranscript(
                     transcript: "",
                     partialYou: "",
@@ -7058,12 +7542,22 @@ final class MuesliController: NSObject {
         let liveMeetingID = activeMeetingID
         var processingRunID: UUID?
         if let liveMeetingID {
+            let diarizationPolicy = resolvedFinalDiarizationPolicy(
+                meetingID: liveMeetingID
+            )
+            sessionToStop.setFinalDiarizationPolicy(diarizationPolicy)
             flushCachedMeetingManualNotes(id: liveMeetingID, sync: false)
             flushCachedMeetingTitle(id: liveMeetingID)
             do {
                 processingRunID = try beginMeetingProcessing(
                     meetingID: liveMeetingID,
-                    operation: .finalization
+                    operation: .finalization,
+                    phases: MeetingProcessingRunPlan.phases(
+                        operation: .finalization,
+                        diarizationMode: diarizationPolicy.enabled
+                            ? .rerun(diarizationPolicy.profileID)
+                            : .disabled
+                    )
                 )
             } catch {
                 fputs("[muesli-native] failed to begin final processing progress for \(liveMeetingID): \(error)\n", stderr)
@@ -7355,6 +7849,16 @@ final class MuesliController: NSObject {
                 lastErrorMessage: nil
             )
         }
+        if let pendingEvidence = result.transcriptEvidence,
+           pendingEvidence.presentation.activeTextDigest
+                == MeetingTranscriptDigest.text(result.rawTranscript) {
+            try dictationStore.publishMeetingTranscriptEvidence(
+                meetingID: meetingID,
+                evidence: pendingEvidence.rebased(to: meetingID),
+                activeTranscript: result.rawTranscript,
+                processingMetadata: processingMetadata
+            )
+        }
         scheduleICloudSyncAfterLocalChange()
         return CompletedMeetingPersistenceResult(meetingID: meetingID, recordingSaveError: recordingSaveError)
     }
@@ -7433,7 +7937,7 @@ final class MuesliController: NSObject {
             return result
         }
         let manualNotes = manualNotesForLiveMeeting(id: meetingID)
-        let combined = MeetingResumePolicy.combinedResumeTranscript(
+        var combined = MeetingResumePolicy.combinedResumeTranscript(
             prior: prior,
             new: result.rawTranscript
         )
@@ -7441,13 +7945,46 @@ final class MuesliController: NSObject {
         let originalStart = originalMeeting
             .flatMap { ISO8601DateFormatter().date(from: $0.startTime) }
         let accumulatedDuration = (originalMeeting?.durationSeconds ?? 0) + result.durationSeconds
+        var combinedEvidence: MeetingTranscriptEvidenceBundle?
+        if let originalStart,
+           let transcription = result.transcriptionResult,
+           let currentRevision = result.transcriptEvidence?.activeTranscriptRevision,
+           let backend = BackendOption.resolve(
+               backend: currentRevision.backend,
+               model: currentRevision.model
+           ),
+           let priorEvidence = try? dictationStore.meetingTranscriptEvidence(
+               meetingID: meetingID
+           ),
+           priorEvidence.activeTranscriptRevision != nil {
+            do {
+                let publication = try MeetingTranscriptEvidenceFactory
+                    .makeAppendedPublication(
+                        meetingID: meetingID,
+                        meetingStart: originalStart,
+                        result: transcription,
+                        backend: backend,
+                        purpose: .final,
+                        runID: currentRevision.runID,
+                        priorEvidence: priorEvidence
+                    )
+                combined = publication.activeTranscript
+                combinedEvidence = publication.evidence
+            } catch {
+                fputs(
+                    "[muesli-native] failed to create structured resume transcript: \(error.localizedDescription)\n",
+                    stderr
+                )
+            }
+        }
 
         guard MeetingResumePolicy.hasNewTranscriptContent(prior: prior, new: result.rawTranscript) else {
             return result.overriding(
                 startTime: originalStart,
                 durationSeconds: accumulatedDuration,
                 rawTranscript: combined,
-                formattedNotes: originalMeeting?.formattedNotes ?? result.formattedNotes
+                formattedNotes: originalMeeting?.formattedNotes ?? result.formattedNotes,
+                transcriptEvidence: combinedEvidence
             )
         }
 
@@ -7471,7 +8008,10 @@ final class MuesliController: NSObject {
                     startedAt: summaryStartedAt,
                     thinkingStatus: summaryResult.thinkingStatus
                 ),
-                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt
+                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt,
+                summaryInput: combinedEvidence?.summaryInputDescriptor(
+                    ownerName: config.userName
+                )
             )
         } catch {
             fputs("[muesli-native] resume summary regeneration failed: \(error.localizedDescription)\n", stderr)
@@ -7484,7 +8024,8 @@ final class MuesliController: NSObject {
             regeneratedProcessingMetadata = MeetingProcessingMetadata(
                 transcription: result.processingMetadata.transcription,
                 summary: nil,
-                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt
+                manualNotesUpdatedAt: result.processingMetadata.manualNotesUpdatedAt,
+                summaryInput: nil
             )
         }
         return result.overriding(
@@ -7492,7 +8033,8 @@ final class MuesliController: NSObject {
             durationSeconds: accumulatedDuration,
             rawTranscript: combined,
             formattedNotes: regeneratedNotes,
-            processingMetadata: regeneratedProcessingMetadata
+            processingMetadata: regeneratedProcessingMetadata,
+            transcriptEvidence: combinedEvidence
         )
     }
 
@@ -8560,6 +9102,9 @@ final class MuesliController: NSObject {
         switch phase {
         case .preparingAudio, .preparingRecording: return "Cleaning"
         case .transcribing: return "Transcribing"
+        case .preparingDiarizer: return "Loading speakers"
+        case .diarizing: return "Analyzing speakers"
+        case .applyingSpeakerLabels: return "Labeling speakers"
         case .generatingTitle: return "Titling"
         case .summarizing: return "Summarizing"
         case .encodingRecording: return "Finalizing"
@@ -8578,6 +9123,9 @@ final class MuesliController: NSObject {
         case .cleaningWav: phase = .preparingAudio
         case .writingRecording: phase = .preparingRecording
         case .transcribingAudio: phase = .transcribing
+        case .preparingDiarizer: phase = .preparingDiarizer
+        case .diarizing: phase = .diarizing
+        case .applyingSpeakerLabels: phase = .applyingSpeakerLabels
         case .generatingTitle: phase = .generatingTitle
         case .summarizingNotes: phase = .summarizing
         }
@@ -8588,14 +9136,159 @@ final class MuesliController: NSObject {
     @MainActor
     private func beginMeetingProcessing(
         meetingID: Int64,
-        operation: MeetingProcessingOperation
+        operation: MeetingProcessingOperation,
+        phases: [MeetingProcessingPhase]? = nil
     ) throws -> UUID {
-        let progress = MeetingProcessingProgress.starting(operation: operation)
+        let progress = MeetingProcessingProgress.starting(
+            operation: operation,
+            phases: phases
+        )
         try dictationStore.beginMeetingProcessing(id: meetingID, progress: progress)
         appState.meetingProcessing[meetingID] = progress
         scheduleICloudSyncAfterLocalChange()
         historyWindowController?.reload()
         return progress.runID
+    }
+
+    private func resolvedFinalDiarizationPolicy(
+        meetingID: Int64
+    ) -> ResolvedMeetingDiarizationPolicy {
+        let preference = try? dictationStore.meetingDiarizationPreference(
+            meetingID: meetingID
+        )
+        return MeetingDiarizationPolicyResolver.resolve(
+            globalEnabled: config.meetingFinalDiarizationEnabledByDefault,
+            globalProfileID: config.resolvedMeetingFinalDiarizationProfile,
+            preference: preference
+        )
+    }
+
+    private func resolveRetranscriptionDiarization(
+        requestedMode: MeetingDiarizationRunMode,
+        meetingPolicy: ResolvedMeetingDiarizationPolicy,
+        priorEvidence: MeetingTranscriptEvidenceBundle?,
+        recordingUnits: [MeetingRecordingUnitInput],
+        meetingStart: Date
+    ) async throws -> ResolvedRetranscriptionDiarization {
+        let installedSnapshots: [MeetingDiarizationProfileID: MeetingDiarizationProfileSnapshot] =
+            Dictionary(uniqueKeysWithValues: await transcriptionCoordinator
+                .meetingDiarizationAssetStatuses()
+                .compactMap { status in
+                    guard status.state == .ready, let digest = status.modelDigest else {
+                        return nil
+                    }
+                    return (
+                        status.profileID,
+                        MeetingDiarizationProfiles.resolve(status.profileID)
+                            .snapshot(modelDigest: digest)
+                    )
+                })
+
+        func compatibleRevision(
+            profileID: MeetingDiarizationProfileID?
+        ) async -> MeetingDiarizationRevision? {
+            guard let priorEvidence, !priorEvidence.diarizationRevisions.isEmpty else {
+                return nil
+            }
+            return await Task.detached(priority: .utility) {
+                guard let rendered = try? MeetingSystemTimelineRenderer.render(
+                    units: recordingUnits,
+                    meetingStart: meetingStart
+                ) else { return nil }
+                defer { rendered.removeTemporaryFile() }
+                return priorEvidence.diarizationRevisions.reversed().first { revision in
+                    guard revision.status == .complete,
+                          revision.schemaVersion
+                            == MeetingDiarizationRevision.currentSchemaVersion,
+                          revision.timelineDigest == rendered.map.digest,
+                          revision.sourceFingerprints == rendered.map.sourceFingerprints,
+                          revision.timelineMap?.renderVersion == rendered.map.renderVersion else {
+                        return false
+                    }
+                    let requestedProfile: MeetingDiarizationProfileID
+                    if let profileID {
+                        requestedProfile = profileID
+                    } else if let captured = MeetingDiarizationProfileID(
+                        rawValue: revision.profile.profileID
+                    ) {
+                        requestedProfile = captured
+                    } else {
+                        return false
+                    }
+                    guard MeetingDiarizationProfiles.matchesActiveProvider(
+                        revision.profile,
+                        requestedID: requestedProfile
+                    ) else {
+                        return false
+                    }
+                    guard let installed = installedSnapshots[requestedProfile] else {
+                        // Reuse does not require the model to remain installed.
+                        return true
+                    }
+                    return MeetingDiarizationProfiles.matchesInstalledSnapshot(
+                        revision.profile,
+                        installed: installed
+                    )
+                }
+            }.value
+        }
+
+        switch requestedMode {
+        case .disabled:
+            return ResolvedRetranscriptionDiarization(
+                pipelinePolicy: .disabled,
+                profileID: meetingPolicy.profileID,
+                reusableRevision: nil,
+                planMode: .disabled
+            )
+        case .rerun(let profileID):
+            return ResolvedRetranscriptionDiarization(
+                pipelinePolicy: .optionalPost,
+                profileID: profileID,
+                reusableRevision: nil,
+                planMode: .rerun(profileID)
+            )
+        case .reuseCompatible:
+            guard let revision = await compatibleRevision(profileID: nil) else {
+                throw MeetingRetranscriptionError.compatibleSpeakerAnalysisUnavailable
+            }
+            let profileID = MeetingDiarizationProfileID(
+                rawValue: revision.profile.profileID
+            ) ?? meetingPolicy.profileID
+            return ResolvedRetranscriptionDiarization(
+                pipelinePolicy: .reuseCompatible,
+                profileID: profileID,
+                reusableRevision: revision,
+                planMode: .reuseCompatible
+            )
+        case .meetingDefault:
+            guard meetingPolicy.enabled else {
+                return ResolvedRetranscriptionDiarization(
+                    pipelinePolicy: .disabled,
+                    profileID: meetingPolicy.profileID,
+                    reusableRevision: nil,
+                    planMode: .disabled
+                )
+            }
+            if let revision = await compatibleRevision(profileID: meetingPolicy.profileID) {
+                return ResolvedRetranscriptionDiarization(
+                    // The phase plan is immutable once published. If retained
+                    // audio changes after this compatibility check, strict
+                    // reuse fails atomically and the user can start a fresh
+                    // run rather than displaying phases that never occurred.
+                    pipelinePolicy: .reuseCompatible,
+                    profileID: meetingPolicy.profileID,
+                    reusableRevision: revision,
+                    planMode: .reuseCompatible
+                )
+            }
+            return ResolvedRetranscriptionDiarization(
+                pipelinePolicy: .optionalPost,
+                profileID: meetingPolicy.profileID,
+                reusableRevision: nil,
+                planMode: .rerun(meetingPolicy.profileID)
+            )
+        }
     }
 
     /// Advances only the run which still owns this meeting. Stale callbacks are ignored.

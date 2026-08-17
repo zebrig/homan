@@ -187,21 +187,29 @@ public struct MeetingProcessingMetadata: Codable, Sendable, Equatable {
     public var transcription: MeetingProcessingRunMetadata?
     public var summary: MeetingProcessingRunMetadata?
     public var manualNotesUpdatedAt: Date?
+    /// Exact transcript presentation used by the latest generated summary.
+    /// Optional so metadata written by Homan 0.8.2 and older remains valid.
+    public var summaryInput: MeetingSummaryInputDescriptor?
 
     public init(
         transcription: MeetingProcessingRunMetadata? = nil,
         summary: MeetingProcessingRunMetadata? = nil,
-        manualNotesUpdatedAt: Date? = nil
+        manualNotesUpdatedAt: Date? = nil,
+        summaryInput: MeetingSummaryInputDescriptor? = nil
     ) {
         self.transcription = transcription
         self.summary = summary
         self.manualNotesUpdatedAt = manualNotesUpdatedAt
+        self.summaryInput = summaryInput
     }
 
     public static let empty = MeetingProcessingMetadata()
 
     public var isEmpty: Bool {
-        transcription == nil && summary == nil && manualNotesUpdatedAt == nil
+        transcription == nil
+            && summary == nil
+            && manualNotesUpdatedAt == nil
+            && summaryInput == nil
     }
 }
 
@@ -229,6 +237,9 @@ public struct SyncTextRecord: Identifiable, Codable, Sendable, Equatable {
     public var cloudChangeTag: String?
     public var followUpToRecordName: String?
     public var processingMetadataJSON: String?
+    /// Optional additive meeting evidence used by newer Homan clients. Older
+    /// clients continue to exchange the materialized `text` field only.
+    public var transcriptEvidence: MeetingTranscriptEvidenceBundle?
 
     public init(
         id: String,
@@ -251,7 +262,8 @@ public struct SyncTextRecord: Identifiable, Codable, Sendable, Equatable {
         isDeleted: Bool = false,
         cloudChangeTag: String? = nil,
         followUpToRecordName: String? = nil,
-        processingMetadataJSON: String? = nil
+        processingMetadataJSON: String? = nil,
+        transcriptEvidence: MeetingTranscriptEvidenceBundle? = nil
     ) {
         self.id = id
         self.kind = kind
@@ -274,6 +286,7 @@ public struct SyncTextRecord: Identifiable, Codable, Sendable, Equatable {
         self.cloudChangeTag = cloudChangeTag
         self.followUpToRecordName = followUpToRecordName
         self.processingMetadataJSON = processingMetadataJSON
+        self.transcriptEvidence = transcriptEvidence
     }
 }
 
@@ -614,6 +627,9 @@ public struct MeetingBackupEntry: Codable, Sendable, Equatable {
     public var followUpToID: Int64?
     public var followUpToRecordName: String?
     public var processingMetadata: MeetingProcessingMetadata
+    /// Versioned, optional structured transcript/speaker evidence. A missing
+    /// value is the valid legacy text-only backup representation.
+    public var transcriptEvidence: MeetingTranscriptEvidenceBundle?
 
     public init(
         sourceID: Int64,
@@ -636,7 +652,8 @@ public struct MeetingBackupEntry: Codable, Sendable, Equatable {
         source: MeetingSource,
         followUpToID: Int64?,
         followUpToRecordName: String?,
-        processingMetadata: MeetingProcessingMetadata
+        processingMetadata: MeetingProcessingMetadata,
+        transcriptEvidence: MeetingTranscriptEvidenceBundle? = nil
     ) {
         self.sourceID = sourceID
         self.title = title
@@ -659,10 +676,14 @@ public struct MeetingBackupEntry: Codable, Sendable, Equatable {
         self.followUpToID = followUpToID
         self.followUpToRecordName = followUpToRecordName
         self.processingMetadata = processingMetadata
+        self.transcriptEvidence = transcriptEvidence
     }
 
     /// Build from a `MeetingRecord`, dropping audio-path fields (text-only backup).
-    public init(record: MeetingRecord) {
+    public init(
+        record: MeetingRecord,
+        transcriptEvidence: MeetingTranscriptEvidenceBundle? = nil
+    ) {
         self.init(
             sourceID: record.id,
             title: record.title,
@@ -684,7 +705,8 @@ public struct MeetingBackupEntry: Codable, Sendable, Equatable {
             source: record.source,
             followUpToID: record.followUpToID,
             followUpToRecordName: record.followUpToRecordName,
-            processingMetadata: record.processingMetadata
+            processingMetadata: record.processingMetadata,
+            transcriptEvidence: transcriptEvidence
         )
     }
 }

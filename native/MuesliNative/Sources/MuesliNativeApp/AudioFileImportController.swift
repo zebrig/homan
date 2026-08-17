@@ -189,52 +189,62 @@ enum AudioFileImportController {
         try Task.checkCancellation()
 
         progress("Transcribing audio...")
-        let transcription: SpeechTranscriptionResult
-        if backend.backend == BackendOption.homanWhisper.backend {
-            transcription = try await MeetingTranscriptionPipeline(
-                coordinator: transcriptionCoordinator
-            ).transcribeHomanWhisperLegacyFile(at: wavURL)
-        } else {
-            transcription = try await transcriptionCoordinator.transcribeMeeting(
-                at: wavURL,
-                backend: backend,
-                cohereLanguage: config.resolvedCohereLanguage,
-                indicASRLanguage: config.resolvedIndicASRLanguage
-            )
-        }
-        let rawTranscript = transcription.text.trimmingCharacters(in: .whitespacesAndNewlines)
-        guard !rawTranscript.isEmpty else {
-            throw ImportError.readError("No speech was transcribed from the selected audio file.")
-        }
-
-        try Task.checkCancellation()
-
-        // Run speaker diarization if available
-        var diarizedTranscript = rawTranscript
-        if backend.backend != BackendOption.homanWhisper.backend,
-           let diarizerManager = await transcriptionCoordinator.getDiarizerManager(),
-           diarizerManager.isAvailable {
-            progress("Identifying speakers...")
-            do {
-                let converter = AudioConverter()
-                let samples = try converter.resampleAudioFile(wavURL)
-                try Task.checkCancellation()
-                let diarizationResult = try diarizerManager.performCompleteDiarization(
-                    samples,
-                    sampleRate: 16000
-                )
-                if !diarizationResult.segments.isEmpty {
-                    diarizedTranscript = formatTranscriptWithSpeakers(
-                        transcription: transcription,
-                        diarizationSegments: diarizationResult.segments,
-                        meetingStart: importedTranscriptTimelineStart()
-                    )
+        let now = Date()
+        let startTime = now.addingTimeInterval(-duration)
+        let provisionalRecording = MeetingRecordingRecord(
+            id: 0,
+            meetingID: 0,
+            path: wavURL.path,
+            createdAt: startTime,
+            deleteAfter: nil,
+            sourceLayout: nil
+        )
+        let runID = UUID()
+        let pipelineResult = try await MeetingTranscriptionPipeline(
+            coordinator: transcriptionCoordinator
+        ).process(MeetingTranscriptionRequest(
+            units: [.legacyMixed(MeetingLegacyRecordingInput(
+                recording: provisionalRecording,
+                playbackURL: wavURL,
+                degradations: [.legacySourceIdentityUnavailable]
+            ))],
+            backend: backend,
+            languages: MeetingLanguageSnapshot(
+                cohereLanguage: config.resolvedCohereLanguage.rawValue,
+                indicASRLanguage: config.resolvedIndicASRLanguage.rawValue,
+                nemotron35Language: config.resolvedNemotron35Language.rawValue
+            ),
+            purpose: .final,
+            systemDiarization: config.meetingFinalDiarizationEnabledByDefault
+                ? .optionalPost
+                : .disabled,
+            diarizationProfileID: config.resolvedMeetingFinalDiarizationProfile,
+            aecModel: config.resolvedMeetingAecModel,
+            progress: { stage in
+                switch stage {
+                case .transcribing:
+                    progress("Transcribing audio...")
+                case .preparingDiarizer:
+                    progress("Preparing speaker analysis...")
+                case .diarizing:
+                    progress("Analyzing speakers...")
+                case .applyingSpeakerLabels:
+                    progress("Applying speaker labels...")
                 }
-            } catch is CancellationError {
-                throw CancellationError()
-            } catch {
-                fputs("[import] diarization failed, using raw transcript: \(error)\n", stderr)
             }
+        ))
+        let evidencePublication = try MeetingTranscriptEvidenceFactory.makePublication(
+            meetingID: 0,
+            meetingStart: startTime,
+            result: pipelineResult,
+            backend: backend,
+            purpose: .final,
+            runID: runID
+        )
+        let diarizedTranscript = evidencePublication.activeTranscript
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !diarizedTranscript.isEmpty else {
+            throw ImportError.readError("No speech was transcribed from the selected audio file.")
         }
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: backend,
@@ -290,8 +300,6 @@ enum AudioFileImportController {
         let savedRecordingPath = try persistRecording(wavURL: wavURL, title: generatedTitle)
 
         progress("Saving...")
-        let now = Date()
-        let startTime = now.addingTimeInterval(-duration)
         let meetingID = try await controller.persistImportedAudioMeeting(
             title: generatedTitle,
             calendarEventID: nil,
@@ -308,8 +316,12 @@ enum AudioFileImportController {
             selectedTemplatePrompt: templateSnapshot.prompt,
             processingMetadata: MeetingProcessingMetadata(
                 transcription: transcriptionMetadata,
-                summary: summaryMetadata
-            )
+                summary: summaryMetadata,
+                summaryInput: evidencePublication.evidence.summaryInputDescriptor(
+                    ownerName: config.userName
+                )
+            ),
+            transcriptEvidence: evidencePublication.evidence
         )
 
         return ImportResult(

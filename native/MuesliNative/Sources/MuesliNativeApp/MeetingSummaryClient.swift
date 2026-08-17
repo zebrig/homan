@@ -380,12 +380,13 @@ enum MeetingSummaryClient {
         userName: String = "",
         promptTemplate: String = MeetingSummaryPromptTemplates.defaultSystem
     ) -> String {
-        MeetingSummaryPromptTemplates.render(
+        let normalizedOwner = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let editableInstructions = MeetingSummaryPromptTemplates.render(
             promptTemplate,
             context: MeetingSummaryPromptContext(
                 template: template.prompt,
                 templateName: template.name,
-                userName: userName.trimmingCharacters(in: .whitespacesAndNewlines),
+                userName: normalizedOwner,
                 meetingTitle: "",
                 transcript: "",
                 meetingContext: "",
@@ -393,6 +394,30 @@ enum MeetingSummaryClient {
                 writtenNotes: manualNotes ?? ""
             )
         )
+        return speakerRoleContract(userName: normalizedOwner)
+            + "\n\n"
+            + editableInstructions
+    }
+
+    /// This source-role legend is application data semantics, not an editable
+    /// style prompt. It is therefore attached to every summary backend even if
+    /// a custom prompt predates speaker-aware transcripts.
+    static func speakerRoleContract(userName: String) -> String {
+        let owner = userName.trimmingCharacters(in: .whitespacesAndNewlines)
+        let ownerSentence = owner.isEmpty
+            ? ""
+            : "The app owner's name is \(owner). "
+        let ownerAttribution = owner.isEmpty
+            ? "the local app owner"
+            : owner
+        return """
+        Transcript speaker-role contract:
+        \(ownerSentence)In a diarized transcript, a line labeled "You" comes from the app owner's local microphone track, so identify "You" as \(ownerAttribution).
+        A line labeled "Others" comes from the remote system-audio track and must not be attributed to \(ownerAttribution).
+        "Speaker 1", "Speaker 2", and similar labels are anonymous acoustic identities scoped only to this meeting. In a source-aware meeting they come from the remote system-audio track; in an imported mixed recording their side is unknown. Never assume a numbered Speaker is \(ownerAttribution).
+        A legacy line labeled only "Speaker" has no reliable side attribution.
+        Do not infer or change a speaker's identity from the language they use, the content of a remark, or a name mentioned in conversation. Do not use the LLM to repair or reinterpret diarization.
+        """
     }
 
     static func summaryUserPrompt(

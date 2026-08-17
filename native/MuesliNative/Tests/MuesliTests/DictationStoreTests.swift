@@ -1781,6 +1781,38 @@ struct DictationStoreTests {
         #expect(try store.liveTranscriptCheckpointText(meetingID: id) == nil)
     }
 
+    @Test("live crash checkpoints never persist provisional remote speaker identities")
+    func liveTranscriptCheckpointsCollapseProvisionalSpeakers() throws {
+        let store = try makeStore()
+        let id = try store.createLiveMeeting(
+            title: "Provisional Live labels",
+            calendarEventID: nil,
+            startTime: Date(timeIntervalSince1970: 1_700_000_000)
+        )
+
+        try store.appendLiveTranscriptCheckpoints(meetingID: id, entries: [
+            LiveTranscriptCheckpointEntry(
+                timestampLabel: "10:00:01",
+                speaker: "Speaker 3",
+                startSeconds: 1,
+                endSeconds: 2,
+                text: "A provisional remote caption."
+            ),
+            LiveTranscriptCheckpointEntry(
+                timestampLabel: "10:00:03",
+                speaker: "You",
+                startSeconds: 3,
+                endSeconds: 4,
+                text: "A microphone caption."
+            ),
+        ])
+
+        let checkpoint = try #require(try store.liveTranscriptCheckpointText(meetingID: id))
+        #expect(checkpoint.contains("[10:00:01] Others: A provisional remote caption."))
+        #expect(checkpoint.contains("[10:00:03] You: A microphone caption."))
+        #expect(!checkpoint.contains("Speaker 3"))
+    }
+
     @Test("resumed meeting crash recovery preserves prior transcript and appends checkpoints")
     func resumedMeetingCrashRecoveryPreservesPriorTranscriptAndAppendsCheckpoints() throws {
         let store = try makeStore()

@@ -20,6 +20,12 @@ struct ModelsView: View {
     @State private var liveCaptionDownloadTask: Task<Void, Never>?
     @State private var showDeleteLiveCaptionModelConfirmation = false
 
+    // Local meeting-speaker model state
+    @State private var speakerAssetStatuses: [MeetingDiarizationAssetStatus] = []
+    @State private var speakerInstallProgress: [MeetingDiarizationProfileID: Double] = [:]
+    @State private var speakerModelToDelete: MeetingDiarizationProfileID?
+    @State private var speakerModelError: String?
+
     // Post-processor state
     @State private var downloadingPostProcModels: Set<String> = []
     @State private var downloadProgressPostProc: [String: Double] = [:]
@@ -82,6 +88,7 @@ struct ModelsView: View {
             syncSelectionsFromActiveBackend()
             checkNemotron35Update()
             prepareGemmaSummaryDownloads()
+            refreshSpeakerAssets()
         }
         .onChange(of: appState.selectedBackend.model) { _, _ in
             syncSelectionsFromActiveBackend()
@@ -151,6 +158,33 @@ struct ModelsView: View {
         } message: {
             Text("The downloaded model files will be removed from this Mac. You can download the model again later.")
         }
+        .alert(
+            "Remove speaker model?",
+            isPresented: Binding(
+                get: { speakerModelToDelete != nil },
+                set: { if !$0 { speakerModelToDelete = nil } }
+            )
+        ) {
+            Button("Cancel", role: .cancel) { speakerModelToDelete = nil }
+            Button("Remove", role: .destructive) {
+                guard let profile = speakerModelToDelete else { return }
+                speakerModelToDelete = nil
+                removeSpeakerModel(profile)
+            }
+        } message: {
+            Text("Existing transcripts and saved speaker analysis stay available. New analysis with this model will require installing it again.")
+        }
+        .alert(
+            "Speaker Model",
+            isPresented: Binding(
+                get: { speakerModelError != nil },
+                set: { if !$0 { speakerModelError = nil } }
+            )
+        ) {
+            Button("OK") { speakerModelError = nil }
+        } message: {
+            Text(speakerModelError ?? "The operation could not be completed.")
+        }
     }
 
     private var modelsCategorySelection: Binding<ModelsCategory> {
@@ -187,6 +221,8 @@ struct ModelsView: View {
             comingSoonSection
         case .streaming:
             streamingSection
+        case .speakerSeparation:
+            speakerSeparationSection
         case .postProcessing:
             postProcessorSection
         case .meetingSummarization:
@@ -425,6 +461,206 @@ struct ModelsView: View {
             }
         } catch {
             fputs("[muesli-native] live caption model delete failed: \(error)\n", stderr)
+        }
+    }
+
+    private var speakerSeparationSection: some View {
+        VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
+            VStack(alignment: .leading, spacing: MuesliTheme.spacing4) {
+                Text("MEETING SPEAKER SEPARATION")
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(MuesliTheme.textTertiary)
+
+                Text("Optional local models analyze only the system-audio side after transcription. Your microphone remains You. Models are installed explicitly and are never downloaded while a meeting is being processed.")
+                    .font(MuesliTheme.caption())
+                    .foregroundStyle(MuesliTheme.textSecondary)
+            }
+            .padding(.leading, 2)
+            .padding(.top, MuesliTheme.spacing8)
+
+            ForEach(
+                [MeetingDiarizationProfileID.offlineQuality, .stableFourSpeaker],
+                id: \.rawValue
+            ) { profile in
+                speakerModelCard(profile)
+            }
+        }
+    }
+
+    private func speakerModelCard(
+        _ profile: MeetingDiarizationProfileID
+    ) -> some View {
+        let definition = MeetingDiarizationProfiles.resolve(profile)
+        let status = speakerAssetStatuses.first { $0.profileID == profile }
+        let progress = speakerInstallProgress[profile]
+        let isReady = status?.state == .ready
+        let isBusy = progress != nil || status?.state == .installing
+        let isInUse = appState.config.meetingFinalDiarizationEnabledByDefault
+            && (
+                appState.config.resolvedMeetingFinalDiarizationProfile == profile
+                    || (profile == .offlineQuality
+                        && appState.config.resolvedMeetingFinalDiarizationProfile == .automatic)
+            )
+
+        return VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
+            HStack(alignment: .top, spacing: MuesliTheme.spacing12) {
+                Image(systemName: "person.2.wave.2")
+                    .font(.system(size: 20, weight: .medium))
+                    .foregroundStyle(MuesliTheme.accent)
+                    .frame(width: 36, height: 36)
+                    .background(MuesliTheme.accentSubtle)
+                    .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+
+                VStack(alignment: .leading, spacing: MuesliTheme.spacing4) {
+                    HStack(spacing: MuesliTheme.spacing8) {
+                        Text(definition.displayName)
+                            .font(MuesliTheme.headline())
+                            .foregroundStyle(MuesliTheme.textPrimary)
+
+                        if profile == .offlineQuality {
+                            Text("Used by Automatic")
+                                .font(.system(size: 10, weight: .semibold))
+                                .foregroundStyle(MuesliTheme.accent)
+                                .padding(.horizontal, 8)
+                                .padding(.vertical, 3)
+                                .background(MuesliTheme.accentSubtle)
+                                .clipShape(Capsule())
+                        }
+                    }
+
+                    Text(definition.detail)
+                        .font(MuesliTheme.caption())
+                        .foregroundStyle(MuesliTheme.textSecondary)
+
+                    HStack(spacing: MuesliTheme.spacing8) {
+                        Text("Revision \(definition.modelRevision)")
+                        if let bytes = status?.sizeBytes, bytes > 0 {
+                            Text("•")
+                            Text(ByteCountFormatter.string(
+                                fromByteCount: bytes,
+                                countStyle: .file
+                            ))
+                        }
+                        Text("•")
+                        Link(definition.licenseName, destination: definition.licenseURL)
+                    }
+                    .font(.system(size: 11))
+                    .foregroundStyle(MuesliTheme.textTertiary)
+                }
+
+                Spacer()
+
+                Text(isReady ? (isInUse ? "Active" : "Ready") : (isBusy ? "Installing" : "Not installed"))
+                    .font(.system(size: 11, weight: .semibold))
+                    .foregroundStyle(isReady ? MuesliTheme.success : MuesliTheme.textTertiary)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 3)
+                    .background(MuesliTheme.surfacePrimary)
+                    .clipShape(RoundedRectangle(cornerRadius: 4))
+            }
+
+            if let progress {
+                VStack(alignment: .leading, spacing: 4) {
+                    ProgressView(value: progress)
+                        .tint(MuesliTheme.accent)
+                    Text("\(Int(progress * 100))% — downloading and validating")
+                        .font(.system(size: 11))
+                        .foregroundStyle(MuesliTheme.textTertiary)
+                }
+            }
+
+            if let error = status?.lastErrorCategory, status?.state == .failed {
+                Text("Last install failed (\(error)). Remove the incomplete files and try again.")
+                    .font(MuesliTheme.caption())
+                    .foregroundStyle(.orange)
+            }
+
+            HStack(spacing: MuesliTheme.spacing8) {
+                if isReady {
+                    if !isInUse {
+                        Button("Use for Final") {
+                            controller.updateConfig {
+                                $0.meetingFinalDiarizationProfile = profile.rawValue
+                                $0.meetingFinalDiarizationEnabledByDefault = true
+                            }
+                        }
+                        .buttonStyle(.plain)
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundStyle(MuesliTheme.accent)
+                    }
+                    Button("Remove", role: .destructive) {
+                        speakerModelToDelete = profile
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(.red.opacity(0.75))
+                    .disabled(appState.isMeetingRecording || appState.isMeetingStarting)
+                } else if !isBusy {
+                    Button("Install") {
+                        installSpeakerModel(profile)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.system(size: 12, weight: .medium))
+                    .foregroundStyle(MuesliTheme.accent)
+                    .padding(.horizontal, MuesliTheme.spacing12)
+                    .padding(.vertical, 4)
+                    .background(MuesliTheme.accentSubtle)
+                    .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+                    .disabled(appState.isMeetingRecording || appState.isMeetingStarting)
+                }
+            }
+        }
+        .padding(MuesliTheme.spacing16)
+        .background(MuesliTheme.backgroundRaised)
+        .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium))
+        .overlay(
+            RoundedRectangle(cornerRadius: MuesliTheme.cornerMedium)
+                .strokeBorder(isInUse && isReady
+                    ? MuesliTheme.accent.opacity(0.6)
+                    : MuesliTheme.surfaceBorder, lineWidth: 1)
+        )
+    }
+
+    private func refreshSpeakerAssets() {
+        Task {
+            speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
+        }
+    }
+
+    private func installSpeakerModel(_ profile: MeetingDiarizationProfileID) {
+        guard speakerInstallProgress[profile] == nil else { return }
+        speakerInstallProgress[profile] = 0
+        Task {
+            do {
+                try await controller.installMeetingDiarizationModel(
+                    profileID: profile,
+                    progress: { update in
+                        Task { @MainActor in
+                            speakerInstallProgress[profile] = min(
+                                max(update.fractionCompleted, 0),
+                                1
+                            )
+                        }
+                    }
+                )
+            } catch is CancellationError {
+                // The user or application shutdown cancelled an explicit install.
+            } catch {
+                speakerModelError = error.localizedDescription
+            }
+            speakerInstallProgress[profile] = nil
+            speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
+        }
+    }
+
+    private func removeSpeakerModel(_ profile: MeetingDiarizationProfileID) {
+        Task {
+            do {
+                try await controller.removeMeetingDiarizationModel(profileID: profile)
+            } catch {
+                speakerModelError = error.localizedDescription
+            }
+            speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
         }
     }
 
