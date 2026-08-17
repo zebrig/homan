@@ -5,6 +5,48 @@ import Testing
 
 @Suite("Meeting diarization profiles")
 struct MeetingDiarizationProfileTests {
+    @Test("Sortformer install accepts FluidAudio's local cache layout")
+    func sortformerInstallUsesFluidAudioCacheLayout() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-sortformer-assets-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let definition = MeetingDiarizationProfiles.resolve(.stableFourSpeaker)
+        let store = MeetingDiarizationAssetStore(rootURL: root)
+        let base = try await store.beginInstall(definition)
+        let model = base
+            .appendingPathComponent("sortformer", isDirectory: true)
+            .appendingPathComponent("SortformerNvidiaLow_v2.1.mlmodelc", isDirectory: true)
+        try FileManager.default.createDirectory(at: model, withIntermediateDirectories: true)
+        try Data("sortformer-model".utf8).write(
+            to: model.appendingPathComponent("coremldata.bin")
+        )
+
+        let installed = try await store.finishInstall(definition)
+        let reopened = MeetingDiarizationAssetStore(rootURL: root)
+        let verified = try await reopened.requireReady(definition)
+
+        #expect(!installed.modelDigest.isEmpty)
+        #expect(verified.snapshot.modelDigest == installed.modelDigest)
+        #expect(await reopened.status(for: .stableFourSpeaker).state == .ready)
+    }
+
+    @Test("residual speaker model files become a retryable failed install after relaunch")
+    func residualInstallIsReportedAsFailedAfterRelaunch() async throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-incomplete-diarization-\(UUID().uuidString)", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let definition = MeetingDiarizationProfiles.resolve(.stableFourSpeaker)
+        let store = MeetingDiarizationAssetStore(rootURL: root)
+        let base = try await store.beginInstall(definition)
+        try Data("partial".utf8).write(to: base.appendingPathComponent("partial-download"))
+
+        let reopened = MeetingDiarizationAssetStore(rootURL: root)
+        let status = await reopened.status(for: .stableFourSpeaker)
+
+        #expect(status.state == .failed)
+        #expect(status.lastErrorCategory == "incomplete_install")
+    }
+
     @Test("reopened asset store rejects model bytes that no longer match the marker")
     func installedAssetBytesAreRevalidatedAfterRelaunch() async throws {
         let root = FileManager.default.temporaryDirectory

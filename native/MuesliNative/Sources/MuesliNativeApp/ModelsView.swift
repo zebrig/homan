@@ -65,6 +65,8 @@ struct ModelsView: View {
                         }
                     }
                     .pickerStyle(.segmented)
+                    .labelsHidden()
+                    .accessibilityLabel("Model category")
                     .frame(maxWidth: 520)
 
                     selectedCategoryContent
@@ -569,8 +571,8 @@ struct ModelsView: View {
                 }
             }
 
-            if let error = status?.lastErrorCategory, status?.state == .failed {
-                Text("Last install failed (\(error)). Remove the incomplete files and try again.")
+            if status?.lastErrorCategory != nil, status?.state == .failed {
+                Text("Installation did not finish. Retry installation; Homan will validate the existing files and replace them automatically if needed.")
                     .font(MuesliTheme.caption())
                     .foregroundStyle(.orange)
             }
@@ -596,8 +598,11 @@ struct ModelsView: View {
                     .foregroundStyle(.red.opacity(0.75))
                     .disabled(appState.isMeetingRecording || appState.isMeetingStarting)
                 } else if !isBusy {
-                    Button("Install") {
-                        installSpeakerModel(profile)
+                    Button(status?.state == .failed ? "Retry installation" : "Install") {
+                        installSpeakerModel(
+                            profile,
+                            replacingExisting: status?.state == .failed
+                        )
                     }
                     .buttonStyle(.plain)
                     .font(.system(size: 12, weight: .medium))
@@ -627,22 +632,28 @@ struct ModelsView: View {
         }
     }
 
-    private func installSpeakerModel(_ profile: MeetingDiarizationProfileID) {
+    private func installSpeakerModel(
+        _ profile: MeetingDiarizationProfileID,
+        replacingExisting: Bool = false
+    ) {
         guard speakerInstallProgress[profile] == nil else { return }
         speakerInstallProgress[profile] = 0
         Task {
             do {
-                try await controller.installMeetingDiarizationModel(
-                    profileID: profile,
-                    progress: { update in
-                        Task { @MainActor in
-                            speakerInstallProgress[profile] = min(
-                                max(update.fractionCompleted, 0),
-                                1
-                            )
-                        }
+                if replacingExisting {
+                    do {
+                        try await installSpeakerModelFiles(profile)
+                    } catch is CancellationError {
+                        throw CancellationError()
+                    } catch MeetingDiarizationAssetError.captureActive {
+                        throw MeetingDiarizationAssetError.captureActive
+                    } catch {
+                        try await controller.removeMeetingDiarizationModel(profileID: profile)
+                        try await installSpeakerModelFiles(profile)
                     }
-                )
+                } else {
+                    try await installSpeakerModelFiles(profile)
+                }
             } catch is CancellationError {
                 // The user or application shutdown cancelled an explicit install.
             } catch {
@@ -651,6 +662,22 @@ struct ModelsView: View {
             speakerInstallProgress[profile] = nil
             speakerAssetStatuses = await controller.meetingDiarizationAssetStatuses()
         }
+    }
+
+    private func installSpeakerModelFiles(
+        _ profile: MeetingDiarizationProfileID
+    ) async throws {
+        try await controller.installMeetingDiarizationModel(
+            profileID: profile,
+            progress: { update in
+                Task { @MainActor in
+                    speakerInstallProgress[profile] = min(
+                        max(update.fractionCompleted, 0),
+                        1
+                    )
+                }
+            }
+        )
     }
 
     private func removeSpeakerModel(_ profile: MeetingDiarizationProfileID) {

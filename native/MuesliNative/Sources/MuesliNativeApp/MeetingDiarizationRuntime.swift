@@ -97,7 +97,7 @@ enum MeetingDiarizationAssetError: Error, LocalizedError {
         case .notInstalled(let name):
             return "The \(name) speaker model is not installed. Install it from Models first."
         case .incomplete(let name):
-            return "The installed \(name) speaker model is incomplete. Remove and install it again."
+            return "The installed \(name) speaker model could not be validated. Retry its installation from Models."
         case .incompatible(let name):
             return "The installed \(name) speaker model is not compatible with this Homan profile."
         case .invalidPLDA:
@@ -175,7 +175,8 @@ actor MeetingDiarizationAssetStore {
     func status(for profileID: MeetingDiarizationProfileID) -> MeetingDiarizationAssetStatus {
         let definition = MeetingDiarizationProfiles.resolve(profileID)
         let transient = transientState[definition.modelAssetID]
-        if let marker = loadMarker(for: definition),
+        let marker = loadMarker(for: definition)
+        if let marker,
            markerIsCompatible(marker, with: definition),
            requiredPaths(for: definition).allSatisfy({ fileManager.fileExists(atPath: $0.path) }) {
             return MeetingDiarizationAssetStatus(
@@ -192,6 +193,16 @@ actor MeetingDiarizationAssetStore {
                 licenseURL: definition.licenseURL
             )
         }
+        let hasResidualInstall = fileManager.fileExists(
+            atPath: baseDirectory(for: definition).path
+        )
+        let persistedFailureCategory: String? = if marker != nil {
+            "incompatible_install"
+        } else if hasResidualInstall {
+            "incomplete_install"
+        } else {
+            nil
+        }
         return MeetingDiarizationAssetStatus(
             assetID: definition.modelAssetID,
             profileID: profileID,
@@ -199,9 +210,9 @@ actor MeetingDiarizationAssetStore {
             modelRevision: definition.modelRevision,
             modelDigest: nil,
             sizeBytes: 0,
-            state: transient?.state ?? .absent,
+            state: transient?.state ?? (hasResidualInstall ? .failed : .absent),
             installedAt: nil,
-            lastErrorCategory: transient?.error,
+            lastErrorCategory: transient?.error ?? persistedFailureCategory,
             licenseName: definition.licenseName,
             licenseURL: definition.licenseURL
         )
@@ -346,8 +357,8 @@ actor MeetingDiarizationAssetStore {
         case .sortformerBalanced:
             return [
                 base
-                    .appendingPathComponent("diar-streaming-sortformer-coreml", isDirectory: true)
-                    .appendingPathComponent("SortformerNvidiaLow_v2.1.mlmodelc", isDirectory: true),
+                    .appendingPathComponent(Repo.sortformer.folderName, isDirectory: true)
+                    .appendingPathComponent("\(definition.modelRevision).mlmodelc", isDirectory: true),
             ]
         }
     }
