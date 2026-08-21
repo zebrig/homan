@@ -167,6 +167,36 @@ enum MeetingDiarizationCatalogError: Error, Equatable, Sendable {
     case replacementCycle(String)
 }
 
+private enum MuesliNativeAppResourceBundle {
+    static let name = "MuesliNative_MuesliNativeApp.bundle"
+
+    /// SwiftPM's generated accessor for a command-line executable searches at
+    /// the root of Bundle.main. A conventionally packaged macOS app stores the
+    /// same bundle under Contents/Resources, so resolve that location before
+    /// touching Bundle.module. In SwiftPM/test execution there is no .app and
+    /// the generated accessor remains the authoritative build-directory path.
+    static func resolve(mainBundle: Bundle = .main) -> Bundle? {
+        if mainBundle.bundleURL.pathExtension.caseInsensitiveCompare("app") == .orderedSame {
+            let candidates = [
+                mainBundle.resourceURL?.appendingPathComponent(name, isDirectory: true),
+                mainBundle.bundleURL.appendingPathComponent(name, isDirectory: true),
+                mainBundle.executableURL?
+                    .deletingLastPathComponent()
+                    .appendingPathComponent(name, isDirectory: true),
+            ].compactMap { $0 }
+
+            for candidate in candidates {
+                if let bundle = Bundle(url: candidate) {
+                    return bundle
+                }
+            }
+            return nil
+        }
+
+        return Bundle.module
+    }
+}
+
 enum MeetingDiarizationModelCatalog {
     static let currentSchemaVersion = 1
     static let bundledRevision = "2026-08-17.1"
@@ -178,7 +208,8 @@ enum MeetingDiarizationModelCatalog {
     /// validated catalog is reused; if none exists, a safe empty catalog is
     /// returned. Installed assets are never touched by catalog failures.
     static func loadBundled() -> MeetingDiarizationCatalogSnapshot {
-        guard let url = Bundle.module.url(
+        guard let resourceBundle = MuesliNativeAppResourceBundle.resolve(),
+              let url = resourceBundle.url(
             forResource: "DiarizationModels",
             withExtension: "json"
         ), let data = try? Data(contentsOf: url) else {

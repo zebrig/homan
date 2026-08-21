@@ -6,7 +6,7 @@ BUILD_CONFIG="${1:-debug}"
 INSTALL_ROOT="$(mktemp -d "${TMPDIR:-/tmp}/muesli-packaging-test.XXXXXX")"
 APP_BUNDLE_NAME="MuesliPackagingTest.app"
 APP_PATH="$INSTALL_ROOT/$APP_BUNDLE_NAME"
-APP_BIN="$APP_PATH/Contents/MacOS/Muesli"
+APP_BIN="$APP_PATH/Contents/MacOS/Homan"
 CLI_BIN="$APP_PATH/Contents/MacOS/homan-cli"
 LOCALVQE_LIBRARY="$APP_PATH/Contents/Frameworks/liblocalvqe.dylib"
 LOCALVQE_GTCRN_MODEL="$APP_PATH/Contents/Resources/Models/localvqe/localvqe-pi-v1-49k-f32.gguf"
@@ -41,6 +41,22 @@ if [[ ! -x "$CLI_BIN" ]]; then
   exit 1
 fi
 
+SWIFTPM_RESOURCE_BUNDLES=(
+  MuesliNative_MuesliNativeApp.bundle
+  DTLNAecCoreML_DTLNAec512.bundle
+  TelemetryDeck_TelemetryDeck.bundle
+)
+for bundle_name in "${SWIFTPM_RESOURCE_BUNDLES[@]}"; do
+  if [[ ! -d "$APP_PATH/Contents/Resources/$bundle_name" ]]; then
+    echo "Packaged app is missing canonical SwiftPM resources: $bundle_name" >&2
+    exit 1
+  fi
+  if [[ -e "$APP_PATH/$bundle_name" ]]; then
+    echo "SwiftPM resource bundle must not be placed at the signed app root: $bundle_name" >&2
+    exit 1
+  fi
+done
+
 if [[ ! -e "$LOCALVQE_LIBRARY" || ! -f "$LOCALVQE_GTCRN_MODEL" || ! -f "$LOCALVQE_V12_MODEL" ]]; then
   echo "Packaged app is missing its LocalVQE runtime or one of its models." >&2
   exit 1
@@ -54,6 +70,7 @@ fi
 
 "$CLI_BIN" spec > "$SPEC_OUTPUT"
 "$CLI_BIN" transcribe --help > "$TRANSCRIBE_HELP_OUTPUT"
+"$APP_BIN" --packaged-resource-smoke-test
 
 if ! grep -q '"command" : "homan-cli spec"' "$SPEC_OUTPUT"; then
   echo "Packaged CLI did not return the expected spec payload." >&2
@@ -71,4 +88,5 @@ echo "Packaged CLI smoke test passed."
 echo "Verified:"
 echo "  - $APP_BIN"
 echo "  - $CLI_BIN"
+echo "  - packaged GUI resource lookup"
 echo "  - bundled LocalVQE runtime and both models"
