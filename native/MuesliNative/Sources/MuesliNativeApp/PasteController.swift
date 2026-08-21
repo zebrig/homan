@@ -4,6 +4,18 @@ import Foundation
 import MuesliCore
 
 enum PasteController {
+    enum LifecycleEvent: String, CaseIterable, Sendable {
+        case clipboardStaged = "clipboard_staged"
+        case clipboardStageFailed = "clipboard_stage_failed"
+        case targetSnapshotted = "target_snapshotted"
+        case pasteDispatched = "paste_dispatched"
+        case pasteDispatchFailed = "paste_dispatch_failed"
+        case clipboardOwnershipLost = "clipboard_ownership_lost"
+        case clipboardRestoreScheduled = "clipboard_restore_scheduled"
+        case clipboardRestored = "clipboard_restored"
+        case clipboardRestoreSkipped = "clipboard_restore_skipped"
+    }
+
     /// How long to wait after simulating Cmd+V before restoring the clipboard.
     /// The receiving app must have consumed the paste data within this window.
     private static let clipboardRestoreDelay: TimeInterval = 0.5
@@ -37,29 +49,70 @@ enum PasteController {
     ///
     /// Flow: save clipboard → write text → Cmd+V → restore clipboard after delay.
     /// If the clipboard cannot be saved (e.g. lazy-provided data), falls back to a simple
-    /// paste without restoration.
+    /// paste without restoration. Completion receives the target app only when Cmd+V was posted.
+    /// Requiring staged ownership also skips Cmd+V if another writer takes the clipboard first.
+    @MainActor
     static func paste(
         text: String,
         pasteboard: NSPasteboard = .general,
-        simulatePasteAction: @escaping () -> Void = PasteController.simulatePaste
+        requireStagedClipboardOwnership: Bool = false,
+        targetApplicationProvider: @escaping @MainActor () -> NSRunningApplication? = {
+            NSWorkspace.shared.frontmostApplication
+        },
+        simulatePasteAction: @escaping @MainActor () -> Bool = PasteController.simulatePaste,
+        onPasteFinished: @escaping @MainActor (NSRunningApplication?) -> Void = { _ in },
+        onClipboardSettled: @escaping @MainActor () -> Void = {},
+        onLifecycleEvent: @escaping @MainActor (LifecycleEvent) -> Void = { _ in }
     ) {
         guard !text.isEmpty else { return }
 
         // Save current clipboard contents (all types) so we can restore after paste.
         let savedItems = saveClipboard(pasteboard)
 
-        pasteboard.clearContents()
-        pasteboard.setString(text, forType: .string)
+        let clearedChangeCount = pasteboard.clearContents()
+        let didStageText = pasteboard.setString(text, forType: .string)
         let pasteChangeCount = pasteboard.changeCount
+        onLifecycleEvent(didStageText ? .clipboardStaged : .clipboardStageFailed)
 
         DispatchQueue.main.asyncAfter(deadline: .now() + 0.05) {
-            simulatePasteAction()
-
-            // Restore the original clipboard contents after the receiving app has consumed the paste.
-            DispatchQueue.main.asyncAfter(deadline: .now() + clipboardRestoreDelay) {
-                guard pasteboard.changeCount == pasteChangeCount else { return }
-                restoreClipboard(pasteboard, from: savedItems)
+            let targetApplication = targetApplicationProvider()
+            onLifecycleEvent(.targetSnapshotted)
+            if requireStagedClipboardOwnership {
+                guard didStageText else {
+                    if pasteboard.changeCount == clearedChangeCount {
+                        restoreClipboard(pasteboard, from: savedItems)
+                        onLifecycleEvent(.clipboardRestored)
+                    } else {
+                        onLifecycleEvent(.clipboardRestoreSkipped)
+                    }
+                    onPasteFinished(nil)
+                    onClipboardSettled()
+                    return
+                }
+                guard pasteboard.changeCount == pasteChangeCount else {
+                    onLifecycleEvent(.clipboardOwnershipLost)
+                    onPasteFinished(nil)
+                    onClipboardSettled()
+                    return
+                }
             }
+            let didDispatchPaste = simulatePasteAction()
+            onLifecycleEvent(didDispatchPaste ? .pasteDispatched : .pasteDispatchFailed)
+
+            // Arm restoration before completion bookkeeping so persistence and UI refreshes
+            // cannot extend how long the transcript owns the clipboard.
+            onLifecycleEvent(.clipboardRestoreScheduled)
+            DispatchQueue.main.asyncAfter(deadline: .now() + clipboardRestoreDelay) {
+                if pasteboard.changeCount == pasteChangeCount {
+                    restoreClipboard(pasteboard, from: savedItems)
+                    onLifecycleEvent(.clipboardRestored)
+                } else {
+                    onLifecycleEvent(.clipboardRestoreSkipped)
+                }
+                onClipboardSettled()
+            }
+
+            onPasteFinished(didDispatchPaste ? targetApplication : nil)
         }
     }
 
@@ -87,18 +140,23 @@ enum PasteController {
 
     // MARK: - Private
 
-    private static func simulatePaste() {
+    private static func simulatePaste() -> Bool {
         guard let source = CGEventSource(stateID: .combinedSessionState) else {
             fputs("[muesli-native] failed to create event source for paste\n", stderr)
-            return
+            return false
         }
         let keyCode: CGKeyCode = 9 // V
-        let commandDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true)
-        commandDown?.flags = .maskCommand
-        let commandUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
-        commandUp?.flags = .maskCommand
-        commandDown?.post(tap: .cghidEventTap)
-        commandUp?.post(tap: .cghidEventTap)
+        guard let commandDown = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: true),
+              let commandUp = CGEvent(keyboardEventSource: source, virtualKey: keyCode, keyDown: false)
+        else {
+            fputs("[muesli-native] failed to create keyboard events for paste\n", stderr)
+            return false
+        }
+        commandDown.flags = .maskCommand
+        commandUp.flags = .maskCommand
+        commandDown.post(tap: .cghidEventTap)
+        commandUp.post(tap: .cghidEventTap)
+        return true
     }
 
     private static func postPhysicalKey(source: CGEventSource, keyCode: CGKeyCode, flags: CGEventFlags) {
