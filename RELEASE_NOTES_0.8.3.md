@@ -2,6 +2,13 @@
 
 Homan 0.8.3 is a packaging hotfix for the refreshed 0.8.2 installer.
 
+## Latest refresh
+
+- Preserved dictation history before paste while moving non-critical sync and UI bookkeeping out of the clipboard handoff path.
+- Added clipboard ownership checks so Homan does not overwrite or paste stale text after another app changes the clipboard.
+- Fixed a checked-continuation race in screen OCR that could crash during context capture.
+- Isolated the test runtime from the installed Homan profile and macOS audio, calendar, media, floating-window, and OAuth side effects.
+
 ## Startup reliability
 
 - Fixed an immediate launch crash on Macs other than the build machine when Homan loads its bundled speaker-diarization catalog.
