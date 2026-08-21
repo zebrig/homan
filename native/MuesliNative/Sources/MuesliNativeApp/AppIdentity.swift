@@ -11,6 +11,8 @@ enum AppIdentity {
     /// Product fallback name used when bundle metadata is absent.
     static let defaultName = "Homan"
 
+    static let isRunningTests = MuesliPaths.isRunningTests
+
     static var bundleName: String {
         stringValue(for: "CFBundleName") ?? defaultName
     }
@@ -29,6 +31,10 @@ enum AppIdentity {
 
     static var supportDirectoryURL: URL {
         MuesliPaths.defaultSupportDirectoryURL(appName: supportDirectoryName)
+    }
+
+    static var databaseURL: URL {
+        MuesliPaths.defaultDatabaseURL(appName: supportDirectoryName)
     }
 
     // MARK: - Homan-owned public destinations

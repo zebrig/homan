@@ -162,10 +162,12 @@ private struct AppDownloadStateFile {
 /// Paths shared between the app and the detached CLI for download state.
 enum AppPaths {
     static func supportDirectoryPath() -> String {
-        if let env = ProcessInfo.processInfo.environment["MUESLI_SUPPORT_DIR"], !env.isEmpty {
+        if !AppIdentity.isRunningTests,
+           let env = ProcessInfo.processInfo.environment["MUESLI_SUPPORT_DIR"],
+           !env.isEmpty {
             return env
         }
-        return MuesliPaths.defaultSupportDirectoryURL().path
+        return AppIdentity.supportDirectoryURL.path
     }
 
     static func modelDownloadsDirectoryURL() -> URL {

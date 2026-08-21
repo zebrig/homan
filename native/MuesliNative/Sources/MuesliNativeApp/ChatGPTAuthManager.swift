@@ -28,7 +28,10 @@ enum ChatGPTAuthError: Error, LocalizedError {
 
 @MainActor
 final class ChatGPTAuthManager {
-    static let shared = ChatGPTAuthManager()
+    static let shared = ChatGPTAuthManager(
+        supportDirectory: AppIdentity.supportDirectoryURL,
+        migrateLegacyKeychain: !AppIdentity.isRunningTests
+    )
 
     private static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
     private static let authURL = "https://auth.openai.com/oauth/authorize"
@@ -37,13 +40,13 @@ final class ChatGPTAuthManager {
     private static let scopes = "openid profile email offline_access"
     private static let callbackTimeoutSeconds: TimeInterval = 300 // 5 minutes
 
-    private var tokenFileURL: URL {
-        AppIdentity.supportDirectoryURL.appendingPathComponent("chatgpt-auth.json")
-    }
+    private let tokenFileURL: URL
 
-    private init() {
-        // Migrate from legacy keychain storage to file
-        migrateFromKeychain()
+    init(supportDirectory: URL, migrateLegacyKeychain: Bool = false) {
+        tokenFileURL = supportDirectory.appendingPathComponent("chatgpt-auth.json")
+        if migrateLegacyKeychain {
+            migrateFromKeychain()
+        }
     }
 
     // MARK: - Public API

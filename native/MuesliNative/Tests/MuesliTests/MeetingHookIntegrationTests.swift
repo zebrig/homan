@@ -111,6 +111,7 @@ struct MeetingHookIntegrationTests {
                 bundlePath: nil
             ),
             dictationStore: store,
+            configStore: ConfigStore(supportDirectory: makeTemporaryDirectory()),
             meetingHookDispatcher: dispatcher
         )
     }

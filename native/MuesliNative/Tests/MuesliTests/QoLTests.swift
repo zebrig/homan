@@ -39,17 +39,41 @@ struct ChatGPTTokenStorageTests {
     @Test("isAuthenticated returns false when no token file exists")
     @MainActor
     func notAuthenticatedByDefault() {
-        // Shared singleton may have tokens from a prior test or real usage,
-        // so just verify the property is accessible and returns a Bool
-        let auth = ChatGPTAuthManager.shared
-        let _ = auth.isAuthenticated  // Should not crash
+        let auth = ChatGPTAuthManager(supportDirectory: makeSupportDirectory())
+        #expect(!auth.isAuthenticated)
     }
 
     @Test("signOut does not crash even when not signed in")
     @MainActor
     func signOutSafe() {
-        let auth = ChatGPTAuthManager.shared
+        let auth = ChatGPTAuthManager(supportDirectory: makeSupportDirectory())
         auth.signOut()  // Should not crash
+    }
+
+    @Test("signOut only removes tokens from the injected support directory")
+    @MainActor
+    func signOutIsScopedToInjectedStorage() throws {
+        let authDirectory = makeSupportDirectory()
+        let unrelatedDirectory = makeSupportDirectory()
+        try FileManager.default.createDirectory(at: authDirectory, withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: unrelatedDirectory, withIntermediateDirectories: true)
+
+        let authToken = authDirectory.appendingPathComponent("chatgpt-auth.json")
+        let unrelatedToken = unrelatedDirectory.appendingPathComponent("chatgpt-auth.json")
+        try Data(#"{"access_token":"test"}"#.utf8).write(to: authToken)
+        try Data(#"{"access_token":"keep"}"#.utf8).write(to: unrelatedToken)
+
+        let auth = ChatGPTAuthManager(supportDirectory: authDirectory)
+        #expect(auth.isAuthenticated)
+        auth.signOut()
+
+        #expect(!FileManager.default.fileExists(atPath: authToken.path))
+        #expect(FileManager.default.fileExists(atPath: unrelatedToken.path))
+    }
+
+    private func makeSupportDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-chatgpt-auth-test-\(UUID().uuidString)", isDirectory: true)
     }
 }
 

@@ -517,7 +517,7 @@ final class MuesliController: NSObject {
         }
         self.runtime = runtime
         self.dictationStore = dictationStore ?? DictationStore(
-            databaseURL: MuesliPaths.defaultDatabaseURL(appName: AppIdentity.supportDirectoryName)
+            databaseURL: AppIdentity.databaseURL
         )
         self.meetingHookDispatcher = meetingHookDispatcher
         self.meetingMarkdownAutoExporter = meetingMarkdownAutoExporter

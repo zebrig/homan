@@ -752,7 +752,7 @@ struct NemotronDictationModePolicyTests {
     @MainActor
     @Test("showWarning is callable without crash in idle state")
     func showWarningIdleNoCrash() {
-        let configStore = ConfigStore()
+        let configStore = ConfigStore(supportDirectory: makeSupportDirectory())
         let config = configStore.load()
         let indicator = FloatingIndicatorController(configStore: configStore)
         // First setState creates the panel so subsequent calls are correctly sequenced
@@ -764,7 +764,7 @@ struct NemotronDictationModePolicyTests {
     @MainActor
     @Test("showWarning is a no-op when indicator is in recording state")
     func showWarningIgnoredDuringRecording() {
-        let configStore = ConfigStore()
+        let configStore = ConfigStore(supportDirectory: makeSupportDirectory())
         let config = configStore.load()
         let indicator = FloatingIndicatorController(configStore: configStore)
         // Create panel first so setState(.recording) sets state correctly
@@ -774,6 +774,11 @@ struct NemotronDictationModePolicyTests {
         // Should return early without crashing or changing state
         indicator.showWarning("should be ignored", duration: 0.01)
         indicator.close()
+    }
+
+    private func makeSupportDirectory() -> URL {
+        FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-nemotron-policy-test-\(UUID().uuidString)", isDirectory: true)
     }
 }
 
