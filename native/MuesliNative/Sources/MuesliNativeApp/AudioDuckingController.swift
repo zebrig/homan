@@ -7,6 +7,13 @@ protocol AudioDuckingManaging: AnyObject {
     func restoreDictationDucking(completion: (() -> Void)?)
 }
 
+/// Test-controller dependency that never constructs or queries a CoreAudio client.
+final class InertAudioDuckingController: AudioDuckingManaging {
+    func beginDictationDucking(enabled: Bool) {}
+    func ensureCurrentDefaultDucked() {}
+    func restoreDictationDucking(completion: (() -> Void)?) { completion?() }
+}
+
 extension AudioDuckingManaging {
     func restoreDictationDucking() {
         restoreDictationDucking(completion: nil)

@@ -56,7 +56,7 @@ struct MeetingHookIntegrationTests {
     }
 
     @Test("hook launch failure does not fail meeting persistence")
-    func hookLaunchFailureDoesNotFailPersistence() throws {
+    func hookLaunchFailureDoesNotFailPersistence() async throws {
         let store = try makeStore()
         let supportDirectory = makeTemporaryDirectory()
         let runner = MeetingHookRunner(supportDirectory: supportDirectory)
@@ -73,6 +73,11 @@ struct MeetingHookIntegrationTests {
         )
 
         #expect(try store.meeting(id: persistence.meetingID) != nil)
+        let log = try await waitForLog(
+            at: runner.logURL,
+            containing: "launch failed: executable does not exist"
+        )
+        #expect(log.contains("/definitely/missing/hook.sh"))
     }
 
     @Test("duplicate calendar metadata does not block persistence or hooks")
@@ -112,7 +117,13 @@ struct MeetingHookIntegrationTests {
             ),
             dictationStore: store,
             configStore: ConfigStore(supportDirectory: makeTemporaryDirectory()),
-            meetingHookDispatcher: dispatcher
+            meetingHookDispatcher: dispatcher,
+            audioDuckingController: InertAudioDuckingController(),
+            dictationAudioRoutingController: InertDictationAudioRouteController(),
+            calendarMonitor: nil,
+            meetingMonitor: nil,
+            featureTourStore: nil,
+            runtimeSideEffectsEnabled: false
         )
     }
 
@@ -129,6 +140,17 @@ struct MeetingHookIntegrationTests {
             .appendingPathComponent("muesli-hook-support-\(UUID().uuidString)", isDirectory: true)
         try? FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
         return url
+    }
+
+    private func waitForLog(at url: URL, containing expected: String) async throws -> String {
+        for _ in 0..<200 {
+            if let log = try? String(contentsOf: url, encoding: .utf8),
+               log.contains(expected) {
+                return log
+            }
+            try await Task.sleep(for: .milliseconds(10))
+        }
+        throw MeetingHookIntegrationTestError.logTimeout(expected)
     }
 
     private func makeMeetingResult(calendarEventID: String? = nil) -> MeetingSessionResult {
@@ -149,6 +171,10 @@ struct MeetingHookIntegrationTests {
             templateSnapshot: MeetingTemplates.auto.snapshot
         )
     }
+}
+
+private enum MeetingHookIntegrationTestError: Error {
+    case logTimeout(String)
 }
 
 private final class MeetingHookDispatcherSpy: MeetingHookDispatching {

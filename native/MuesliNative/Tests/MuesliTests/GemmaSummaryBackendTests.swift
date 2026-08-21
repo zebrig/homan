@@ -100,37 +100,41 @@ struct GemmaSummaryBackendOptionTests {
         #expect(resolved.topP == 0.95)
     }
 
-    @Test("isMeetingSummaryBackendConfigured requires a downloaded model")
+    @Test("isMeetingSummaryBackendConfigured uses injected model availability")
     @MainActor
     func configuredOnlyWhenDownloaded() {
         let config = AppConfig()
-        let configured = MuesliController.isMeetingSummaryBackendConfigured(
+        #expect(!MuesliController.isMeetingSummaryBackendConfigured(
             .gemmaLocal,
             config: config,
-            isChatGPTAuthenticated: false
-        )
-        // A fresh config points at a model that is not on disk yet.
-        #expect(configured == GemmaSummaryModel.resolve(id: config.gemmaSummaryModel).isDownloaded)
+            isChatGPTAuthenticated: false,
+            isGemmaModelDownloaded: { _ in false }
+        ))
+        #expect(MuesliController.isMeetingSummaryBackendConfigured(
+            .gemmaLocal,
+            config: config,
+            isChatGPTAuthenticated: false,
+            isGemmaModelDownloaded: { _ in true }
+        ))
     }
 }
 
 @Suite("Gemma summary fallback")
 struct GemmaSummaryFallbackTests {
     @Test("unconfigured gemmaLocal falls back to the raw transcript")
-    func unconfiguredFallsBackToRawTranscript() async throws {
-        // Fresh config now defaults to gemma_local; until the model is downloaded
-        // the summary keeps the raw transcript (like unconfigured cloud backends).
-        let config = AppConfig()
-        let model = GemmaSummaryModel.resolve(id: config.gemmaSummaryModel)
-        guard !model.isDownloaded else { return } // hermetic: only when model absent
-
-        let result = try await MeetingSummaryClient.summarize(
+    func unconfiguredFallsBackToRawTranscript() throws {
+        let result = try #require(MeetingSummaryClient.gemmaUnavailableFallback(
             transcript: "raw meeting transcript",
             meetingTitle: "Standup",
-            config: config
-        )
+            isModelDownloaded: false
+        ))
         #expect(result.contains("## Raw Transcript"))
         #expect(result.contains("raw meeting transcript"))
+        #expect(MeetingSummaryClient.gemmaUnavailableFallback(
+            transcript: "raw meeting transcript",
+            meetingTitle: "Standup",
+            isModelDownloaded: true
+        ) == nil)
     }
 }
 

@@ -327,6 +327,7 @@ final class MuesliController: NSObject {
 
     private let runtime: RuntimePaths
     private let configStore: ConfigStore
+    private let runtimeSideEffectsEnabled: Bool
     private let processingSupportDirectory: URL
     private let dictationStore: DictationStore
     private let meetingHookDispatcher: MeetingHookDispatching
@@ -369,8 +370,16 @@ final class MuesliController: NSObject {
     )
     private let dictationLatencyTimestampFormatter = ISO8601DateFormatter()
     private let indicator: FloatingIndicatorController
-    private let calendarMonitor = CalendarMonitor()
-    private let meetingMonitor = MeetingMonitor()
+    private let calendarMonitorStorage: CalendarMonitor?
+    private var calendarMonitor: CalendarMonitor {
+        precondition(runtimeSideEffectsEnabled, "Calendar runtime is disabled for this controller")
+        return calendarMonitorStorage!
+    }
+    private let meetingMonitorStorage: MeetingMonitor?
+    private var meetingMonitor: MeetingMonitor {
+        precondition(runtimeSideEffectsEnabled, "Meeting monitor runtime is disabled for this controller")
+        return meetingMonitorStorage!
+    }
     private let meetingNotification = MeetingNotificationController()
     private let meetingSourceWindowLocator = MeetingSourceWindowLocator()
 
@@ -393,7 +402,11 @@ final class MuesliController: NSObject {
     private var historyWindowController: RecentHistoryWindowController?
     private var preferencesWindowController: PreferencesWindowController?
     private var onboardingWindowController: OnboardingWindowController?
-    private let featureTourStore = FeatureTourStore()
+    private let featureTourStoreStorage: FeatureTourStore?
+    private var featureTourStore: FeatureTourStore {
+        precondition(runtimeSideEffectsEnabled, "Feature-tour persistence is disabled for this controller")
+        return featureTourStoreStorage!
+    }
     var updaterController: SPUStandardUpdaterController?
     private var busyStatusGeneration = 0
 
@@ -500,9 +513,14 @@ final class MuesliController: NSObject {
         meetingMarkdownAutoExporter: MeetingMarkdownAutoExporting = MeetingMarkdownAutoExporter(),
         launchAtLoginManager: LaunchAtLoginManaging = SystemLaunchAtLoginManager(),
         audioDuckingController: AudioDuckingManaging = AudioDuckingController(),
-        dictationAudioRoutingController: DictationAudioRouting = DictationAudioRouteController()
+        dictationAudioRoutingController: DictationAudioRouting = DictationAudioRouteController(),
+        calendarMonitor: CalendarMonitor? = CalendarMonitor(),
+        meetingMonitor: MeetingMonitor? = nil,
+        featureTourStore: FeatureTourStore? = FeatureTourStore(),
+        runtimeSideEffectsEnabled: Bool = true
     ) {
         self.configStore = configStore
+        self.runtimeSideEffectsEnabled = runtimeSideEffectsEnabled
         self.processingSupportDirectory = configStore.supportDirectory()
         var loadedConfig = configStore.load()
         let loadedBackend = BackendOption.all.first(where: {
@@ -524,10 +542,10 @@ final class MuesliController: NSObject {
         self.launchAtLoginCoordinator = LaunchAtLoginCoordinator(manager: launchAtLoginManager)
         self.audioDuckingController = audioDuckingController
         self.dictationAudioRoutingController = dictationAudioRoutingController
-        self.dictationAudioRoutingController.selectedInputDeviceUID = loadedConfig.dictationInputDeviceUID
-        self.dictationAudioRoutingController.selectedMeetingInputDeviceUID = loadedConfig.meetingInputDeviceUID
+        dictationAudioRoutingController.selectedInputDeviceUID = loadedConfig.dictationInputDeviceUID
+        dictationAudioRoutingController.selectedMeetingInputDeviceUID = loadedConfig.meetingInputDeviceUID
         self.config = loadedConfig
-        if loadedConfig.recordingColorHex != "1e1e2e" {
+        if runtimeSideEffectsEnabled, loadedConfig.recordingColorHex != "1e1e2e" {
             MuesliTheme.accentOverrideHex = loadedConfig.recordingColorHex
         }
         self.selectedBackend = loadedBackend
@@ -538,7 +556,7 @@ final class MuesliController: NSObject {
         self.selectedMeetingTranscriptionBackend = Self.availableMeetingTranscriptionBackend(
             config: loadedConfig,
             dictationBackend: self.selectedBackend,
-            downloadedOptions: BackendOption.downloaded
+            downloadedOptions: runtimeSideEffectsEnabled ? BackendOption.downloaded : []
         ) ?? Self.fallbackMeetingTranscriptionBackend(
             configured: configuredMeetingBackend,
             dictationBackend: self.selectedBackend
@@ -547,8 +565,16 @@ final class MuesliController: NSObject {
             $0.backend == loadedConfig.meetingSummaryBackend
         }) ?? .transcriptOnly
         self.selectedPostProcessorBackend = loadedPostProcessorBackend
-        self.indicator = FloatingIndicatorController(configStore: configStore)
-        ComputerUseCursorOverlay.shared.attachIndicator(self.indicator)
+        self.calendarMonitorStorage = calendarMonitor
+        self.meetingMonitorStorage = meetingMonitor ?? (runtimeSideEffectsEnabled ? MeetingMonitor() : nil)
+        self.featureTourStoreStorage = featureTourStore
+        self.indicator = FloatingIndicatorController(
+            configStore: configStore,
+            uiEnabled: runtimeSideEffectsEnabled
+        )
+        if runtimeSideEffectsEnabled {
+            ComputerUseCursorOverlay.shared.attachIndicator(self.indicator)
+        }
         super.init()
         dictationAudioSessionManager.onEvent = { [weak self] event in
             Task { @MainActor [weak self] in
@@ -576,15 +602,18 @@ final class MuesliController: NSObject {
                 self.refreshActiveMeetingMicrophoneState()
             }
         }
-        Task {
-            try? await transcriptionCoordinator.configureHomanWhisper(
-                endpointString: loadedConfig.homanWhisperEndpoint,
-                apiKey: loadedConfig.homanWhisperAPIKey
-            )
+        if runtimeSideEffectsEnabled {
+            Task {
+                try? await transcriptionCoordinator.configureHomanWhisper(
+                    endpointString: loadedConfig.homanWhisperEndpoint,
+                    apiKey: loadedConfig.homanWhisperAPIKey
+                )
+            }
         }
     }
 
     func start() {
+        guard runtimeSideEffectsEnabled else { return }
         hasStarted = true
         do {
             try dictationStore.migrateIfNeeded()
@@ -882,6 +911,10 @@ final class MuesliController: NSObject {
     }
 
     func shutdown() {
+        guard runtimeSideEffectsEnabled else {
+            shutdownIsolatedRuntime()
+            return
+        }
         if let workspaceObserver {
             NSWorkspace.shared.notificationCenter.removeObserver(workspaceObserver)
             self.workspaceObserver = nil
@@ -950,8 +983,47 @@ final class MuesliController: NSObject {
         GemmaSummaryBackend.shutdownSynchronously()
     }
 
+    /// Tests can exercise controller lifetime without leaving tasks or session state behind.
+    /// Every dependency reached here is either process-local or explicitly inert.
+    private func shutdownIsolatedRuntime() {
+        searchTask?.cancel()
+        searchTask = nil
+        onboardingModelPreparationTask?.cancel()
+        onboardingModelPreparationTask = nil
+        dictionarySuggestionPromptAdvanceTask?.cancel()
+        dictionarySuggestionPromptAdvanceTask = nil
+        computerUseCommandTask?.cancel()
+        computerUseCommandTask = nil
+        meetingStartTask?.cancel()
+        meetingStartTask = nil
+        importTask?.cancel()
+        importTask = nil
+        iCloudSyncTask?.cancel()
+        iCloudSyncTask = nil
+        iCloudSyncDebounceTask?.cancel()
+        iCloudSyncDebounceTask = nil
+        iCloudSubscriptionTask?.cancel()
+        iCloudSubscriptionTask = nil
+        dictationTestTask?.cancel()
+        dictationTestTask = nil
+        indicator.close()
+    }
+
     func recentDictations() -> [DictationRecord] {
         (try? dictationStore.recentDictations(limit: 10)) ?? []
+    }
+
+    var usesInertRuntimeDependenciesForTesting: Bool {
+        !runtimeSideEffectsEnabled
+            && dictationRecorder.usesInertChildrenForTesting
+            && computerUseRecorder.usesInertChildrenForTesting
+            && audioDuckingController is InertAudioDuckingController
+            && dictationAudioRoutingController is InertDictationAudioRouteController
+            && dictationAudioSessionManager.usesInertMediaPlaybackForTesting
+            && computerUseAudioSessionManager.usesInertMediaPlaybackForTesting
+            && calendarMonitorStorage == nil
+            && meetingMonitorStorage == nil
+            && featureTourStoreStorage == nil
     }
 
     func recentMeetings() -> [MeetingRecord] {
@@ -1438,7 +1510,8 @@ final class MuesliController: NSObject {
         )
         selectedMeetingTranscriptionBackend = Self.availableMeetingTranscriptionBackend(
             config: config,
-            dictationBackend: selectedBackend
+            dictationBackend: selectedBackend,
+            downloadedOptions: runtimeSideEffectsEnabled ? BackendOption.downloaded : []
         ) ?? Self.fallbackMeetingTranscriptionBackend(
             configured: configuredMeetingTranscriptionBackend,
             dictationBackend: selectedBackend
@@ -1451,11 +1524,13 @@ final class MuesliController: NSObject {
         configStore.save(config)
         let homanWhisperEndpoint = config.homanWhisperEndpoint
         let homanWhisperAPIKey = config.homanWhisperAPIKey
-        Task {
-            try? await transcriptionCoordinator.configureHomanWhisper(
-                endpointString: homanWhisperEndpoint,
-                apiKey: homanWhisperAPIKey
-            )
+        if runtimeSideEffectsEnabled {
+            Task {
+                try? await transcriptionCoordinator.configureHomanWhisper(
+                    endpointString: homanWhisperEndpoint,
+                    apiKey: homanWhisperAPIKey
+                )
+            }
         }
         selectedMeetingSummaryBackend = MeetingSummaryBackendOption.all.first(where: {
             $0.backend == config.meetingSummaryBackend
@@ -1569,6 +1644,15 @@ final class MuesliController: NSObject {
     }
 
     private func applyConfigRuntimeSideEffects(wasICloudSyncEnabled: Bool, hotkeyTriggerThresholdChanged: Bool) {
+        guard runtimeSideEffectsEnabled else {
+            appState.selectedBackend = selectedBackend
+            appState.selectedMeetingTranscriptionBackend = selectedMeetingTranscriptionBackend
+            appState.selectedMeetingSummaryBackend = selectedMeetingSummaryBackend
+            appState.selectedPostProcessorBackend = selectedPostProcessorBackend
+            appState.config = config
+            appState.isChatGPTAuthenticated = chatGPTAuth.isAuthenticated
+            return
+        }
         statusBarController?.refresh()
         statusBarController?.refreshIcon()
         indicator.refreshIcon()
@@ -2342,7 +2426,7 @@ final class MuesliController: NSObject {
 
     func selectBackend(_ option: BackendOption) {
         let replacesGemmaCleanup = !selectedPostProcessorBackend.isCompatible(with: option)
-        let hasLocalCleanupModel = PostProcessorOption.runtimeOption(id: config.activePostProcessorId) != nil
+        let hasLocalCleanupModel = runtimePostProcessorOption() != nil
         updateConfig {
             $0.sttBackend = option.backend
             $0.sttModel = option.model
@@ -2352,6 +2436,10 @@ final class MuesliController: NSObject {
                     $0.enablePostProcessor = false
                 }
             }
+        }
+        guard runtimeSideEffectsEnabled else {
+            dictationBackendReadiness = .ready
+            return
         }
         dictationBackendReadiness = .preparing
         Task { [weak self] in
@@ -2422,6 +2510,7 @@ final class MuesliController: NSObject {
     /// Update the Nemotron 3.5 dictation language and push the prompt_id to the runtime.
     func setNemotron35Language(_ language: Nemotron35Language) async {
         updateConfig { $0.nemotron35Language = language.rawValue }
+        guard runtimeSideEffectsEnabled else { return }
         await transcriptionCoordinator.setNemotron35PromptId(language.promptId)
     }
 
@@ -2434,10 +2523,15 @@ final class MuesliController: NSObject {
             normalizeMeetingTranscriptionSelectionForAvailability()
             return
         }
-        let isReady = option.capabilitiesExecutionLocation == .cloud
-            ? !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            : option.isDownloaded
-        guard !requireDownloaded || isReady else {
+        let isReady: Bool
+        if requireDownloaded {
+            isReady = option.capabilitiesExecutionLocation == .cloud
+                ? !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                : option.isDownloaded
+        } else {
+            isReady = true
+        }
+        guard isReady else {
             presentErrorAlert(
                 title: "Meeting model unavailable",
                 message: option.capabilitiesExecutionLocation == .cloud
@@ -2512,6 +2606,9 @@ final class MuesliController: NSObject {
 
     private func runtimePostProcessorOption() -> PostProcessorOption? {
         guard selectedPostProcessorBackend == .local else { return nil }
+        guard runtimeSideEffectsEnabled else {
+            return PostProcessorOption.resolve(id: config.activePostProcessorId)
+        }
         return PostProcessorOption.runtimeOption(id: config.activePostProcessorId)
     }
 
@@ -2554,6 +2651,7 @@ final class MuesliController: NSObject {
     }
 
     func preloadExperimentalTranscriptionFeatures() {
+        guard runtimeSideEffectsEnabled else { return }
         let ppOption = runtimePostProcessorOption()
         let enabled = canRunTranscriptCleanup(option: ppOption)
         Task { [weak self] in
@@ -2705,7 +2803,7 @@ final class MuesliController: NSObject {
     }
 
     func availableMeetingRetranscriptionBackends() -> [BackendOption] {
-        var options = BackendOption.downloadedMeetingTranscription
+        var options = runtimeSideEffectsEnabled ? BackendOption.downloadedMeetingTranscription : []
         if !config.homanWhisperAPIKey.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
             options.append(.homanWhisper)
         }
@@ -2744,7 +2842,10 @@ final class MuesliController: NSObject {
         Self.isMeetingSummaryBackendConfigured(
             option,
             config: config,
-            isChatGPTAuthenticated: chatGPTAuth.isAuthenticated
+            isChatGPTAuthenticated: chatGPTAuth.isAuthenticated,
+            isGemmaModelDownloaded: { [runtimeSideEffectsEnabled] model in
+                runtimeSideEffectsEnabled ? model.isDownloaded : true
+            }
         )
     }
 
@@ -2752,7 +2853,8 @@ final class MuesliController: NSObject {
         _ option: MeetingSummaryBackendOption,
         config: AppConfig,
         isChatGPTAuthenticated: Bool,
-        environment: [String: String] = ProcessInfo.processInfo.environment
+        environment: [String: String] = ProcessInfo.processInfo.environment,
+        isGemmaModelDownloaded: (GemmaSummaryModel) -> Bool = { $0.isDownloaded }
     ) -> Bool {
         switch option {
         case .transcriptOnly:
@@ -2775,7 +2877,7 @@ final class MuesliController: NSObject {
             return MeetingSummaryClient.customLLMHasRequiredSettings(config: config)
         case .gemmaLocal:
             // Configured once the selected Gemma 4 summary model is on disk.
-            return GemmaSummaryModel.resolve(id: config.gemmaSummaryModel).isDownloaded
+            return isGemmaModelDownloaded(GemmaSummaryModel.resolve(id: config.gemmaSummaryModel))
         default:
             return false
         }

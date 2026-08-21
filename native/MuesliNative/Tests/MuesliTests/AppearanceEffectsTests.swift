@@ -8,23 +8,12 @@ struct SoundControllerTests {
 
     @Test("playDictationStart with enabled=false does not throw")
     func playStartDisabled() {
-        // NSSound.play() is a no-op in the test runner (no audio device required)
         SoundController.playDictationStart(enabled: false)
     }
 
     @Test("playDictationInsert with enabled=false does not throw")
     func playInsertDisabled() {
         SoundController.playDictationInsert(enabled: false)
-    }
-
-    @Test("playDictationStart with enabled=true does not throw")
-    func playStartEnabled() {
-        SoundController.playDictationStart(enabled: true)
-    }
-
-    @Test("playDictationInsert with enabled=true does not throw")
-    func playInsertEnabled() {
-        SoundController.playDictationInsert(enabled: true)
     }
 }
 

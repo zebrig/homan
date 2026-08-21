@@ -89,6 +89,36 @@ protocol DictationAudioRecording: AnyObject {
     func currentPower() -> Float
 }
 
+private enum InertDictationAudioRecorderError: Error {
+    case runtimeDisabled
+}
+
+/// A fail-closed recorder for controller tests. Constructing it does not create AVAudioEngine,
+/// AVAudioRecorder, AudioQueue or any other connection to the system audio stack.
+final class InertDictationAudioRecorder: DictationAudioRecording {
+    var preferredInputDeviceID: AudioObjectID?
+    var keepsAudioGraphWarm = false
+    var onFirstCapturedAudioBuffer: ((Date) -> Void)?
+    var onFirstSpeechDetected: ((Date) -> Void)?
+    var onNoAudioTimeout: ((Date) -> Void)?
+    var onRecordingFailed: ((Error, UUID) -> Void)?
+    var onLatencyEvent: ((String, Date) -> Void)?
+
+    func prepare() throws { throw InertDictationAudioRecorderError.runtimeDisabled }
+    func beginExplicitWarmup(preferredInputDeviceID: AudioObjectID?) {}
+    func warmUp(preferredInputDeviceID: AudioObjectID?) throws {
+        throw InertDictationAudioRecorderError.runtimeDisabled
+    }
+    func activateWarmEngine(preferredInputDeviceID: AudioObjectID?) throws {
+        throw InertDictationAudioRecorderError.runtimeDisabled
+    }
+    func coolDown() {}
+    func start() throws -> UUID { throw InertDictationAudioRecorderError.runtimeDisabled }
+    func stop() -> URL? { nil }
+    func cancel() {}
+    func currentPower() -> Float { -160 }
+}
+
 extension MicrophoneRecorder: DictationAudioRecording {}
 
 final class DictationAudioSessionManager: @unchecked Sendable {
@@ -151,7 +181,9 @@ final class DictationAudioSessionManager: @unchecked Sendable {
     init(
         recorder: DictationAudioRecording,
         duckingController: AudioDuckingManaging,
-        mediaPlaybackController: MediaPlaybackManaging = MediaPlaybackController(),
+        mediaPlaybackController: MediaPlaybackManaging = AppIdentity.isRunningTests
+            ? InertMediaPlaybackController()
+            : MediaPlaybackController(),
         routingController: DictationAudioRouting,
         queue: DispatchQueue = DispatchQueue(label: "com.muesli.dictation-audio-session-manager"),
         eventQueue: DispatchQueue = .main
@@ -184,6 +216,10 @@ final class DictationAudioSessionManager: @unchecked Sendable {
         recorder.onLatencyEvent = { [weak self] event, date in
             self?.emitLatency(event, at: date)
         }
+    }
+
+    var usesInertMediaPlaybackForTesting: Bool {
+        mediaPlaybackController is InertMediaPlaybackController
     }
 
     var currentState: DictationAudioSessionState {

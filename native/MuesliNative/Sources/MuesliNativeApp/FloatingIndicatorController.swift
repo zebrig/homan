@@ -124,6 +124,7 @@ final class FloatingIndicatorController: NSObject {
     private var isHovered = false
     private var hoverExitWorkItem: DispatchWorkItem?
     private let configStore: ConfigStore
+    private let uiEnabled: Bool
     private var isMeetingRecording = false
     private var isMeetingRecordingPaused = false
     private var isMeetingTranscriptManuallyDismissed = false
@@ -177,8 +178,9 @@ final class FloatingIndicatorController: NSObject {
         case waiting
     }
 
-    init(configStore: ConfigStore) {
+    init(configStore: ConfigStore, uiEnabled: Bool = true) {
         self.configStore = configStore
+        self.uiEnabled = uiEnabled
         super.init()
     }
 
@@ -231,6 +233,7 @@ final class FloatingIndicatorController: NSObject {
     /// Single clicks are deferred while a meeting is recording so a double-click
     /// (confirm stop) can be detected before the first click stops the meeting.
     func scheduleSingleClick(atX x: CGFloat) {
+        guard uiEnabled else { return }
         pendingSingleClickWorkItem?.cancel()
         let delay: TimeInterval = (state == .recording && isMeetingRecording) ? 0.25 : 0
         let item = DispatchWorkItem { [weak self] in
@@ -260,6 +263,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func showStatusMenu(with event: NSEvent, in view: NSView) {
+        guard uiEnabled else { return }
         if let statusMenu {
             NSMenu.popUpContextMenu(statusMenu, with: event, for: view)
         } else {
@@ -321,9 +325,11 @@ final class FloatingIndicatorController: NSObject {
         recordingWaveformMode = .level
         if !recording {
             isMeetingRecordingPaused = false
-            hideMeetingTranscript(reset: true)
-            // Restore the configured idle color (the meeting state uses red).
-            refreshIcon()
+            if uiEnabled {
+                hideMeetingTranscript(reset: true)
+                // Restore the configured idle color (the meeting state uses red).
+                refreshIcon()
+            }
         }
         if recording {
             setState(.recording, config: config)
@@ -334,6 +340,7 @@ final class FloatingIndicatorController: NSObject {
 
     func setRecordingWaveformWaiting(config: AppConfig) {
         recordingWaveformMode = .waiting
+        guard uiEnabled else { return }
         guard state == .recording else { return }
         let targetSize = frameForState(.recording, config: config).size
         ensureWaveformAnimation(in: targetSize, mode: .waiting)
@@ -341,6 +348,7 @@ final class FloatingIndicatorController: NSObject {
 
     func setRecordingWaveformLevel(config: AppConfig) {
         recordingWaveformMode = .level
+        guard uiEnabled else { return }
         guard state == .recording else {
             setState(.recording, config: config)
             return
@@ -351,6 +359,7 @@ final class FloatingIndicatorController: NSObject {
 
     func setPreparingWaveformWaiting(config: AppConfig) {
         recordingWaveformMode = .waiting
+        guard uiEnabled else { return }
         guard state == .preparing else {
             setState(.preparing, config: config)
             return
@@ -502,6 +511,7 @@ final class FloatingIndicatorController: NSObject {
         if state != .idle {
             isHovered = false
         }
+        guard uiEnabled else { return }
         if !config.showFloatingIndicator && state == .idle {
             close()
             return
@@ -631,6 +641,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func showComputerUseCursor(at quartzPoint: CGPoint, label rawLabel: String?) {
+        guard uiEnabled else { return }
         let config = configStore.load()
         if panel == nil {
             createPanel(config: config)
@@ -710,6 +721,7 @@ final class FloatingIndicatorController: NSObject {
     /// Homan mark colored by the floating bar icon color setting (never the
     /// animated waveform and never the interface accent override).
     func refreshIcon() {
+        guard uiEnabled else { return }
         let config = configStore.load()
         let iconColor = NSColor.colorWith(hexString: config.floatingIndicatorIconColorHex)
         let newImage = HomanMark.image(size: 30, color: iconColor)
@@ -719,6 +731,7 @@ final class FloatingIndicatorController: NSObject {
 
     /// Flash a brief warning message on the indicator pill, then snap back to idle.
     func showWarning(_ message: String, icon: String = "⚡", duration: TimeInterval = 2.5) {
+        guard uiEnabled else { return }
         guard state == .idle else { return }
         let config = configStore.load()
         if panel == nil { createPanel(config: config) }
@@ -792,6 +805,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func showLoading(_ message: String) {
+        guard uiEnabled else { return }
         let config = configStore.load()
         if panel == nil { createPanel(config: config) }
         guard let panel, let contentView, let textLabel else { return }
@@ -917,6 +931,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func scheduleHoverExit() {
+        guard uiEnabled else { return }
         if state == .recording, isMeetingRecording, meetingTranscriptPanel.isVisible {
             scheduleMeetingTranscriptHoverExit()
             return
@@ -937,6 +952,14 @@ final class FloatingIndicatorController: NSObject {
     }
 
     func close() {
+        if !uiEnabled {
+            stopWaveformAnimation()
+            pendingSingleClickWorkItem?.cancel()
+            pendingSingleClickWorkItem = nil
+            hoverExitWorkItem?.cancel()
+            hoverExitWorkItem = nil
+            return
+        }
         stopWaveformAnimation()
         hoverExitWorkItem?.cancel()
         hoverExitWorkItem = nil
@@ -951,6 +974,11 @@ final class FloatingIndicatorController: NSObject {
         micIconView = nil
         wandIconView = nil
         meetingTranscriptPanel.close()
+    }
+
+    var hasActiveUIForTesting: Bool {
+        panel != nil || amplitudeTimer != nil || loadingSpinner != nil ||
+            hoverExitWorkItem != nil || pendingSingleClickWorkItem != nil
     }
 
     private func setMeetingTranscriptPanelHovered(_ hovered: Bool) {
@@ -1319,6 +1347,7 @@ final class FloatingIndicatorController: NSObject {
     }
 
     private func createPanel(config: AppConfig) {
+        guard uiEnabled else { return }
         let panel = InteractiveFloatingPanel(
             contentRect: frameForState(.idle, config: config),
             styleMask: .borderless,

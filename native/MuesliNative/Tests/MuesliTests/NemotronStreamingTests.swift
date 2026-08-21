@@ -750,29 +750,24 @@ struct NemotronDictationModePolicyTests {
     }
 
     @MainActor
-    @Test("showWarning is callable without crash in idle state")
-    func showWarningIdleNoCrash() {
+    @Test("disabled indicator never creates panels, spinners, or waveform timers")
+    func disabledIndicatorHasNoUIRuntime() {
         let configStore = ConfigStore(supportDirectory: makeSupportDirectory())
         let config = configStore.load()
-        let indicator = FloatingIndicatorController(configStore: configStore)
-        // First setState creates the panel so subsequent calls are correctly sequenced
-        indicator.setState(.idle, config: config)
-        indicator.showWarning("test warning", icon: "⚡", duration: 0.01)
-        indicator.close()
-    }
-
-    @MainActor
-    @Test("showWarning is a no-op when indicator is in recording state")
-    func showWarningIgnoredDuringRecording() {
-        let configStore = ConfigStore(supportDirectory: makeSupportDirectory())
-        let config = configStore.load()
-        let indicator = FloatingIndicatorController(configStore: configStore)
-        // Create panel first so setState(.recording) sets state correctly
-        indicator.setState(.idle, config: config)
-        // Now set to recording — showWarning guard should fire
+        let indicator = FloatingIndicatorController(configStore: configStore, uiEnabled: false)
         indicator.setState(.recording, config: config)
-        // Should return early without crashing or changing state
-        indicator.showWarning("should be ignored", duration: 0.01)
+        indicator.setRecordingWaveformWaiting(config: config)
+        indicator.setRecordingWaveformLevel(config: config)
+        indicator.setState(.preparing, config: config)
+        indicator.setPreparingWaveformWaiting(config: config)
+        indicator.showComputerUseCursor(at: .zero, label: "test")
+        indicator.showLoading("test loading")
+        indicator.showWarning("test warning", icon: "⚡", duration: 0.01)
+        indicator.setState(.idle, config: config)
+        indicator.scheduleHoverExit()
+        indicator.scheduleSingleClick(atX: 0)
+
+        #expect(!indicator.hasActiveUIForTesting)
         indicator.close()
     }
 

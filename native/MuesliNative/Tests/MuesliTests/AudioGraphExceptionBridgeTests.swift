@@ -3,6 +3,10 @@ import AudioGraphExceptionBridge
 import CoreAudio
 import Testing
 
+// These checks instantiate AVAudioEngine and may consult the real HAL. Keep them out of the
+// authoritative unit suite; an explicit isolated dev-lane build may opt in with
+// -Xswiftc -DHOMAN_HARDWARE_TESTS.
+#if HOMAN_HARDWARE_TESTS
 @Suite("AVFAudio exception boundary")
 struct AudioGraphExceptionBridgeTests {
     @Test("input state reads return a format or a bridged error")
@@ -19,3 +23,4 @@ struct AudioGraphExceptionBridgeTests {
         #expect(error != nil)
     }
 }
+#endif

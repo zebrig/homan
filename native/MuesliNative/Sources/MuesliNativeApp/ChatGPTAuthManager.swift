@@ -26,11 +26,45 @@ enum ChatGPTAuthError: Error, LocalizedError {
     }
 }
 
+protocol ChatGPTLegacyCredentialStoring {
+    func read(service: String, account: String) -> String?
+    func delete(service: String, account: String)
+}
+
+struct SystemChatGPTLegacyCredentialStore: ChatGPTLegacyCredentialStoring {
+    func read(service: String, account: String) -> String? {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: true,
+            kSecReturnData as String: true,
+            kSecMatchLimit as String: kSecMatchLimitOne,
+        ]
+        var result: AnyObject?
+        let status = SecItemCopyMatching(query as CFDictionary, &result)
+        guard status == errSecSuccess, let data = result as? Data else { return nil }
+        return String(data: data, encoding: .utf8)
+    }
+
+    func delete(service: String, account: String) {
+        let query: [String: Any] = [
+            kSecClass as String: kSecClassGenericPassword,
+            kSecAttrService as String: service,
+            kSecAttrAccount as String: account,
+            kSecUseDataProtectionKeychain as String: true,
+        ]
+        SecItemDelete(query as CFDictionary)
+    }
+}
+
 @MainActor
 final class ChatGPTAuthManager {
     static let shared = ChatGPTAuthManager(
         supportDirectory: AppIdentity.supportDirectoryURL,
-        migrateLegacyKeychain: !AppIdentity.isRunningTests
+        legacyCredentialStore: AppIdentity.isRunningTests ? nil : SystemChatGPTLegacyCredentialStore(),
+        migrateLegacyKeychain: !AppIdentity.isRunningTests,
+        allowLegacyKeychainMutation: !AppIdentity.isRunningTests
     )
 
     private static let clientID = "app_EMoamEEZ73f0CkXaXp7hrann"
@@ -41,9 +75,18 @@ final class ChatGPTAuthManager {
     private static let callbackTimeoutSeconds: TimeInterval = 300 // 5 minutes
 
     private let tokenFileURL: URL
+    private let legacyCredentialStore: ChatGPTLegacyCredentialStoring?
+    private let allowLegacyKeychainMutation: Bool
 
-    init(supportDirectory: URL, migrateLegacyKeychain: Bool = false) {
+    init(
+        supportDirectory: URL,
+        legacyCredentialStore: ChatGPTLegacyCredentialStoring? = nil,
+        migrateLegacyKeychain: Bool = false,
+        allowLegacyKeychainMutation: Bool = false
+    ) {
         tokenFileURL = supportDirectory.appendingPathComponent("chatgpt-auth.json")
+        self.legacyCredentialStore = legacyCredentialStore
+        self.allowLegacyKeychainMutation = allowLegacyKeychainMutation
         if migrateLegacyKeychain {
             migrateFromKeychain()
         }
@@ -65,9 +108,10 @@ final class ChatGPTAuthManager {
 
     func signOut() {
         deleteTokens()
-        // Also clean up legacy keychain entries
-        for account in ["access_token", "refresh_token", "expires_at", "account_id"] {
-            keychainDeleteLegacy(account: account)
+        if allowLegacyKeychainMutation {
+            for account in ["access_token", "refresh_token", "expires_at", "account_id"] {
+                legacyCredentialStore?.delete(service: Self.keychainService, account: account)
+            }
         }
         fputs("[chatgpt-auth] signed out\n", stderr)
     }
@@ -382,7 +426,8 @@ final class ChatGPTAuthManager {
 
     // MARK: - File-based Token Storage
 
-    private func saveTokens(_ tokens: TokenResponse) {
+    @discardableResult
+    private func saveTokens(_ tokens: TokenResponse) -> Bool {
         let dict: [String: String] = [
             "access_token": tokens.accessToken,
             "refresh_token": tokens.refreshToken,
@@ -399,8 +444,10 @@ final class ChatGPTAuthManager {
             resourceValues.isExcludedFromBackup = true
             var fileURL = tokenFileURL
             try fileURL.setResourceValues(resourceValues)
+            return true
         } catch {
             fputs("[chatgpt-auth] failed to save tokens: \(error)\n", stderr)
+            return false
         }
     }
 
@@ -425,10 +472,23 @@ final class ChatGPTAuthManager {
         guard !FileManager.default.fileExists(atPath: tokenFileURL.path) else { return }
 
         // Try reading from legacy keychain
-        guard let accessToken = keychainReadLegacy(account: "access_token") else { return }
-        let refreshToken = keychainReadLegacy(account: "refresh_token") ?? ""
-        let expiresAt = keychainReadLegacy(account: "expires_at") ?? "0"
-        let accountId = keychainReadLegacy(account: "account_id") ?? ""
+        guard let legacyCredentialStore,
+              let accessToken = legacyCredentialStore.read(
+                service: Self.keychainService,
+                account: "access_token"
+              ) else { return }
+        let refreshToken = legacyCredentialStore.read(
+            service: Self.keychainService,
+            account: "refresh_token"
+        ) ?? ""
+        let expiresAt = legacyCredentialStore.read(
+            service: Self.keychainService,
+            account: "expires_at"
+        ) ?? "0"
+        let accountId = legacyCredentialStore.read(
+            service: Self.keychainService,
+            account: "account_id"
+        ) ?? ""
 
         let tokens = TokenResponse(
             accessToken: accessToken,
@@ -436,38 +496,17 @@ final class ChatGPTAuthManager {
             expiresAtMs: Double(expiresAt) ?? 0,
             accountId: accountId
         )
-        saveTokens(tokens)
+        guard saveTokens(tokens) else {
+            fputs("[chatgpt-auth] keychain migration kept legacy tokens because file storage failed\n", stderr)
+            return
+        }
 
-        // Clean up keychain entries
-        for account in ["access_token", "refresh_token", "expires_at", "account_id"] {
-            keychainDeleteLegacy(account: account)
+        if allowLegacyKeychainMutation {
+            for account in ["access_token", "refresh_token", "expires_at", "account_id"] {
+                legacyCredentialStore.delete(service: Self.keychainService, account: account)
+            }
         }
         fputs("[chatgpt-auth] migrated tokens from keychain to file\n", stderr)
-    }
-
-    private func keychainReadLegacy(account: String) -> String? {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: account,
-            kSecUseDataProtectionKeychain as String: true,
-            kSecReturnData as String: true,
-            kSecMatchLimit as String: kSecMatchLimitOne,
-        ]
-        var result: AnyObject?
-        let status = SecItemCopyMatching(query as CFDictionary, &result)
-        guard status == errSecSuccess, let data = result as? Data else { return nil }
-        return String(data: data, encoding: .utf8)
-    }
-
-    private func keychainDeleteLegacy(account: String) {
-        let query: [String: Any] = [
-            kSecClass as String: kSecClassGenericPassword,
-            kSecAttrService as String: Self.keychainService,
-            kSecAttrAccount as String: account,
-            kSecUseDataProtectionKeychain as String: true,
-        ]
-        SecItemDelete(query as CFDictionary)
     }
 }
 

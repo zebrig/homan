@@ -991,8 +991,12 @@ enum MeetingSummaryClient {
         let modelID = config.gemmaSummaryModel
         // Mirrors the cloud backends: when the backend is not actually configured
         // (model not downloaded), keep the raw transcript instead of failing.
-        guard GemmaSummaryModel.resolve(id: modelID).isDownloaded else {
-            return rawTranscriptFallback(transcript: transcript, meetingTitle: meetingTitle)
+        if let fallback = gemmaUnavailableFallback(
+            transcript: transcript,
+            meetingTitle: meetingTitle,
+            isModelDownloaded: GemmaSummaryModel.resolve(id: modelID).isDownloaded
+        ) {
+            return fallback
         }
         let settings = config.meetingSummaryGenerationSettings(
             backend: .gemmaLocal,
@@ -1021,6 +1025,15 @@ enum MeetingSummaryClient {
             modelID: modelID,
             settings: settings
         )
+    }
+
+    static func gemmaUnavailableFallback(
+        transcript: String,
+        meetingTitle: String,
+        isModelDownloaded: Bool
+    ) -> String? {
+        guard !isModelDownloaded else { return nil }
+        return rawTranscriptFallback(transcript: transcript, meetingTitle: meetingTitle)
     }
 
     static func customLLMRequiresAPIKey(config: AppConfig) -> Bool {

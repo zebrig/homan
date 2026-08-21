@@ -29,7 +29,7 @@ enum GoogleCalendarAuthError: Error, LocalizedError {
 
 @MainActor
 final class GoogleCalendarAuthManager {
-    static let shared = GoogleCalendarAuthManager()
+    static let shared = GoogleCalendarAuthManager(loadCredentials: !AppIdentity.isRunningTests)
 
     private static let authURL = "https://accounts.google.com/o/oauth2/v2/auth"
     private static let tokenURL = "https://oauth2.googleapis.com/token"
@@ -43,8 +43,8 @@ final class GoogleCalendarAuthManager {
         AppIdentity.supportDirectoryURL.appendingPathComponent("google-calendar-auth.json")
     }
 
-    private init() {
-        credentials = GoogleCalendarCredentials.load()
+    private init(loadCredentials: Bool) {
+        credentials = loadCredentials ? GoogleCalendarCredentials.load() : nil
     }
 
     // MARK: - Public API

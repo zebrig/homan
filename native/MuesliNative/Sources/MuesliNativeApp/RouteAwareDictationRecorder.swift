@@ -58,14 +58,23 @@ final class RouteAwareDictationRecorder: DictationAudioRecording {
     private var activeRecorderKindStorage: ActiveRecorderKind = .systemDefault
 
     init(
-        systemDefaultRecorder: DictationAudioRecording = AppScopedDictationRecorder(),
-        appScopedRecorder: DictationAudioRecording = AppScopedDictationRecorder(),
+        systemDefaultRecorder: DictationAudioRecording = AppIdentity.isRunningTests
+            ? InertDictationAudioRecorder()
+            : AppScopedDictationRecorder(),
+        appScopedRecorder: DictationAudioRecording = AppIdentity.isRunningTests
+            ? InertDictationAudioRecorder()
+            : AppScopedDictationRecorder(),
         lifecycleQueue: DispatchQueue = DispatchQueue(label: "com.muesli.route-aware-dictation-recorder-lifecycle")
     ) {
         self.systemDefaultRecorder = systemDefaultRecorder
         self.appScopedRecorder = appScopedRecorder
         self.lifecycleQueue = lifecycleQueue
         wireCallbacks()
+    }
+
+    var usesInertChildrenForTesting: Bool {
+        systemDefaultRecorder is InertDictationAudioRecorder &&
+            appScopedRecorder is InertDictationAudioRecorder
     }
 
     func activeRecorderKindForDebug() -> ActiveRecorderKind {

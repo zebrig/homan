@@ -7,6 +7,12 @@ protocol MediaPlaybackManaging: AnyObject {
     func restoreDictationMediaPause()
 }
 
+/// Fail-closed media control for test processes. It never loads MediaRemote or posts HID events.
+final class InertMediaPlaybackController: MediaPlaybackManaging {
+    func beginDictationMediaPause(enabled: Bool, routeKind: AudioOutputRouteKind) {}
+    func restoreDictationMediaPause() {}
+}
+
 /// Actual playback state of the system now-playing application, as opposed to
 /// `AudioOutputActivityStatus`, which only reflects whether an app's audio
 /// output pipeline is running. Browsers and most video players keep their

@@ -36,7 +36,13 @@ struct MeetingsNavigationTests {
                 bundlePath: nil
             ),
             dictationStore: dictationStore,
-            configStore: configStore ?? ConfigStore(supportDirectory: makeSupportDirectory())
+            configStore: configStore ?? ConfigStore(supportDirectory: makeSupportDirectory()),
+            audioDuckingController: InertAudioDuckingController(),
+            dictationAudioRoutingController: InertDictationAudioRouteController(),
+            calendarMonitor: nil,
+            meetingMonitor: nil,
+            featureTourStore: nil,
+            runtimeSideEffectsEnabled: false
         )
     }
 
@@ -79,6 +85,16 @@ struct MeetingsNavigationTests {
 
         #expect(appState.meetingsNavigationState == .browser)
         #expect(appState.selectedMeeting == nil)
+    }
+
+    @Test("test controller constructs no hardware audio runtime")
+    func testControllerUsesInertRuntimeDependencies() {
+        let controller = makeController()
+
+        #expect(controller.usesInertRuntimeDependenciesForTesting)
+        controller.start()
+        controller.shutdown()
+        #expect(controller.usesInertRuntimeDependenciesForTesting)
     }
 
     @Test("each dashboard statistic opens insights with its originating section")

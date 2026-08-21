@@ -1,5 +1,4 @@
 import Testing
-import EventKit
 import Foundation
 import MuesliCore
 @testable import MuesliNativeApp
@@ -173,24 +172,23 @@ struct GoogleCalendarTests {
 
     @Test("EventKit one-off event identity survives rescheduling")
     func eventKitOneOffIdentitySurvivesRescheduling() {
-        let eventStore = EKEventStore()
-        let event = EKEvent(eventStore: eventStore)
         let originalStart = date("2026-04-10T14:00:00Z")
-        event.startDate = originalStart
-        event.endDate = originalStart.addingTimeInterval(30 * 60)
-
         let originalReference = CalendarMonitor.occurrenceReference(
-            for: event,
+            calendarID: nil,
             eventID: "one-off-event",
+            isRecurring: false,
+            externalIdentifier: nil,
+            occurrenceDate: nil,
             startDate: originalStart
         )
 
         let movedStart = originalStart.addingTimeInterval(90 * 60)
-        event.startDate = movedStart
-        event.endDate = movedStart.addingTimeInterval(30 * 60)
         let movedReference = CalendarMonitor.occurrenceReference(
-            for: event,
+            calendarID: nil,
             eventID: "one-off-event",
+            isRecurring: false,
+            externalIdentifier: nil,
+            occurrenceDate: nil,
             startDate: movedStart
         )
 
@@ -200,26 +198,21 @@ struct GoogleCalendarTests {
     }
 
     @Test("EventKit recurrence uses the server-stable series identifier")
-    func eventKitRecurrenceUsesExternalSeriesIdentifier() throws {
-        let eventStore = EKEventStore()
-        let event = EKEvent(eventStore: eventStore)
+    func eventKitRecurrenceUsesExternalSeriesIdentifier() {
         let start = date("2026-04-10T14:00:00Z")
-        event.startDate = start
-        event.endDate = start.addingTimeInterval(30 * 60)
-        event.addRecurrenceRule(
-            EKRecurrenceRule(recurrenceWith: .daily, interval: 1, end: nil)
-        )
-
-        let externalIdentifier = try #require(event.calendarItemExternalIdentifier)
+        let externalIdentifier = "server-stable-series-id"
         let reference = CalendarMonitor.occurrenceReference(
-            for: event,
+            calendarID: "work",
             eventID: "store-local-event-id",
+            isRecurring: true,
+            externalIdentifier: externalIdentifier,
+            occurrenceDate: start,
             startDate: start
         )
 
         #expect(reference.seriesID == externalIdentifier)
         #expect(reference.seriesID != reference.eventID)
-        #expect(reference.originalStartTime == event.occurrenceDate)
+        #expect(reference.originalStartTime == start)
     }
 
     // MARK: - Merge & dedup
@@ -407,7 +400,13 @@ struct GoogleCalendarTests {
             configStore: ConfigStore(
                 supportDirectory: FileManager.default.temporaryDirectory
                     .appendingPathComponent("homan-calendar-test-\(UUID().uuidString)", isDirectory: true)
-            )
+            ),
+            audioDuckingController: InertAudioDuckingController(),
+            dictationAudioRoutingController: InertDictationAudioRouteController(),
+            calendarMonitor: nil,
+            meetingMonitor: nil,
+            featureTourStore: nil,
+            runtimeSideEffectsEnabled: false
         )
         let firstStart = date("2026-04-10T14:00:00Z")
         let firstOccurrence = CalendarOccurrenceReference(

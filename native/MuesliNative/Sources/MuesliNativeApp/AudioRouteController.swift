@@ -163,6 +163,27 @@ extension DictationAudioRouting {
     }
 }
 
+/// Process-local no-op routing used when the package test runner constructs an app controller
+/// without supplying a fake. It deliberately performs no CoreAudio queries or listener installs.
+final class InertDictationAudioRouteController: DictationAudioRouting {
+    var onPreferredInputDeviceChanged: ((AudioObjectID?) -> Void)?
+    var onMeetingPreferredInputDeviceChanged: ((AudioObjectID?) -> Void)?
+    var selectedInputDeviceUID: String?
+    var selectedMeetingInputDeviceUID: String?
+
+    func refreshRouteCache() {}
+    func preferredInputDeviceIDForDictation() -> AudioObjectID? { nil }
+    func preferredInputDeviceIDForMeeting() -> AudioObjectID? { nil }
+    func cachedPreferredInputDeviceIDForDictation() -> AudioObjectID? { nil }
+    func availableInputDevices() -> [AudioInputDeviceInfo] { [] }
+    func cachedAvailableInputDevices() -> [AudioInputDeviceInfo] { [] }
+    func isDefaultOutputHeadphoneLike() -> Bool { false }
+    func currentOutputRouteKindForDebug() -> AudioOutputRouteKind { .unknown }
+    func currentRouteDebugDescription() -> String { "output=unknown input=isolated-test" }
+    func systemDefaultInputIsBuiltInForDictation() -> Bool { false }
+    func refreshRouteAfterDictationSession() {}
+}
+
 final class DictationAudioRouteController: DictationAudioRouting {
     private struct RouteSnapshot {
         var outputRouteKind: AudioOutputRouteKind = .unknown

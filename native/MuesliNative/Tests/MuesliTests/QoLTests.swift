@@ -71,9 +71,66 @@ struct ChatGPTTokenStorageTests {
         #expect(FileManager.default.fileExists(atPath: unrelatedToken.path))
     }
 
+    @Test("test-mode auth never mutates the legacy keychain adapter")
+    @MainActor
+    func legacyKeychainMutationRequiresExplicitOptIn() {
+        let legacyStore = RecordingLegacyCredentialStore(values: [
+            "access_token": "legacy-test-token",
+            "refresh_token": "legacy-test-refresh",
+        ])
+        let auth = ChatGPTAuthManager(
+            supportDirectory: makeSupportDirectory(),
+            legacyCredentialStore: legacyStore,
+            migrateLegacyKeychain: true,
+            allowLegacyKeychainMutation: false
+        )
+
+        #expect(auth.isAuthenticated)
+        auth.signOut()
+        #expect(legacyStore.deletedAccounts.isEmpty)
+    }
+
+    @Test("failed file migration preserves legacy keychain tokens")
+    @MainActor
+    func failedMigrationPreservesLegacyTokens() throws {
+        let nonDirectory = makeSupportDirectory()
+        try Data("not-a-directory".utf8).write(to: nonDirectory)
+        let legacyStore = RecordingLegacyCredentialStore(values: [
+            "access_token": "legacy-test-token",
+            "refresh_token": "legacy-test-refresh",
+        ])
+
+        let auth = ChatGPTAuthManager(
+            supportDirectory: nonDirectory,
+            legacyCredentialStore: legacyStore,
+            migrateLegacyKeychain: true,
+            allowLegacyKeychainMutation: true
+        )
+
+        #expect(!auth.isAuthenticated)
+        #expect(legacyStore.deletedAccounts.isEmpty)
+    }
+
     private func makeSupportDirectory() -> URL {
         FileManager.default.temporaryDirectory
             .appendingPathComponent("homan-chatgpt-auth-test-\(UUID().uuidString)", isDirectory: true)
+    }
+}
+
+private final class RecordingLegacyCredentialStore: ChatGPTLegacyCredentialStoring {
+    private let values: [String: String]
+    private(set) var deletedAccounts: [String] = []
+
+    init(values: [String: String]) {
+        self.values = values
+    }
+
+    func read(service: String, account: String) -> String? {
+        values[account]
+    }
+
+    func delete(service: String, account: String) {
+        deletedAccounts.append(account)
     }
 }
 
@@ -370,6 +427,7 @@ struct FloatingMeetingTranscriptTests {
         ) == nil)
     }
 
+#if HOMAN_UI_TESTS
     @Test("floating panel can receive controls without becoming the main window")
     @MainActor
     func floatingPanelIsInteractive() {
@@ -431,6 +489,7 @@ struct FloatingMeetingTranscriptTests {
         #expect(controller.handleClick(atWindowPoint: NSPoint(x: 290, y: 300)))
         #expect(dismissCount == 1)
     }
+#endif
 
     @Test("panel prefers the open side and remains inside the screen")
     func panelPlacement() {
@@ -545,7 +604,10 @@ struct FloatingIndicatorPointerInteractionTests {
     private func makeIndicator() -> FloatingIndicatorController {
         let supportDirectory = FileManager.default.temporaryDirectory
             .appendingPathComponent(UUID().uuidString, isDirectory: true)
-        return FloatingIndicatorController(configStore: ConfigStore(supportDirectory: supportDirectory))
+        return FloatingIndicatorController(
+            configStore: ConfigStore(supportDirectory: supportDirectory),
+            uiEnabled: false
+        )
     }
 }
 

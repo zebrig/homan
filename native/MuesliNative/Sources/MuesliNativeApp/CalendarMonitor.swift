@@ -206,15 +206,33 @@ final class CalendarMonitor {
         startDate: Date
     ) -> CalendarOccurrenceReference {
         let isRecurring = event.hasRecurrenceRules || event.isDetached
-        return CalendarOccurrenceReference(
-            provider: .eventKit,
+        return occurrenceReference(
             calendarID: event.calendar?.calendarIdentifier,
             eventID: eventID,
+            isRecurring: isRecurring,
+            externalIdentifier: event.calendarItemExternalIdentifier,
+            occurrenceDate: event.occurrenceDate,
+            startDate: startDate
+        )
+    }
+
+    static func occurrenceReference(
+        calendarID: String?,
+        eventID: String,
+        isRecurring: Bool,
+        externalIdentifier: String?,
+        occurrenceDate: Date?,
+        startDate: Date
+    ) -> CalendarOccurrenceReference {
+        return CalendarOccurrenceReference(
+            provider: .eventKit,
+            calendarID: calendarID,
+            eventID: eventID,
             seriesID: isRecurring
-                ? (event.calendarItemExternalIdentifier ?? eventID)
+                ? (externalIdentifier ?? eventID)
                 : nil,
             originalStartTime: isRecurring
-                ? (event.occurrenceDate ?? startDate)
+                ? (occurrenceDate ?? startDate)
                 : startDate
         )
     }
