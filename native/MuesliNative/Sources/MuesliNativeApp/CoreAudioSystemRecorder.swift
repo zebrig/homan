@@ -32,6 +32,7 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         "com.zebrig.homan.system-audio-tap",
         "com.zebrig.homan.system-audio-tap-fallback",
     ]
+    static let disableOutputTapRebuildExperimentKey = "HOMAN_DEV_DISABLE_OUTPUT_TAP_REBUILD"
 
     var onPCMSamples: (([Int16]) -> Void)?
     var onNativeAudioChunk: ((CapturedAudioChunk) -> Void)?
@@ -52,6 +53,8 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
     private var outputURL: URL?
     private var totalBytesWritten = 0
     private var activeCaptureGeneration: UInt64 = 0
+    private var activeGraphOperationID: UUID?
+    private var activeGraphCleanupHadFailure = false
     private let recordingFlag = ManagedAtomic(false)
     private let pausedFlag = ManagedAtomic(false)
     private let processedAudioFlag = ManagedAtomic(true)
@@ -188,6 +191,19 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
     // MARK: - Tap + Aggregate Device Setup
 
     private func createTapAndAggregateDevice() throws {
+        let graphOperationID = UUID()
+        activeGraphOperationID = graphOperationID
+        activeGraphCleanupHadFailure = false
+        activeCaptureGeneration &+= 1
+        AudioLifecycleDiagnostics.emit(
+            .info,
+            operation: "system_graph_create_begin",
+            operationID: graphOperationID,
+            generation: activeCaptureGeneration,
+            routeRole: "system_audio",
+            status: "starting"
+        )
+
         // Use the global stereo process mix. This is the closest CoreAudio tap
         // equivalent to ScreenCaptureKit's "system audio" stream: all process
         // output mixed to stereo, excluding Homan itself. The previous
@@ -234,7 +250,22 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
             )
         }
         guard status == noErr, aggregateDeviceID != kAudioObjectUnknown else {
+            let rollbackStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
             let destroyTapStatus = AudioHardwareDestroyProcessTap(tapID)
+            AudioLifecycleDiagnostics.emit(
+                destroyTapStatus == noErr ? .info : .error,
+                operation: "system_tap_rollback",
+                operationID: graphOperationID,
+                generation: activeCaptureGeneration,
+                routeRole: "system_audio",
+                deviceID: tapID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(
+                    since: rollbackStartedAt
+                ),
+                status: destroyTapStatus == noErr ? "success" : "failure",
+                osStatus: destroyTapStatus
+            )
+            activeGraphCleanupHadFailure = destroyTapStatus != noErr
             if destroyTapStatus != noErr {
                 fputs(
                     "[system-audio] failed to roll back process tap after aggregate creation "
@@ -288,10 +319,19 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         ]
     }
 
+    static func shouldInstallDefaultOutputDeviceListener(
+        bundleIdentifier: String?,
+        environment: [String: String]
+    ) -> Bool {
+        let namedDevLaneBundleIDs = ["com.muesli.dev.a", "com.muesli.dev.b", "com.muesli.dev.c"]
+        guard let bundleIdentifier,
+              namedDevLaneBundleIDs.contains(bundleIdentifier) else { return true }
+        return environment[disableOutputTapRebuildExperimentKey] != "1"
+    }
+
     private func setupAndStartAudioDevice() throws {
         let format = sourceFormat
         configureResampler(for: format)
-        activeCaptureGeneration &+= 1
         let generation = activeCaptureGeneration
         let block: AudioDeviceIOBlock = { [weak self] _, inputData, inputTime, _, _ in
             guard let self, self.isRecording, !self.isPaused else { return }
@@ -336,7 +376,22 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         do {
             try osCheck(AudioDeviceStart(aggregateDeviceID, procID), "start aggregate device")
         } catch {
-            AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            let destroyStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
+            let destroyStatus = AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            AudioLifecycleDiagnostics.emit(
+                destroyStatus == noErr ? .info : .error,
+                operation: "system_ioproc_start_rollback",
+                operationID: activeGraphOperationID,
+                generation: activeCaptureGeneration,
+                routeRole: "system_audio",
+                deviceID: aggregateDeviceID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(
+                    since: destroyStartedAt
+                ),
+                status: destroyStatus == noErr ? "success" : "failure",
+                osStatus: destroyStatus
+            )
+            activeGraphCleanupHadFailure = activeGraphCleanupHadFailure || destroyStatus != noErr
             deviceIOProcID = nil
             deviceIOBlock = nil
             throw error
@@ -648,7 +703,18 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         var testTapID: AudioObjectID = kAudioObjectUnknown
         let status = AudioHardwareCreateProcessTap(tapDesc, &testTapID)
         if status == noErr, testTapID != kAudioObjectUnknown {
-            AudioHardwareDestroyProcessTap(testTapID)
+            let destroyStatus = AudioHardwareDestroyProcessTap(testTapID)
+            if destroyStatus != noErr {
+                AudioLifecycleDiagnostics.emit(
+                    .error,
+                    operation: "system_permission_tap_destroy",
+                    operationID: UUID(),
+                    routeRole: "permission_probe",
+                    deviceID: testTapID,
+                    status: "failure",
+                    osStatus: destroyStatus
+                )
+            }
             return true
         }
         return false
@@ -784,12 +850,38 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
 
             if (name.takeRetainedValue() as String) == "Homan System Audio" {
                 fputs("[system-audio] cleaning up stale aggregate device \(deviceID)\n", stderr)
-                AudioHardwareDestroyAggregateDevice(deviceID)
+                let operationID = UUID()
+                let startedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
+                let status = AudioHardwareDestroyAggregateDevice(deviceID)
+                AudioLifecycleDiagnostics.emit(
+                    status == noErr ? .notice : .error,
+                    operation: "system_stale_aggregate_destroy",
+                    operationID: operationID,
+                    routeRole: "system_audio",
+                    deviceID: deviceID,
+                    durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: startedAt),
+                    status: status == noErr ? "success" : "failure",
+                    osStatus: status
+                )
             }
         }
     }
 
     private func installDefaultOutputDeviceListener() {
+        guard Self.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: Bundle.main.bundleIdentifier,
+            environment: ProcessInfo.processInfo.environment
+        ) else {
+            AudioLifecycleDiagnostics.emit(
+                .notice,
+                operation: "system_output_listener_install",
+                operationID: activeGraphOperationID,
+                generation: activeCaptureGeneration,
+                routeRole: "system_audio",
+                status: "disabled_named_dev_lane_experiment"
+            )
+            return
+        }
         guard defaultOutputDeviceListenerBlock == nil else { return }
 
         let block: AudioObjectPropertyListenerBlock = { [weak self] _, _ in
@@ -804,12 +896,23 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        AudioObjectAddPropertyListenerBlock(
+        let status = AudioObjectAddPropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
             &address,
             nil,
             block
         )
+        if status != noErr {
+            AudioLifecycleDiagnostics.emit(
+                .error,
+                operation: "system_output_listener_install",
+                operationID: activeGraphOperationID,
+                generation: activeCaptureGeneration,
+                routeRole: "system_audio",
+                status: "failure",
+                osStatus: status
+            )
+        }
     }
 
     private func removeDefaultOutputDeviceListener() {
@@ -819,12 +922,23 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
             mScope: kAudioObjectPropertyScopeGlobal,
             mElement: kAudioObjectPropertyElementMain
         )
-        AudioObjectRemovePropertyListenerBlock(
+        let status = AudioObjectRemovePropertyListenerBlock(
             AudioObjectID(kAudioObjectSystemObject),
             &address,
             nil,
             block
         )
+        if status != noErr {
+            AudioLifecycleDiagnostics.emit(
+                .error,
+                operation: "system_output_listener_remove",
+                operationID: activeGraphOperationID,
+                generation: activeCaptureGeneration,
+                routeRole: "system_audio",
+                status: "failure",
+                osStatus: status
+            )
+        }
         defaultOutputDeviceListenerBlock = nil
     }
 
@@ -887,14 +1001,52 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
     }
 
     private func teardownTapAndAudioDevice() {
+        let graphOperationID = activeGraphOperationID ?? UUID()
+        let teardownGeneration = activeCaptureGeneration
+        let teardownStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
+        var teardownFailed = activeGraphCleanupHadFailure
+        AudioLifecycleDiagnostics.emit(
+            .info,
+            operation: "system_graph_teardown_begin",
+            operationID: graphOperationID,
+            generation: teardownGeneration,
+            routeRole: "system_audio",
+            status: "starting"
+        )
+
         activeCaptureGeneration &+= 1
         resampler = nil
         resamplerInputFormat = nil
         resamplerOutputFormat = nil
 
         if let procID = deviceIOProcID, aggregateDeviceID != kAudioObjectUnknown {
+            let stopStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
             let stopStatus = AudioDeviceStop(aggregateDeviceID, procID)
+            AudioLifecycleDiagnostics.emit(
+                stopStatus == noErr ? .info : .error,
+                operation: "system_ioproc_stop",
+                operationID: graphOperationID,
+                generation: teardownGeneration,
+                routeRole: "system_audio",
+                deviceID: aggregateDeviceID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: stopStartedAt),
+                status: stopStatus == noErr ? "success" : "failure",
+                osStatus: stopStatus
+            )
+            let destroyStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
             let destroyProcStatus = AudioDeviceDestroyIOProcID(aggregateDeviceID, procID)
+            AudioLifecycleDiagnostics.emit(
+                destroyProcStatus == noErr ? .info : .error,
+                operation: "system_ioproc_destroy",
+                operationID: graphOperationID,
+                generation: teardownGeneration,
+                routeRole: "system_audio",
+                deviceID: aggregateDeviceID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: destroyStartedAt),
+                status: destroyProcStatus == noErr ? "success" : "failure",
+                osStatus: destroyProcStatus
+            )
+            teardownFailed = teardownFailed || stopStatus != noErr || destroyProcStatus != noErr
             if stopStatus != noErr || destroyProcStatus != noErr {
                 fputs(
                     "[system-audio] teardown IO stop/destroy failed "
@@ -908,7 +1060,21 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         deviceIOBlock = nil
 
         if aggregateDeviceID != kAudioObjectUnknown {
+            let aggregateID = aggregateDeviceID
+            let destroyStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
             let destroyStatus = AudioHardwareDestroyAggregateDevice(aggregateDeviceID)
+            AudioLifecycleDiagnostics.emit(
+                destroyStatus == noErr ? .info : .error,
+                operation: "system_aggregate_destroy",
+                operationID: graphOperationID,
+                generation: teardownGeneration,
+                routeRole: "system_audio",
+                deviceID: aggregateID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: destroyStartedAt),
+                status: destroyStatus == noErr ? "success" : "failure",
+                osStatus: destroyStatus
+            )
+            teardownFailed = teardownFailed || destroyStatus != noErr
             if destroyStatus != noErr {
                 fputs(
                     "[system-audio] failed to destroy aggregate device "
@@ -920,7 +1086,21 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
         }
 
         if tapID != kAudioObjectUnknown {
+            let retiringTapID = tapID
+            let destroyStartedAt = AudioLifecycleDiagnostics.monotonicNowNanoseconds()
             let destroyTapStatus = AudioHardwareDestroyProcessTap(tapID)
+            AudioLifecycleDiagnostics.emit(
+                destroyTapStatus == noErr ? .info : .error,
+                operation: "system_tap_destroy",
+                operationID: graphOperationID,
+                generation: teardownGeneration,
+                routeRole: "system_audio",
+                deviceID: retiringTapID,
+                durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: destroyStartedAt),
+                status: destroyTapStatus == noErr ? "success" : "failure",
+                osStatus: destroyTapStatus
+            )
+            teardownFailed = teardownFailed || destroyTapStatus != noErr
             if destroyTapStatus != noErr {
                 fputs(
                     "[system-audio] failed to destroy process tap \(tapID) "
@@ -930,6 +1110,17 @@ final class CoreAudioSystemRecorder: SystemAudioCapturing, SystemAudioDiagnostic
             }
             tapID = kAudioObjectUnknown
         }
+        activeGraphOperationID = nil
+        activeGraphCleanupHadFailure = false
+        AudioLifecycleDiagnostics.emit(
+            teardownFailed ? .error : .info,
+            operation: "system_graph_teardown_end",
+            operationID: graphOperationID,
+            generation: teardownGeneration,
+            routeRole: "system_audio",
+            durationMilliseconds: AudioLifecycleDiagnostics.elapsedMilliseconds(since: teardownStartedAt),
+            status: teardownFailed ? "failure" : "success"
+        )
     }
 
     private func cleanupFailedStart() {

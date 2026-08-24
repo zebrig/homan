@@ -48,14 +48,28 @@ final class MeetingRecordingLeaseRegistry: @unchecked Sendable {
     private let state = OSAllocatedUnfairLock(initialState: State())
 
     func acquireRead(for key: MeetingRecordingLeaseKey) -> MeetingRecordingLease? {
+        acquireReads(for: [key])
+    }
+
+    /// Acquires one composite reader for every unique key while holding a
+    /// single registry lock. If any member is being deleted, no reader count is
+    /// changed, so callers never expose a partially protected recording set.
+    func acquireReads<S: Sequence>(
+        for keys: S
+    ) -> MeetingRecordingLease? where S.Element == MeetingRecordingLeaseKey {
+        let uniqueKeys = Array(Set(keys))
         let acquired = state.withLock { state in
-            guard !state.deleting.contains(key) else { return false }
-            state.readers[key, default: 0] += 1
+            guard uniqueKeys.allSatisfy({ !state.deleting.contains($0) }) else {
+                return false
+            }
+            for key in uniqueKeys {
+                state.readers[key, default: 0] += 1
+            }
             return true
         }
         guard acquired else { return nil }
         return MeetingRecordingLease { [weak self] in
-            self?.releaseRead(for: key)
+            self?.releaseReads(for: uniqueKeys)
         }
     }
 
@@ -80,13 +94,15 @@ final class MeetingRecordingLeaseRegistry: @unchecked Sendable {
         }
     }
 
-    private func releaseRead(for key: MeetingRecordingLeaseKey) {
+    private func releaseReads(for keys: [MeetingRecordingLeaseKey]) {
         state.withLock { state in
-            let count = state.readers[key, default: 0]
-            if count <= 1 {
-                state.readers.removeValue(forKey: key)
-            } else {
-                state.readers[key] = count - 1
+            for key in keys {
+                let count = state.readers[key, default: 0]
+                if count <= 1 {
+                    state.readers.removeValue(forKey: key)
+                } else {
+                    state.readers[key] = count - 1
+                }
             }
         }
     }

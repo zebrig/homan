@@ -42,6 +42,36 @@ struct MeetingRawAudioPostProcessorTests {
         #expect(processor.nonZeroReferenceFrames == 1)
     }
 
+    @Test("microphone-only raw audio never fabricates a system reference")
+    func microphoneOnlyHasNoReference() async throws {
+        let support = try temporarySupportDirectory()
+        defer { try? FileManager.default.removeItem(at: support) }
+        let capture = try MeetingRawAudioCapture(
+            meetingID: 94,
+            startedAt: Date(),
+            timelineAnchorNanoseconds: 1_000,
+            finalModelID: .parakeetRealtimeEOU,
+            supportDirectory: support,
+            compactLosslessly: false
+        )
+        capture.append(
+            chunk(samples: [16_384, 16_384], timestamp: 1_000),
+            role: .microphone
+        )
+        let raw = try capture.finalize(endedAt: Date())
+        let prepared = try await MeetingRawAudioPostProcessor.renderProcessingView(
+            raw,
+            aec: MeetingNeuralAec(preloadedProcessor: DirectionalAecProcessor())
+        )
+        defer { prepared.removeTemporaryFiles() }
+
+        #expect(prepared.systemURL == nil)
+        #expect(prepared.aecDiagnostics.systemSamplesReceived == 0)
+        #expect(prepared.aecDiagnostics.fullReferenceFrames == 0)
+        #expect(prepared.aecDiagnostics.partialReferenceFrames == 0)
+        #expect(prepared.aecDiagnostics.missingReferenceFrames == 1)
+    }
+
     @Test("cancellation stops post-AEC processing and leaves raw capture recoverable")
     func cancellationStopsPostProcessing() async throws {
         let support = try temporarySupportDirectory()

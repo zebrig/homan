@@ -2,6 +2,7 @@ import Foundation
 
 public enum MeetingProcessingPhase: String, Codable, CaseIterable, Sendable, Equatable, Hashable {
     case preparingAudio = "preparing_audio"
+    case processingAudio = "processing_audio"
     case preparingRecording = "preparing_recording"
     case transcribing
     case preparingDiarizer = "preparing_diarizer"
@@ -15,6 +16,7 @@ public enum MeetingProcessingPhase: String, Codable, CaseIterable, Sendable, Equ
     public var displayLabel: String {
         switch self {
         case .preparingAudio: return "Preparing audio"
+        case .processingAudio: return "Processing audio"
         case .preparingRecording: return "Preparing recording"
         case .transcribing: return "Transcribing"
         case .preparingDiarizer: return "Preparing speaker model"
@@ -50,6 +52,7 @@ public enum MeetingProcessingOperation: String, Codable, CaseIterable, Sendable,
         case .finalization, .recovery:
             return [
                 .preparingAudio,
+                .processingAudio,
                 .preparingRecording,
                 .transcribing,
                 .generatingTitle,
@@ -58,7 +61,7 @@ public enum MeetingProcessingOperation: String, Codable, CaseIterable, Sendable,
                 .saving,
             ]
         case .retranscription:
-            return [.preparingAudio, .transcribing, .summarizing, .saving]
+            return [.preparingAudio, .processingAudio, .transcribing, .summarizing, .saving]
         case .rediarization:
             return [.preparingAudio, .preparingDiarizer, .diarizing, .applyingSpeakerLabels, .saving]
         case .resummarization:

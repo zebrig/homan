@@ -1,6 +1,7 @@
 import CoreAudio
 import Foundation
 import Testing
+import os
 @testable import MuesliNativeApp
 
 @Suite("RouteAwareMeetingMicRecorder", .serialized)
@@ -448,6 +449,7 @@ struct RouteAwareMeetingMicRecorderTests {
         let startedAt = Date()
         recorder.cancel()
         let elapsed = Date().timeIntervalSince(startedAt)
+        #expect(replacementCancelled.wait(timeout: .now() + 0.05) == .timedOut)
         allowStart.signal()
 
         #expect(elapsed < 0.2)
@@ -482,11 +484,439 @@ struct RouteAwareMeetingMicRecorderTests {
         let startedAt = Date()
         _ = recorder.stop()
         let elapsed = Date().timeIntervalSince(startedAt)
+        #expect(replacementCancelled.wait(timeout: .now() + 0.05) == .timedOut)
         allowStart.signal()
 
         #expect(elapsed < 0.2)
         #expect(system.stopCalls == 1)
         #expect(replacementCancelled.wait(timeout: .now() + 5) == .success)
+    }
+
+    @Test("blocked replacement start is not multiplied by later route requests")
+    func blockedReplacementStartDoesNotMultiplyPhysicalWorkers() throws {
+        let lifecycleQueue = DispatchQueue(label: "test.route-aware-meeting.blocked-start-bound")
+        let startEntered = DispatchSemaphore(value: 0)
+        let allowStart = DispatchSemaphore(value: 0)
+        let startReturned = DispatchSemaphore(value: 0)
+        let replacementCancelled = DispatchSemaphore(value: 0)
+        let factoryState = OSAllocatedUnfairLock(initialState: (count: 0, first: Optional<FakeMeetingMicRecorder>.none))
+        let system = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: system,
+            appScopedRecorderFactory: {
+                let replacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+                let index = factoryState.withLock { state -> Int in
+                    state.count += 1
+                    if state.first == nil {
+                        state.first = replacement
+                    }
+                    return state.count
+                }
+                if index == 1 {
+                    replacement.onStart = {
+                        startEntered.signal()
+                        _ = allowStart.wait(timeout: .now() + 10)
+                        startReturned.signal()
+                    }
+                    replacement.onCancel = { replacementCancelled.signal() }
+                }
+                return replacement
+            },
+            lifecycleQueue: lifecycleQueue,
+            handoffTimeout: 1,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler
+        )
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 100
+        #expect(startEntered.wait(timeout: .now() + 5) == .success)
+
+        for offset in 1...100 {
+            recorder.preferredInputDeviceID = AudioObjectID(100 + offset)
+        }
+        lifecycleQueue.sync {}
+
+        let factoryCalls = factoryState.withLock { $0.count }
+        #expect(factoryCalls == 1)
+
+        recorder.cancel()
+        allowStart.signal()
+        #expect(startReturned.wait(timeout: .now() + 5) == .success)
+        #expect(replacementCancelled.wait(timeout: .now() + 5) == .success)
+    }
+
+    @Test("blocked replacement prepare is not multiplied by later route requests")
+    func blockedReplacementPrepareDoesNotMultiplyPhysicalWorkers() throws {
+        let lifecycleQueue = DispatchQueue(label: "test.route-aware-meeting.blocked-prepare-bound")
+        let startGate = MeetingMicHandoffStartGate()
+        let prepareEntered = DispatchSemaphore(value: 0)
+        let allowPrepare = DispatchSemaphore(value: 0)
+        let prepareReturned = DispatchSemaphore(value: 0)
+        let factoryCalls = OSAllocatedUnfairLock(initialState: 0)
+        let system = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: system,
+            appScopedRecorderFactory: {
+                let replacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+                let index = factoryCalls.withLock { count -> Int in
+                    count += 1
+                    return count
+                }
+                if index == 1 {
+                    replacement.onPrepare = {
+                        prepareEntered.signal()
+                        _ = allowPrepare.wait(timeout: .now() + 10)
+                        prepareReturned.signal()
+                    }
+                }
+                return replacement
+            },
+            lifecycleQueue: lifecycleQueue,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 100
+        #expect(prepareEntered.wait(timeout: .now() + 5) == .success)
+
+        for offset in 1...100 {
+            recorder.preferredInputDeviceID = AudioObjectID(100 + offset)
+        }
+        lifecycleQueue.sync {}
+
+        #expect(factoryCalls.withLock { $0 } == 1)
+        #expect(startGate.unfinishedLeaseCountForDebug() == 1)
+
+        recorder.cancel()
+        allowPrepare.signal()
+        #expect(prepareReturned.wait(timeout: .now() + 5) == .success)
+        waitUntilSynchronously { startGate.unfinishedLeaseCountForDebug() == 0 }
+    }
+
+    @Test("signal before physical start return promotes only after return")
+    func signalBeforeStartReturnWaitsForPhysicalSuccess() throws {
+        let startGate = MeetingMicHandoffStartGate()
+        let startEntered = DispatchSemaphore(value: 0)
+        let allowStart = DispatchSemaphore(value: 0)
+        let system = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        let replacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        replacement.onStart = {
+            replacement.onRawPCMSamples?([8])
+            startEntered.signal()
+            _ = allowStart.wait(timeout: .now() + 10)
+        }
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: system,
+            appScopedRecorder: replacement,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+        var samples: [[Int16]] = []
+        recorder.onRawPCMSamples = { samples.append($0) }
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 91
+        #expect(startEntered.wait(timeout: .now() + 5) == .success)
+        system.onRawPCMSamples?([1])
+
+        #expect(recorder.activeRecorderKindForDebug() == .systemDefault)
+        #expect(samples == [[1]])
+
+        allowStart.signal()
+        waitUntilSynchronously { recorder.activeRecorderKindForDebug() == .appScoped }
+        waitUntilSynchronously { samples == [[1], [8]] }
+
+        #expect(samples == [[1], [8]])
+        _ = recorder.stop()
+    }
+
+    @Test("superseded blocked start hands off to the latest route after physical return")
+    func supersededBlockedStartContinuesWithLatestRoute() throws {
+        let lifecycleQueue = DispatchQueue(label: "test.route-aware-meeting.latest-after-return")
+        let startGate = MeetingMicHandoffStartGate()
+        let firstStartEntered = DispatchSemaphore(value: 0)
+        let allowFirstStart = DispatchSemaphore(value: 0)
+        let first = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        let second = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        first.onStart = {
+            firstStartEntered.signal()
+            _ = allowFirstStart.wait(timeout: .now() + 10)
+        }
+        var replacements = [first, second]
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorderFactory: { replacements.removeFirst() },
+            lifecycleQueue: lifecycleQueue,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 91
+        #expect(firstStartEntered.wait(timeout: .now() + 5) == .success)
+        recorder.preferredInputDeviceID = 92
+        lifecycleQueue.sync {}
+
+        #expect(second.startCalls == 0)
+        #expect(startGate.unfinishedLeaseCountForDebug() == 1)
+
+        allowFirstStart.signal()
+        waitUntilSynchronously { second.startCalls == 1 }
+        #expect(first.cancelCalls == 1)
+        #expect(second.preferredInputDeviceID == 92)
+
+        second.onRawPCMSamples?([4])
+        waitUntilSynchronously { recorder.diagnosticsSnapshot().preferredInputDeviceID == 92 }
+        _ = recorder.stop()
+    }
+
+    @Test("blocked A to B to A waits for B to return before refreshing A")
+    func blockedRoundTripToActiveRouteRemainsBounded() throws {
+        let lifecycleQueue = DispatchQueue(label: "test.route-aware-meeting.blocked-round-trip")
+        let startGate = MeetingMicHandoffStartGate()
+        let startEntered = DispatchSemaphore(value: 0)
+        let allowStart = DispatchSemaphore(value: 0)
+        let active = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        let blocked = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        let refreshedActive = FakeMeetingMicRecorder(kind: .systemDefaultStreaming)
+        blocked.onStart = {
+            startEntered.signal()
+            _ = allowStart.wait(timeout: .now() + 10)
+        }
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: active,
+            appScopedRecorder: blocked,
+            systemDefaultRecorderFactory: { refreshedActive },
+            lifecycleQueue: lifecycleQueue,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+        var samples: [[Int16]] = []
+        recorder.onRawPCMSamples = { samples.append($0) }
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 91
+        #expect(startEntered.wait(timeout: .now() + 5) == .success)
+        recorder.preferredInputDeviceID = nil
+        lifecycleQueue.sync {}
+
+        #expect(refreshedActive.prepareCalls == 0)
+        #expect(refreshedActive.startCalls == 0)
+        #expect(startGate.unfinishedLeaseCountForDebug() == 1)
+
+        blocked.onRawPCMSamples?([9])
+        active.onRawPCMSamples?([1])
+        lifecycleQueue.sync {}
+        #expect(samples == [[1]])
+        #expect(active.stopCalls == 0)
+
+        allowStart.signal()
+        waitUntilSynchronously { refreshedActive.startCalls == 1 }
+        #expect(blocked.cancelCalls == 1)
+        #expect(recorder.activeRecorderKindForDebug() == .systemDefault)
+
+        refreshedActive.onRawPCMSamples?([6])
+        waitUntilSynchronously { active.stopCalls == 1 }
+        _ = recorder.stop()
+    }
+
+    @Test("pause and resume cannot overtake a physically blocked replacement")
+    func pauseResumeWaitsForBlockedReplacementReturn() throws {
+        let startGate = MeetingMicHandoffStartGate()
+        let startEntered = DispatchSemaphore(value: 0)
+        let allowStart = DispatchSemaphore(value: 0)
+        let first = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        let second = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        first.onStart = {
+            startEntered.signal()
+            _ = allowStart.wait(timeout: .now() + 10)
+        }
+        let recorder = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorder: first,
+            appScopedRecorderFactory: { second },
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+
+        try recorder.start()
+        recorder.preferredInputDeviceID = 91
+        #expect(startEntered.wait(timeout: .now() + 5) == .success)
+
+        recorder.pause()
+        recorder.resume()
+        #expect(second.prepareCalls == 0)
+        #expect(second.startCalls == 0)
+
+        allowStart.signal()
+        waitUntilSynchronously { second.startCalls == 1 }
+        #expect(first.cancelCalls == 1)
+        _ = recorder.stop()
+    }
+
+    @Test("two waiting owners re-register and start across successive lease releases")
+    func twoWaitingOwnersEventuallyAcquireWithoutNewRouteEvents() throws {
+        let startGate = MeetingMicHandoffStartGate()
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let allowBlocker = DispatchSemaphore(value: 0)
+        let waiterEntered = DispatchSemaphore(value: 0)
+        let allowWaiter = DispatchSemaphore(value: 0)
+        let blockerReplacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        blockerReplacement.onStart = {
+            blockerEntered.signal()
+            _ = allowBlocker.wait(timeout: .now() + 10)
+        }
+        let blocker = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorder: blockerReplacement,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+
+        let secondLifecycle = DispatchQueue(label: "test.route-aware-meeting.waiter.second")
+        let thirdLifecycle = DispatchQueue(label: "test.route-aware-meeting.waiter.third")
+        let secondTimeouts = ManualMeetingMicHandoffTimeoutScheduler()
+        let thirdTimeouts = ManualMeetingMicHandoffTimeoutScheduler()
+        let secondReplacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        let thirdReplacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        for replacement in [secondReplacement, thirdReplacement] {
+            replacement.onStart = {
+                waiterEntered.signal()
+                _ = allowWaiter.wait(timeout: .now() + 10)
+            }
+        }
+        let second = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorderFactory: { secondReplacement },
+            lifecycleQueue: secondLifecycle,
+            handoffTimeoutScheduler: secondTimeouts.schedule,
+            handoffStartGate: startGate
+        )
+        let third = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorderFactory: { thirdReplacement },
+            lifecycleQueue: thirdLifecycle,
+            handoffTimeoutScheduler: thirdTimeouts.schedule,
+            handoffStartGate: startGate
+        )
+
+        try blocker.start()
+        try second.start()
+        try third.start()
+        blocker.preferredInputDeviceID = 90
+        #expect(blockerEntered.wait(timeout: .now() + 5) == .success)
+
+        second.preferredInputDeviceID = 91
+        third.preferredInputDeviceID = 92
+        secondLifecycle.sync {}
+        thirdLifecycle.sync {}
+
+        #expect(startGate.waiterCountForDebug() == 2)
+        #expect(second.routeTransitionSnapshot().attempt == 0)
+        #expect(third.routeTransitionSnapshot().attempt == 0)
+        #expect(secondTimeouts.scheduledCount == 0)
+        #expect(thirdTimeouts.scheduledCount == 0)
+
+        allowBlocker.signal()
+        #expect(waiterEntered.wait(timeout: .now() + 5) == .success)
+        waitUntilSynchronously {
+            secondReplacement.startCalls + thirdReplacement.startCalls == 1
+                && startGate.waiterCountForDebug() == 1
+        }
+
+        allowWaiter.signal()
+        #expect(waiterEntered.wait(timeout: .now() + 5) == .success)
+        allowWaiter.signal()
+        waitUntilSynchronously {
+            secondReplacement.startCalls == 1
+                && thirdReplacement.startCalls == 1
+                && startGate.unfinishedLeaseCountForDebug() == 0
+        }
+
+        blocker.cancel()
+        second.cancel()
+        third.cancel()
+    }
+
+    @Test("stopped gate waiter never starts after another owner releases")
+    func stoppedGateWaiterIsCancelled() throws {
+        let startGate = MeetingMicHandoffStartGate()
+        let blockerEntered = DispatchSemaphore(value: 0)
+        let allowBlocker = DispatchSemaphore(value: 0)
+        let blockerReplacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        blockerReplacement.onStart = {
+            blockerEntered.signal()
+            _ = allowBlocker.wait(timeout: .now() + 10)
+        }
+        let blocker = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorder: blockerReplacement,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+        let waiterLifecycle = DispatchQueue(label: "test.route-aware-meeting.stopped-waiter")
+        let waiterFactoryCalls = OSAllocatedUnfairLock(initialState: 0)
+        let waiter = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorderFactory: {
+                waiterFactoryCalls.withLock { $0 += 1 }
+                return FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+            },
+            lifecycleQueue: waiterLifecycle,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+
+        try blocker.start()
+        try waiter.start()
+        blocker.preferredInputDeviceID = 90
+        #expect(blockerEntered.wait(timeout: .now() + 5) == .success)
+        waiter.preferredInputDeviceID = 91
+        waiterLifecycle.sync {}
+        #expect(startGate.waiterCountForDebug() == 1)
+
+        waiter.cancel()
+        #expect(startGate.waiterCountForDebug() == 0)
+        allowBlocker.signal()
+        waitUntilSynchronously { startGate.unfinishedLeaseCountForDebug() == 0 }
+        Thread.sleep(forTimeInterval: 0.05)
+
+        #expect(waiterFactoryCalls.withLock { $0 } == 0)
+        blocker.cancel()
+    }
+
+    @Test("owner deallocation after blocked start still cancels the candidate")
+    func ownerDeallocationCleansUpReturnedCandidate() throws {
+        let startGate = MeetingMicHandoffStartGate()
+        let startEntered = DispatchSemaphore(value: 0)
+        let allowStart = DispatchSemaphore(value: 0)
+        let replacementCancelled = DispatchSemaphore(value: 0)
+        let replacement = FakeMeetingMicRecorder(kind: .appScopedAudioQueue)
+        replacement.onStart = {
+            startEntered.signal()
+            _ = allowStart.wait(timeout: .now() + 10)
+        }
+        replacement.onCancel = { replacementCancelled.signal() }
+
+        var recorder: RouteAwareMeetingMicRecorder? = RouteAwareMeetingMicRecorder(
+            systemDefaultRecorder: FakeMeetingMicRecorder(kind: .systemDefaultStreaming),
+            appScopedRecorder: replacement,
+            handoffTimeoutScheduler: disabledMeetingMicHandoffTimeoutScheduler,
+            handoffStartGate: startGate
+        )
+        let weakRecorder = WeakRouteAwareMeetingMicRecorder(recorder)
+
+        try recorder?.start()
+        recorder?.preferredInputDeviceID = 91
+        #expect(startEntered.wait(timeout: .now() + 5) == .success)
+
+        recorder = nil
+        #expect(weakRecorder.value == nil)
+        allowStart.signal()
+
+        #expect(replacementCancelled.wait(timeout: .now() + 5) == .success)
+        waitUntilSynchronously { startGate.unfinishedLeaseCountForDebug() == 0 }
     }
 
     @Test("handoff timeout runs while replacement start is blocked")
@@ -515,10 +945,11 @@ struct RouteAwareMeetingMicRecorderTests {
         recorder.preferredInputDeviceID = 92
         #expect(startEntered.wait(timeout: .now() + 5) == .success)
         #expect(timeoutScheduler.fireNext())
-        #expect(replacementCancelled.wait(timeout: .now() + 5) == .success)
+        #expect(replacementCancelled.wait(timeout: .now() + 0.05) == .timedOut)
 
         system.onRawPCMSamples?([7])
         allowStart.signal()
+        #expect(replacementCancelled.wait(timeout: .now() + 5) == .success)
         replacement.onRawPCMSamples?([9])
 
         #expect(samples == [[7]])
@@ -639,6 +1070,7 @@ struct RouteAwareMeetingMicRecorderTests {
         try recorder.start()
         recorder.preferredInputDeviceID = 91
         lifecycleQueue.sync {}
+        waitUntilSynchronously { recorder.pendingStartHasReturnedForDebug() }
 
         var queueIsSuspended = true
         lifecycleQueue.suspend()
@@ -683,6 +1115,7 @@ struct RouteAwareMeetingMicRecorderTests {
         try recorder.start()
         recorder.preferredInputDeviceID = 91
         lifecycleQueue.sync {}
+        waitUntilSynchronously { recorder.pendingStartHasReturnedForDebug() }
 
         var queueIsSuspended = true
         lifecycleQueue.suspend()
@@ -840,6 +1273,27 @@ struct RouteAwareMeetingMicRecorderTests {
             try await Task.sleep(for: .milliseconds(5))
         }
     }
+
+    private func waitUntilSynchronously(
+        timeout: TimeInterval = 5,
+        condition: () -> Bool
+    ) {
+        let deadline = Date().addingTimeInterval(timeout)
+        while !condition(), Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.005)
+        }
+        if !condition() {
+            Issue.record("Timed out waiting for synchronous recorder state")
+        }
+    }
+}
+
+private final class WeakRouteAwareMeetingMicRecorder {
+    weak var value: RouteAwareMeetingMicRecorder?
+
+    init(_ value: RouteAwareMeetingMicRecorder?) {
+        self.value = value
+    }
 }
 
 private let disabledMeetingMicHandoffTimeoutScheduler: RouteAwareMeetingMicRecorder.HandoffTimeoutScheduler = {
@@ -887,6 +1341,10 @@ private final class ManualMeetingMicHandoffTimeoutScheduler {
         workItem.perform()
         return true
     }
+
+    var scheduledCount: Int {
+        lock.withLock { scheduledWorkItems.count }
+    }
 }
 
 private final class FakeMeetingMicRecorder: MeetingMicRecording {
@@ -904,6 +1362,7 @@ private final class FakeMeetingMicRecorder: MeetingMicRecording {
     var stopCalls = 0
     var cancelCalls = 0
     var startError: Error?
+    var onPrepare: (() -> Void)?
     var onStart: (() -> Void)?
     var onCancel: (() -> Void)?
 
@@ -913,6 +1372,7 @@ private final class FakeMeetingMicRecorder: MeetingMicRecording {
 
     func prepare() throws {
         prepareCalls += 1
+        onPrepare?()
     }
 
     func start() throws {

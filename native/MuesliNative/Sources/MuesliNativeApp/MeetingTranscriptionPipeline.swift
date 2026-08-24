@@ -123,6 +123,31 @@ struct MeetingTranscriptionPipeline: Sendable {
         let systemSampleCount: Int
         let degradations: [MeetingProcessingDegradation]
         let leaseKey: MeetingRecordingLeaseKey?
+        let aecDiagnostics: MeetingAecDiagnosticsSnapshot?
+
+        init(
+            unitID: String,
+            sessionID: UUID?,
+            startedAt: Date,
+            microphoneURL: URL?,
+            systemURL: URL?,
+            microphoneSampleCount: Int,
+            systemSampleCount: Int,
+            degradations: [MeetingProcessingDegradation],
+            leaseKey: MeetingRecordingLeaseKey?,
+            aecDiagnostics: MeetingAecDiagnosticsSnapshot? = nil
+        ) {
+            self.unitID = unitID
+            self.sessionID = sessionID
+            self.startedAt = startedAt
+            self.microphoneURL = microphoneURL
+            self.systemURL = systemURL
+            self.microphoneSampleCount = microphoneSampleCount
+            self.systemSampleCount = systemSampleCount
+            self.degradations = degradations
+            self.leaseKey = leaseKey
+            self.aecDiagnostics = aecDiagnostics
+        }
     }
 
     private enum RecognitionOutcome: Sendable {
@@ -186,10 +211,23 @@ struct MeetingTranscriptionPipeline: Sendable {
         deinit { cleanup() }
     }
 
+    private enum PreparedGenericUnit: Sendable {
+        case canonical(OwnedCanonicalUnit)
+        case legacy(MeetingLegacyRecordingInput, MeetingRecordingLease)
+
+        func cleanup() {
+            switch self {
+            case .canonical(let owned): owned.cleanup()
+            case .legacy(_, let lease): lease.release()
+            }
+        }
+    }
+
     private let provider: any MeetingTranscriptionProviding
     private let leaseRegistry: MeetingRecordingLeaseRegistry
     private let inferenceScheduler: MeetingInferenceScheduler
     private let aecFactory: @Sendable (MeetingAecModel) -> MeetingNeuralAec
+    private let cancellationCheck: @Sendable () throws -> Void
 
     init(
         provider: any MeetingTranscriptionProviding,
@@ -197,12 +235,16 @@ struct MeetingTranscriptionPipeline: Sendable {
         inferenceScheduler: MeetingInferenceScheduler = .shared,
         aecFactory: @escaping @Sendable (MeetingAecModel) -> MeetingNeuralAec = {
             MeetingNeuralAec(localVQEModel: $0)
+        },
+        cancellationCheck: @escaping @Sendable () throws -> Void = {
+            try Task.checkCancellation()
         }
     ) {
         self.provider = provider
         self.leaseRegistry = leaseRegistry
         self.inferenceScheduler = inferenceScheduler
         self.aecFactory = aecFactory
+        self.cancellationCheck = cancellationCheck
     }
 
     init(
@@ -211,13 +253,17 @@ struct MeetingTranscriptionPipeline: Sendable {
         inferenceScheduler: MeetingInferenceScheduler = .shared,
         aecFactory: @escaping @Sendable (MeetingAecModel) -> MeetingNeuralAec = {
             MeetingNeuralAec(localVQEModel: $0)
+        },
+        cancellationCheck: @escaping @Sendable () throws -> Void = {
+            try Task.checkCancellation()
         }
     ) {
         self.init(
             provider: coordinator,
             leaseRegistry: leaseRegistry,
             inferenceScheduler: inferenceScheduler,
-            aecFactory: aecFactory
+            aecFactory: aecFactory,
+            cancellationCheck: cancellationCheck
         )
     }
 
@@ -225,6 +271,7 @@ struct MeetingTranscriptionPipeline: Sendable {
         guard !request.units.isEmpty else {
             throw MeetingTranscriptionPipelineError.noRecordingUnits
         }
+        request.progress(.processingAudio)
 
         if request.backend.backend == BackendOption.homanWhisper.backend,
            request.units.allSatisfy({ input in
@@ -245,48 +292,42 @@ struct MeetingTranscriptionPipeline: Sendable {
             )
         }
 
-        var unitResults: [MeetingUnitTranscriptionResult] = []
+        var preparedUnits: [PreparedGenericUnit] = []
+        defer { preparedUnits.forEach { $0.cleanup() } }
         for input in request.units.sorted(by: Self.unitComesBefore) {
+            try cancellationCheck()
             switch input {
-            case .sourceBundle(let sourceInput):
-                let bundle = sourceInput.bundle
-                let recordingID = sourceInput.recording?.id ?? bundle.manifest.recordingID
-                if let rawAudio = bundle.rawAudio {
-                    unitResults.append(
-                        try await processRawBundle(
-                            rawAudio,
-                            bundle: bundle,
-                            recordingID: recordingID,
-                            request: request
-                        )
+            case .sourceBundle, .separatedChannels:
+                preparedUnits.append(.canonical(
+                    try await prepareOwnedCanonicalUnit(
+                        input,
+                        aecModel: request.aecModel
                     )
-                    continue
-                }
-                let unit = CanonicalSourceUnit(
-                    unitID: bundle.manifest.sessionID.uuidString.lowercased(),
-                    sessionID: bundle.manifest.sessionID,
-                    startedAt: bundle.manifest.startedAt,
-                    microphoneURL: bundle.microphoneURL,
-                    systemURL: bundle.systemURL,
-                    microphoneSampleCount: bundle.manifest.microphone.sampleCount,
-                    systemSampleCount: bundle.manifest.system.sampleCount,
-                    degradations: bundle.degradations,
-                    leaseKey: recordingID.map(MeetingRecordingLeaseKey.recordingID)
-                        ?? .sessionID(bundle.manifest.sessionID)
-                )
-                unitResults.append(try await processCanonical(unit, request: request))
-            case .separatedChannels(let separatedInput):
-                unitResults.append(try await processSeparated(
-                    separatedInput,
-                    request: request
                 ))
             case .legacyMixed(let legacyInput):
-                unitResults.append(try await processLegacy(
-                    legacyInput,
-                    request: request
-                ))
+                guard MeetingRecordingUnitInput
+                    .legacyMixed(legacyInput)
+                    .hasUsableAudio(onDisk: .default),
+                      let lease = leaseRegistry.acquireRead(
+                          for: .recordingID(legacyInput.recording.id)
+                      ) else {
+                    throw MeetingTranscriptionPipelineError.noUsableAudio
+                }
+                preparedUnits.append(.legacy(legacyInput, lease))
+            }
+            try cancellationCheck()
+        }
+        request.progress(.transcribing)
+        var unitResults: [MeetingUnitTranscriptionResult] = []
+        for prepared in preparedUnits {
+            switch prepared {
+            case .canonical(let owned):
+                unitResults.append(try await processCanonical(owned.unit, request: request))
+            case .legacy(let input, _):
+                unitResults.append(try await processLegacy(input, request: request))
             }
         }
+        preparedUnits.forEach { $0.cleanup() }
         return try await applyMeetingWideDiarizationIfNeeded(
             to: unitResults,
             request: request,
@@ -334,6 +375,7 @@ struct MeetingTranscriptionPipeline: Sendable {
             persistentRemoteBatchAudio: stagedAudio,
             progress: progress
         )
+        request.progress(.transcribing)
         let unitResult = try await processCanonical(unit, request: request)
         return try await applyMeetingWideDiarizationIfNeeded(
             to: [unitResult],
@@ -358,15 +400,17 @@ struct MeetingTranscriptionPipeline: Sendable {
     private func processHomanWhisperMeeting(
         _ request: MeetingTranscriptionRequest
     ) async throws -> [MeetingUnitTranscriptionResult] {
-        request.progress(.transcribing)
         var ownedUnits: [OwnedCanonicalUnit] = []
         do {
             for input in request.units.sorted(by: Self.unitComesBefore) {
+                try cancellationCheck()
                 ownedUnits.append(try await prepareOwnedCanonicalUnit(
                     input,
                     aecModel: request.aecModel
                 ))
+                try cancellationCheck()
             }
+            request.progress(.transcribing)
             let meetingStart = ownedUnits.map(\.unit.startedAt).min() ?? Date()
             let sources = ownedUnits.flatMap { owned -> [HomanBatchSource] in
                 let unit = owned.unit
@@ -529,7 +573,8 @@ struct MeetingTranscriptionPipeline: Sendable {
                             microphoneSampleCount: prepared.microphoneSampleCount,
                             systemSampleCount: prepared.systemSampleCount,
                             degradations: bundle.degradations,
-                            leaseKey: nil
+                            leaseKey: nil,
+                            aecDiagnostics: prepared.aecDiagnostics
                         ),
                         temporaryURLs: urls,
                         lease: lease
@@ -564,7 +609,8 @@ struct MeetingTranscriptionPipeline: Sendable {
             do {
                 let extracted = try MeetingRecordingWriter.extractSeparatedChannels(
                     from: separated.recordingURL,
-                    sourceLayout: separated.sourceLayout
+                    sourceLayout: separated.sourceLayout,
+                    cancellationCheck: cancellationCheck
                 )
                 return OwnedCanonicalUnit(
                     unit: CanonicalSourceUnit(
@@ -637,85 +683,15 @@ struct MeetingTranscriptionPipeline: Sendable {
             recognizedSegments: recognizedSegments,
             microphoneSegments: reconciled.micSegments,
             systemSegments: reconciled.systemSegments,
-            diarizationSegments: nil
+            diarizationSegments: nil,
+            aecDiagnostics: unit.aecDiagnostics
         )
-    }
-
-    private func processRawBundle(
-        _ rawAudio: MeetingStagedRawAudio,
-        bundle: MeetingRecordingBundle,
-        recordingID: Int64?,
-        request: MeetingTranscriptionRequest
-    ) async throws -> MeetingUnitTranscriptionResult {
-        let leaseKey = recordingID.map(MeetingRecordingLeaseKey.recordingID)
-            ?? .sessionID(bundle.manifest.sessionID)
-        guard let lease = leaseRegistry.acquireRead(for: leaseKey) else {
-            throw MeetingTranscriptionPipelineError.noUsableAudio
-        }
-        defer { lease.release() }
-
-        let prepared = try await MeetingRawAudioPostProcessor
-            .renderProcessingView(
-                rawAudio,
-                aec: aecFactory(request.aecModel),
-                inferenceScheduler: inferenceScheduler
-            )
-        defer { prepared.removeTemporaryFiles() }
-        let unit = CanonicalSourceUnit(
-            unitID: bundle.manifest.sessionID.uuidString.lowercased(),
-            sessionID: bundle.manifest.sessionID,
-            startedAt: bundle.manifest.startedAt,
-            microphoneURL: prepared.microphoneURL,
-            systemURL: prepared.systemURL,
-            microphoneSampleCount: prepared.microphoneSampleCount,
-            systemSampleCount: prepared.systemSampleCount,
-            degradations: bundle.degradations,
-            leaseKey: nil
-        )
-        return try await processCanonical(unit, request: request)
-    }
-
-    private func processSeparated(
-        _ input: MeetingSeparatedRecordingInput,
-        request: MeetingTranscriptionRequest
-    ) async throws -> MeetingUnitTranscriptionResult {
-        guard MeetingRecordingUnitInput
-            .separatedChannels(input)
-            .hasUsableAudio(onDisk: .default) else {
-            throw MeetingTranscriptionPipelineError.noUsableAudio
-        }
-        guard let lease = leaseRegistry.acquireRead(
-            for: .recordingID(input.recording.id)
-        ) else {
-            throw MeetingTranscriptionPipelineError.noUsableAudio
-        }
-        defer { lease.release() }
-
-        let extracted = try MeetingRecordingWriter.extractSeparatedChannels(
-            from: input.recordingURL,
-            sourceLayout: input.sourceLayout
-        )
-        defer { extracted.removeTemporaryFiles() }
-
-        let unit = CanonicalSourceUnit(
-            unitID: "recording-\(input.recording.id)",
-            sessionID: nil,
-            startedAt: input.recording.createdAt,
-            microphoneURL: extracted.microphoneURL,
-            systemURL: extracted.systemURL,
-            microphoneSampleCount: extracted.microphoneSampleCount,
-            systemSampleCount: extracted.systemSampleCount,
-            degradations: [],
-            leaseKey: nil
-        )
-        return try await processCanonical(unit, request: request)
     }
 
     private func processCanonical(
         _ unit: CanonicalSourceUnit,
         request: MeetingTranscriptionRequest
     ) async throws -> MeetingUnitTranscriptionResult {
-        request.progress(.transcribing)
         let lease = unit.leaseKey.flatMap { leaseRegistry.acquireRead(for: $0) }
         if unit.leaseKey != nil, lease == nil {
             throw MeetingTranscriptionPipelineError.noUsableAudio
@@ -807,7 +783,8 @@ struct MeetingTranscriptionPipeline: Sendable {
             recognizedSegments: recognizedSegments,
             microphoneSegments: reconciled.micSegments,
             systemSegments: reconciled.systemSegments,
-            diarizationSegments: nil
+            diarizationSegments: nil,
+            aecDiagnostics: unit.aecDiagnostics
         )
     }
 
@@ -1434,7 +1411,8 @@ struct MeetingTranscriptionPipeline: Sendable {
                 recognizedSegments: unit.recognizedSegments,
                 microphoneSegments: reconciled.micSegments,
                 systemSegments: reconciled.systemSegments,
-                diarizationSegments: localDiarization
+                diarizationSegments: localDiarization,
+                aecDiagnostics: unit.aecDiagnostics
             )
         }
     }
@@ -1454,7 +1432,8 @@ struct MeetingTranscriptionPipeline: Sendable {
                 recognizedSegments: unit.recognizedSegments,
                 microphoneSegments: unit.microphoneSegments,
                 systemSegments: unit.systemSegments,
-                diarizationSegments: unit.diarizationSegments
+                diarizationSegments: unit.diarizationSegments,
+                aecDiagnostics: unit.aecDiagnostics
             )
         }
     }

@@ -6,12 +6,13 @@ import Testing
 
 @Suite("MeetingNeuralAec")
 struct MeetingNeuralAecTests {
-    @Test("GTCRN is the default and legacy LocalVQE remains selectable")
+    @Test("LocalVQE v1.2 is the default and low-CPU GTCRN remains selectable")
     func meetingAecModels() {
-        #expect(MeetingAecModel.defaultModel == .gtcrn49K)
-        #expect(MeetingAecModel.resolved(nil) == .gtcrn49K)
-        #expect(MeetingAecModel.resolved("unknown") == .gtcrn49K)
+        #expect(MeetingAecModel.defaultModel == .localVQEV12)
+        #expect(MeetingAecModel.resolved(nil) == .localVQEV12)
+        #expect(MeetingAecModel.resolved("unknown") == .localVQEV12)
         #expect(MeetingAecModel.resolved(MeetingAecModel.localVQEV12.rawValue) == .localVQEV12)
+        #expect(MeetingAecModel.resolved(MeetingAecModel.gtcrn49K.rawValue) == .gtcrn49K)
         #expect(MeetingAecModel.gtcrn49K.inferenceThreads == 1)
         #expect(MeetingAecModel.localVQEV12.inferenceThreads == 2)
         #expect(Set(MeetingAecModel.allCases.map(\.fileName)).count == MeetingAecModel.allCases.count)

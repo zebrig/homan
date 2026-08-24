@@ -20,8 +20,12 @@ final class MeetingBackgroundProcessingRegistry {
         }
     }
 
-    func remove(id: UUID) {
-        tasks[id] = nil
+    /// Removes an owned task and reports whether that removal made the registry idle.
+    /// Unknown or already-removed IDs do not produce a duplicate idle transition.
+    @discardableResult
+    func remove(id: UUID) -> Bool {
+        guard tasks.removeValue(forKey: id) != nil else { return false }
+        return tasks.isEmpty
     }
 
     func cancelAllAndWait() async {

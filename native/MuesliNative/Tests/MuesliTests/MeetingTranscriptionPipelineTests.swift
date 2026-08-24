@@ -164,7 +164,6 @@ struct MeetingTranscriptionPipelineTests {
                 segments: [.init(start: 0, end: 0.05, text: "remote")]
             ),
         ])
-
         let result = try await MeetingTranscriptionPipeline(provider: provider).process(
             MeetingTranscriptionRequest(
                 units: units,
@@ -693,6 +692,7 @@ struct MeetingTranscriptionPipelineTests {
                 segments: [.init(start: 0, end: 1, text: "mixed voices")]
             ),
         ])
+        let progress = PipelineProgressRecorder()
 
         let result = try await MeetingTranscriptionPipeline(provider: provider).process(
             MeetingTranscriptionRequest(
@@ -704,7 +704,8 @@ struct MeetingTranscriptionPipelineTests {
                 backend: .whisperSmall,
                 languages: .init(),
                 purpose: .retranscribe,
-                systemDiarization: .optionalPost
+                systemDiarization: .optionalPost,
+                progress: { progress.append($0) }
             )
         )
 
@@ -713,6 +714,7 @@ struct MeetingTranscriptionPipelineTests {
         #expect(result.formattedTranscript.contains("Speaker: mixed voices"))
         #expect(result.degradations.contains(.legacySourceIdentityUnavailable))
         #expect(result.degradations.contains(.sourceBundleVersionUnsupported(99)))
+        #expect(Array(progress.stages.prefix(2)) == [.processingAudio, .transcribing])
         support.assertExists(playback)
     }
 
@@ -746,11 +748,13 @@ struct MeetingTranscriptionPipelineTests {
             playbackURL: try support.makePlaybackFile(),
             supportDirectory: support.supportDirectory
         )
+        let aecProcessor = RawPipelinePassThroughAec()
+        let progress = PipelineProgressRecorder()
         let pipeline = MeetingTranscriptionPipeline(
             provider: RawPipelineProvider(),
             aecFactory: { _ in
                 MeetingNeuralAec(
-                    preloadedProcessor: RawPipelinePassThroughAec()
+                    preloadedProcessor: aecProcessor
                 )
             }
         )
@@ -767,12 +771,225 @@ struct MeetingTranscriptionPipelineTests {
                 backend: .parakeetMultilingual,
                 languages: .init(),
                 purpose: .retranscribe,
-                systemDiarization: .disabled
+                systemDiarization: .disabled,
+                progress: { progress.append($0) }
             )
         )
 
         #expect(result.attributedTurns.map(\.sourceRole) == [.you, .others])
         #expect(result.attributedTurns.map(\.text) == ["local", "remote"])
+        #expect(aecProcessor.processedReferenceFrames == 1)
+        #expect(aecProcessor.nonZeroReferenceSamples == 2)
+        #expect(progress.stages == [.processingAudio, .transcribing])
+        #expect(result.units.first?.aecDiagnostics?.processor == "test-pass-through")
+        #expect(result.units.first?.aecDiagnostics?.ready == true)
+        #expect(result.units.first?.aecDiagnostics?.processedFrames == 1)
+    }
+
+    @Test("generic multi-unit processing completes every AEC pass before ASR")
+    func genericMultiUnitPreparesAudioBeforeTranscribing() async throws {
+        let support = try MeetingRecordingBundleTestSupport(
+            testName: "raw-multi-unit-pipeline"
+        )
+        defer { support.cleanup() }
+
+        func makeBundle(
+            meetingID: Int64,
+            startedAt: Date,
+            anchor: UInt64
+        ) throws -> MeetingRecordingBundle {
+            let capture = try MeetingRawAudioCapture(
+                meetingID: meetingID,
+                startedAt: startedAt,
+                timelineAnchorNanoseconds: anchor,
+                finalModelID: BackendOption.parakeetMultilingual.asrModelID,
+                supportDirectory: support.supportDirectory,
+                compactLosslessly: true
+            )
+            capture.append(
+                rawPipelineChunk(samples: [1_000, 2_000], timestamp: anchor),
+                role: .microphone
+            )
+            capture.append(
+                rawPipelineChunk(samples: [3_000, 4_000], timestamp: anchor),
+                role: .system
+            )
+            let raw = try capture.finalize(endedAt: startedAt.addingTimeInterval(1))
+            return try MeetingRecordingBundlePublisher.publish(
+                stagedRawAudio: raw,
+                playbackURL: try support.makePlaybackFile(
+                    named: "multi-\(meetingID).wav"
+                ),
+                supportDirectory: support.supportDirectory
+            )
+        }
+
+        let first = try makeBundle(
+            meetingID: 101,
+            startedAt: Date(timeIntervalSince1970: 1_000),
+            anchor: 10_000
+        )
+        let second = try makeBundle(
+            meetingID: 102,
+            startedAt: Date(timeIntervalSince1970: 1_002),
+            anchor: 20_000
+        )
+        let events = PipelineExecutionRecorder()
+        let pipeline = MeetingTranscriptionPipeline(
+            provider: RawPipelineProvider(),
+            aecFactory: { _ in
+                MeetingNeuralAec(preloadedProcessor: RawPipelinePassThroughAec(
+                    onProcess: { events.append(.aec) }
+                ))
+            }
+        )
+
+        _ = try await pipeline.process(MeetingTranscriptionRequest(
+            units: [first, second].map { bundle in
+                .sourceBundle(.init(recording: nil, playbackURL: nil, bundle: bundle))
+            },
+            backend: .parakeetMultilingual,
+            languages: .init(),
+            purpose: .retranscribe,
+            systemDiarization: .disabled,
+            progress: { events.append(.stage($0)) }
+        ))
+
+        #expect(events.events == [
+            .stage(.processingAudio),
+            .aec,
+            .aec,
+            .stage(.transcribing),
+        ])
+    }
+
+    @Test("Homan Whisper reprocesses schema-v2 raw bundle through AEC before batching")
+    func homanWhisperRawBundleUsesAEC() async throws {
+        let support = try MeetingRecordingBundleTestSupport(
+            testName: "raw-homan-whisper-pipeline"
+        )
+        defer { support.cleanup() }
+        let capture = try MeetingRawAudioCapture(
+            meetingID: 42,
+            startedAt: Date(timeIntervalSince1970: 1_000),
+            timelineAnchorNanoseconds: 10_000,
+            finalModelID: BackendOption.homanWhisper.asrModelID,
+            supportDirectory: support.supportDirectory,
+            compactLosslessly: true
+        )
+        capture.append(
+            rawPipelineChunk(
+                samples: [Int16](repeating: 1_000, count: 1_600),
+                timestamp: 10_000
+            ),
+            role: .microphone
+        )
+        capture.append(
+            rawPipelineChunk(
+                samples: [Int16](repeating: 3_000, count: 1_600),
+                timestamp: 10_000
+            ),
+            role: .system
+        )
+        let raw = try capture.finalize(
+            endedAt: Date(timeIntervalSince1970: 1_000.1)
+        )
+        let bundle = try MeetingRecordingBundlePublisher.publish(
+            stagedRawAudio: raw,
+            playbackURL: try support.makePlaybackFile(),
+            supportDirectory: support.supportDirectory
+        )
+        let provider = HomanWhisperBatchPipelineProvider()
+        let aecProcessor = RawPipelinePassThroughAec()
+        let progress = PipelineProgressRecorder()
+        let pipeline = MeetingTranscriptionPipeline(
+            provider: provider,
+            aecFactory: { _ in
+                MeetingNeuralAec(preloadedProcessor: aecProcessor)
+            }
+        )
+
+        let result = try await pipeline.process(
+            MeetingTranscriptionRequest(
+                units: [.sourceBundle(.init(
+                    recording: nil,
+                    playbackURL: nil,
+                    bundle: bundle
+                ))],
+                backend: .homanWhisper,
+                languages: .init(),
+                purpose: .retranscribe,
+                systemDiarization: .disabled,
+                progress: { progress.append($0) }
+            )
+        )
+
+        #expect(await provider.batchCount == 1)
+        #expect(await provider.submittedItems.map(\.source) == [.microphone, .system])
+        #expect(result.attributedTurns.map(\.sourceRole) == [.you, .others])
+        #expect(aecProcessor.processedReferenceFrames == 800)
+        #expect(aecProcessor.nonZeroReferenceSamples == 1_600)
+        #expect(progress.stages == [.processingAudio, .transcribing])
+        #expect(result.units.first?.aecDiagnostics?.processor == "test-pass-through")
+    }
+
+    @Test("Homan Whisper cancellation cleans prepared channels and releases leases")
+    func homanWhisperPreparationCancellationCleansResources() async throws {
+        let support = try MeetingRecordingBundleTestSupport(
+            testName: "homan-whisper-cancelled-preparation"
+        )
+        defer { support.cleanup() }
+        let playback = try support.makeSeparatedPlaybackFile()
+        let createdAt = Date(timeIntervalSince1970: 1_000)
+        func input(recordingID: Int64) -> MeetingRecordingUnitInput {
+            .separatedChannels(.init(
+                recording: MeetingRecordingRecord(
+                    id: recordingID,
+                    meetingID: 42,
+                    path: playback.path,
+                    createdAt: createdAt,
+                    deleteAfter: nil,
+                    sourceLayout: .separateStereoMicrophoneAndSystem
+                ),
+                recordingURL: playback,
+                sourceLayout: .separateStereoMicrophoneAndSystem
+            ))
+        }
+        let extractionDirectory = FileManager.default.temporaryDirectory
+            .appendingPathComponent(
+                "muesli-meeting-channel-extraction",
+                isDirectory: true
+            )
+        let filesBefore = temporaryFileNames(in: extractionDirectory)
+        let registry = MeetingRecordingLeaseRegistry()
+        // Checkpoints: before unit, extraction start, extraction block,
+        // extraction finish, then immediately after the owned unit is stored.
+        let cancellation = DeterministicPipelineCancellation(throwAt: 5)
+        let pipeline = MeetingTranscriptionPipeline(
+            provider: HomanWhisperBatchPipelineProvider(),
+            leaseRegistry: registry,
+            cancellationCheck: { try cancellation.check() }
+        )
+
+        await #expect(throws: CancellationError.self) {
+            _ = try await pipeline.process(MeetingTranscriptionRequest(
+                units: [input(recordingID: 701), input(recordingID: 702)],
+                backend: .homanWhisper,
+                languages: .init(),
+                purpose: .retranscribe,
+                systemDiarization: .disabled
+            ))
+        }
+
+        #expect(temporaryFileNames(in: extractionDirectory) == filesBefore)
+        let firstDeletion = try #require(
+            registry.acquireDeletion(for: .recordingID(701))
+        )
+        let secondDeletion = try #require(
+            registry.acquireDeletion(for: .recordingID(702))
+        )
+        firstDeletion.release()
+        secondDeletion.release()
     }
 
     private func rawPipelineChunk(
@@ -797,6 +1014,15 @@ struct MeetingTranscriptionPipelineTests {
                     data: samples.withUnsafeBufferPointer { Data(buffer: $0) }
                 ),
             ]
+        )
+    }
+
+    private func temporaryFileNames(in directory: URL) -> Set<String> {
+        Set(
+            (try? FileManager.default.contentsOfDirectory(
+                at: directory,
+                includingPropertiesForKeys: nil
+            ))?.map(\.lastPathComponent) ?? []
         )
     }
 }
@@ -861,15 +1087,87 @@ private struct RawPipelineProvider: MeetingTranscriptionProviding {
     }
 }
 
-private final class RawPipelinePassThroughAec: MeetingAecProcessor {
+private final class RawPipelinePassThroughAec: MeetingAecProcessor, @unchecked Sendable {
     let name = "test-pass-through"
     let frameSize = 2
     let sampleRate = 16_000
+    private let lock = NSLock()
+    private let onProcess: @Sendable () -> Void
+    private var referenceFrames = 0
+    private var nonZeroSamples = 0
+
+    var processedReferenceFrames: Int {
+        lock.withLock { referenceFrames }
+    }
+
+    var nonZeroReferenceSamples: Int {
+        lock.withLock { nonZeroSamples }
+    }
+
+    init(onProcess: @escaping @Sendable () -> Void = {}) {
+        self.onProcess = onProcess
+    }
 
     func reset() {}
 
     func processFrame(mic: [Float], reference: [Float]) throws -> [Float] {
-        mic
+        onProcess()
+        lock.withLock {
+            referenceFrames += 1
+            nonZeroSamples += reference.count(where: { $0 != 0 })
+        }
+        return mic
+    }
+}
+
+private enum PipelineExecutionEvent: Sendable, Equatable {
+    case stage(MeetingTranscriptionPipelineStage)
+    case aec
+}
+
+private final class PipelineExecutionRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [PipelineExecutionEvent] = []
+
+    var events: [PipelineExecutionEvent] {
+        lock.withLock { recorded }
+    }
+
+    func append(_ event: PipelineExecutionEvent) {
+        lock.withLock { recorded.append(event) }
+    }
+}
+
+private final class PipelineProgressRecorder: @unchecked Sendable {
+    private let lock = NSLock()
+    private var recorded: [MeetingTranscriptionPipelineStage] = []
+
+    var stages: [MeetingTranscriptionPipelineStage] {
+        lock.withLock { recorded }
+    }
+
+    func append(_ stage: MeetingTranscriptionPipelineStage) {
+        lock.withLock { recorded.append(stage) }
+    }
+}
+
+private final class DeterministicPipelineCancellation: @unchecked Sendable {
+    private let lock = NSLock()
+    private let throwAt: Int
+    private var count = 0
+
+    init(throwAt: Int) {
+        self.throwAt = throwAt
+    }
+
+    func check() throws {
+        let shouldCancel = lock.withLock {
+            count += 1
+            return count == throwAt
+        }
+        if shouldCancel {
+            throw CancellationError()
+        }
     }
 }
 
@@ -976,7 +1274,8 @@ private actor HomanWhisperBatchPipelineProvider:
 
     func meetingSpeechSegments(at url: URL) async throws -> [VadSegment]? {
         speechSegmentationCount += 1
-        if url.lastPathComponent.contains("mic-cleaned") {
+        if url.lastPathComponent.contains("mic-cleaned")
+            || url.deletingLastPathComponent().lastPathComponent == "muesli-meeting-post-aec" {
             return [VadSegment(startTime: 0.0, endTime: 0.03)]
         }
         return [VadSegment(startTime: 0.04, endTime: 0.07)]

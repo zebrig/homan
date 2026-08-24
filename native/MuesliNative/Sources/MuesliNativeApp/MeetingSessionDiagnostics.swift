@@ -69,7 +69,7 @@ protocol SystemAudioDiagnosticsProviding {
     var diagnosticsSnapshot: SystemAudioCaptureDiagnosticsSnapshot { get }
 }
 
-struct MeetingAecDiagnosticsSnapshot: Codable {
+struct MeetingAecDiagnosticsSnapshot: Codable, Sendable, Equatable {
     let ready: Bool
     let processor: String
     let processedFrames: Int
@@ -83,9 +83,10 @@ struct MeetingAecDiagnosticsSnapshot: Codable {
     let currentDelayMs: Int
     let delayHistory: [MeetingAecDelayObservation]
     let delaySkipHistory: [MeetingAecDelaySkip]
+    let lastProcessingError: String?
 }
 
-struct MeetingAecDelayObservation: Codable {
+struct MeetingAecDelayObservation: Codable, Sendable, Equatable {
     let delayMs: Int
     let appliedDelayMs: Int
     let score: Double
@@ -95,13 +96,13 @@ struct MeetingAecDelayObservation: Codable {
     let candidateScores: [MeetingAecDelayCandidateScore]
 }
 
-struct MeetingAecDelayCandidateScore: Codable {
+struct MeetingAecDelayCandidateScore: Codable, Sendable, Equatable {
     let delayMs: Int
     let score: Double
     let comparedFrames: Int
 }
 
-struct MeetingAecDelaySkip: Codable {
+struct MeetingAecDelaySkip: Codable, Sendable, Equatable {
     let reason: String
     let micSamplesReceived: Int
     let systemSamplesReceived: Int

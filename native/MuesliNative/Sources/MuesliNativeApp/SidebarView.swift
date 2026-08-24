@@ -362,6 +362,14 @@ struct SidebarView: View {
                         Image(systemName: "checkmark.circle.fill")
                             .font(.system(size: 15, weight: .semibold))
                             .foregroundStyle(MuesliTheme.success)
+                    } else if appState.modelPreparationTerminalPhase == .failed {
+                        Image(systemName: "exclamationmark.triangle.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(.red)
+                    } else if appState.modelPreparationTerminalPhase == .paused {
+                        Image(systemName: "pause.circle.fill")
+                            .font(.system(size: 15, weight: .semibold))
+                            .foregroundStyle(MuesliTheme.textTertiary)
                     } else if appState.isModelPreparingAfterDownload || appState.modelPreparationProgress == nil {
                         ProgressView()
                             .controlSize(.small)

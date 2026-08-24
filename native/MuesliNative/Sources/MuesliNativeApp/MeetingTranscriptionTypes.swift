@@ -22,6 +22,13 @@ enum MeetingProcessingPurpose: String, Codable, Sendable, Hashable {
     case retranscribe
 }
 
+enum MeetingTranscriptionAudioSource: String, Codable, Sendable, Hashable {
+    case rawSourceBundle = "raw_source_bundle"
+    case derivedSourceBundle = "derived_source_bundle"
+    case separatedPlayback = "separated_playback"
+    case legacyMixed = "legacy_mixed"
+}
+
 enum SystemDiarizationPolicy: String, Codable, Sendable, Hashable {
     case disabled
     case reuseCompatible = "reuse_compatible"
@@ -107,6 +114,26 @@ enum MeetingRecordingUnitInput: Sendable {
     case separatedChannels(MeetingSeparatedRecordingInput)
     case legacyMixed(MeetingLegacyRecordingInput)
 
+    var transcriptionAudioSource: MeetingTranscriptionAudioSource {
+        switch self {
+        case .sourceBundle(let input):
+            return input.bundle.rawAudio == nil
+                ? .derivedSourceBundle
+                : .rawSourceBundle
+        case .separatedChannels:
+            return .separatedPlayback
+        case .legacyMixed:
+            return .legacyMixed
+        }
+    }
+
+    var reappliesRequestedAEC: Bool {
+        if case .sourceBundle(let input) = self {
+            return input.bundle.rawAudio != nil
+        }
+        return false
+    }
+
     func hasUsableAudio(onDisk fileManager: FileManager = .default) -> Bool {
         switch self {
         case .sourceBundle(let input):
@@ -158,6 +185,20 @@ enum MeetingRecordingUnitInput: Sendable {
     }
 }
 
+enum MeetingTranscriptionProvenance {
+    static func audioSource(for units: [MeetingRecordingUnitInput]) -> String? {
+        let sources = Set(units.map(\.transcriptionAudioSource.rawValue)).sorted()
+        return sources.isEmpty ? nil : sources.joined(separator: "+")
+    }
+
+    static func requestedAECModel(
+        for units: [MeetingRecordingUnitInput],
+        requested model: MeetingAecModel
+    ) -> String? {
+        units.contains(where: \.reappliesRequestedAEC) ? model.rawValue : nil
+    }
+}
+
 struct MeetingTranscriptionRequest: Sendable {
     let units: [MeetingRecordingUnitInput]
     let backend: BackendOption
@@ -199,6 +240,7 @@ struct MeetingTranscriptionRequest: Sendable {
 }
 
 enum MeetingTranscriptionPipelineStage: Sendable, Equatable {
+    case processingAudio
     case transcribing
     case preparingDiarizer
     case diarizing
@@ -216,6 +258,33 @@ struct MeetingUnitTranscriptionResult: Sendable {
     let microphoneSegments: [SpeechSegment]
     let systemSegments: [SpeechSegment]
     let diarizationSegments: [TimedSpeakerSegment]?
+    let aecDiagnostics: MeetingAecDiagnosticsSnapshot?
+
+    init(
+        unitID: String,
+        sessionID: UUID?,
+        startedAt: Date,
+        attributedTurns: [AttributedTurn],
+        formattedTranscript: String,
+        degradations: [MeetingProcessingDegradation],
+        recognizedSegments: [SourceRecognizedSegment],
+        microphoneSegments: [SpeechSegment],
+        systemSegments: [SpeechSegment],
+        diarizationSegments: [TimedSpeakerSegment]?,
+        aecDiagnostics: MeetingAecDiagnosticsSnapshot? = nil
+    ) {
+        self.unitID = unitID
+        self.sessionID = sessionID
+        self.startedAt = startedAt
+        self.attributedTurns = attributedTurns
+        self.formattedTranscript = formattedTranscript
+        self.degradations = degradations
+        self.recognizedSegments = recognizedSegments
+        self.microphoneSegments = microphoneSegments
+        self.systemSegments = systemSegments
+        self.diarizationSegments = diarizationSegments
+        self.aecDiagnostics = aecDiagnostics
+    }
 }
 
 struct MeetingTranscriptionResult: Sendable {

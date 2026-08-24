@@ -543,7 +543,8 @@ final class MeetingNeuralAec {
             bufferedMicSamples: pendingMicSamples.count,
             currentDelayMs: Int(round(Double(currentDelaySamples) * 1000.0 / Double(sampleRate))),
             delayHistory: delayHistory,
-            delaySkipHistory: delaySkipHistory
+            delaySkipHistory: delaySkipHistory,
+            lastProcessingError: lastProcessingError
         )
     }
 }

@@ -158,6 +158,80 @@ public enum MeetingProcessingThinkingStatus: String, Codable, Sendable, Equatabl
     case notReported = "not_reported"
 }
 
+public struct MeetingAecRunDiagnostics: Codable, Sendable, Equatable {
+    public let processor: String
+    public let ready: Bool
+    public let processedFrames: Int
+    public let fullReferenceFrames: Int
+    public let partialReferenceFrames: Int
+    public let missingReferenceFrames: Int
+    public let sourceUnitCount: Int
+    public let appliedSourceUnitCount: Int
+    public let processingError: String?
+
+    private enum CodingKeys: String, CodingKey {
+        case processor
+        case ready
+        case processedFrames
+        case fullReferenceFrames
+        case partialReferenceFrames
+        case missingReferenceFrames
+        case sourceUnitCount
+        case appliedSourceUnitCount
+        case processingError
+    }
+
+    public init(
+        processor: String,
+        ready: Bool,
+        processedFrames: Int,
+        fullReferenceFrames: Int,
+        partialReferenceFrames: Int,
+        missingReferenceFrames: Int,
+        sourceUnitCount: Int = 1,
+        appliedSourceUnitCount: Int? = nil,
+        processingError: String? = nil
+    ) {
+        self.processor = processor
+        self.ready = ready
+        self.processedFrames = max(processedFrames, 0)
+        self.fullReferenceFrames = max(fullReferenceFrames, 0)
+        self.partialReferenceFrames = max(partialReferenceFrames, 0)
+        self.missingReferenceFrames = max(missingReferenceFrames, 0)
+        let resolvedSourceUnitCount = max(sourceUnitCount, 0)
+        self.sourceUnitCount = resolvedSourceUnitCount
+        let inferredAppliedUnitCount = ready
+            && processedFrames > 0
+            && fullReferenceFrames + partialReferenceFrames > 0
+            && processingError == nil
+            ? resolvedSourceUnitCount
+            : 0
+        self.appliedSourceUnitCount = min(
+            max(appliedSourceUnitCount ?? inferredAppliedUnitCount, 0),
+            resolvedSourceUnitCount
+        )
+        self.processingError = processingError
+    }
+
+    public init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        try self.init(
+            processor: container.decode(String.self, forKey: .processor),
+            ready: container.decode(Bool.self, forKey: .ready),
+            processedFrames: container.decode(Int.self, forKey: .processedFrames),
+            fullReferenceFrames: container.decode(Int.self, forKey: .fullReferenceFrames),
+            partialReferenceFrames: container.decode(Int.self, forKey: .partialReferenceFrames),
+            missingReferenceFrames: container.decode(Int.self, forKey: .missingReferenceFrames),
+            sourceUnitCount: container.decodeIfPresent(Int.self, forKey: .sourceUnitCount) ?? 1,
+            appliedSourceUnitCount: container.decodeIfPresent(
+                Int.self,
+                forKey: .appliedSourceUnitCount
+            ),
+            processingError: container.decodeIfPresent(String.self, forKey: .processingError)
+        )
+    }
+}
+
 public struct MeetingProcessingRunMetadata: Codable, Sendable, Equatable {
     public let completedAt: Date
     public let durationSeconds: Double
@@ -165,6 +239,12 @@ public struct MeetingProcessingRunMetadata: Codable, Sendable, Equatable {
     public let model: String
     public let displayName: String
     public let thinkingStatus: MeetingProcessingThinkingStatus?
+    /// Canonical source selected for this run. Optional for 0.8.3 and older data.
+    public let audioSource: String?
+    /// Requested AEC model when this run actually reprocessed raw sources.
+    public let aecModel: String?
+    /// Actual processor outcome, including fallback or pass-through evidence.
+    public let aecDiagnostics: MeetingAecRunDiagnostics?
 
     public init(
         completedAt: Date,
@@ -172,7 +252,10 @@ public struct MeetingProcessingRunMetadata: Codable, Sendable, Equatable {
         backend: String,
         model: String,
         displayName: String,
-        thinkingStatus: MeetingProcessingThinkingStatus? = nil
+        thinkingStatus: MeetingProcessingThinkingStatus? = nil,
+        audioSource: String? = nil,
+        aecModel: String? = nil,
+        aecDiagnostics: MeetingAecRunDiagnostics? = nil
     ) {
         self.completedAt = completedAt
         self.durationSeconds = max(durationSeconds, 0)
@@ -180,6 +263,9 @@ public struct MeetingProcessingRunMetadata: Codable, Sendable, Equatable {
         self.model = model
         self.displayName = displayName
         self.thinkingStatus = thinkingStatus
+        self.audioSource = audioSource
+        self.aecModel = aecModel
+        self.aecDiagnostics = aecDiagnostics
     }
 }
 

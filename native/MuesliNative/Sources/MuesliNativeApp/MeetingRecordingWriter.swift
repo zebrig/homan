@@ -215,8 +215,10 @@ enum MeetingRecordingWriter {
     /// the extracted files are temporary and owned by the caller.
     static func extractSeparatedChannels(
         from recordingURL: URL,
-        sourceLayout: MeetingRecordingSourceLayout
+        sourceLayout: MeetingRecordingSourceLayout,
+        cancellationCheck: () throws -> Void = {}
     ) throws -> MeetingSeparatedChannelFiles {
+        try cancellationCheck()
         let file = try AVAudioFile(
             forReading: recordingURL,
             commonFormat: .pcmFormatFloat32,
@@ -255,6 +257,7 @@ enum MeetingRecordingWriter {
         do {
             let capacity: AVAudioFrameCount = 16_384
             while file.framePosition < file.length {
+                try cancellationCheck()
                 guard let buffer = AVAudioPCMBuffer(
                     pcmFormat: format,
                     frameCapacity: capacity
@@ -298,6 +301,7 @@ enum MeetingRecordingWriter {
                 }
             }
 
+            try cancellationCheck()
             let microphoneURL = try microphoneWriter?.finish()
             let systemURL = try systemWriter?.finish()
             return MeetingSeparatedChannelFiles(

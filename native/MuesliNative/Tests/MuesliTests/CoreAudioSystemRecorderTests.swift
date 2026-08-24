@@ -46,4 +46,34 @@ struct CoreAudioSystemRecorderTests {
         #expect(tap[kAudioSubTapUIDKey] as? String == "tap-uid")
         #expect(tap[kAudioSubTapDriftCompensationKey] as? Bool == true)
     }
+
+    @Test("output tap rebuild experiment is restricted to named dev lanes")
+    func outputTapRebuildExperimentIsRestrictedToNamedDevLanes() {
+        let enabled = [CoreAudioSystemRecorder.disableOutputTapRebuildExperimentKey: "1"]
+
+        #expect(CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.zebrig.homan",
+            environment: enabled
+        ))
+        #expect(CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.muesli.dev",
+            environment: enabled
+        ))
+        #expect(!CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.muesli.dev.a",
+            environment: enabled
+        ))
+        #expect(!CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.muesli.dev.c",
+            environment: enabled
+        ))
+        #expect(CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.muesli.dev.d",
+            environment: enabled
+        ))
+        #expect(CoreAudioSystemRecorder.shouldInstallDefaultOutputDeviceListener(
+            bundleIdentifier: "com.muesli.dev.a",
+            environment: [CoreAudioSystemRecorder.disableOutputTapRebuildExperimentKey: "0"]
+        ))
+    }
 }

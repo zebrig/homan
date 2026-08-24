@@ -8,6 +8,18 @@ import MuesliCore
 @Suite("BackendOption")
 struct BackendOptionTests {
 
+    @Test("runtime failure blocks Active while paused work remains retryable")
+    func modelDownloadSnapshotActivationPolicy() {
+        let preparing = ModelDownloadProgress.preparing(modelID: "model", message: "Preparing")
+        let failed = preparing.replacing(phase: .failed, message: "Runtime rejected model")
+        let paused = preparing.replacing(phase: .paused, message: "Paused")
+
+        #expect(ModelDownloadDisplayFormatting.isActiveJob(preparing))
+        #expect(!ModelDownloadDisplayFormatting.isActiveJob(failed))
+        #expect(ModelDownloadDisplayFormatting.blocksActivation(failed))
+        #expect(!ModelDownloadDisplayFormatting.blocksActivation(paused))
+    }
+
     @Test("all options have unique models")
     func uniqueModels() {
         let models = BackendOption.all.map(\.model)
@@ -35,6 +47,94 @@ struct BackendOptionTests {
     func parakeetBackend() {
         #expect(BackendOption.parakeetMultilingual.backend == "fluidaudio")
         #expect(BackendOption.parakeetEnglish.backend == "fluidaudio")
+    }
+
+    @Test("partial Parakeet directories are never reported as downloaded")
+    func partialParakeetIsNotDownloaded() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-parakeet-readiness-\(UUID().uuidString)", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let legacy = root.appendingPathComponent("legacy", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plan = ManagedASRModelPlans.parakeetV3(modelsRoot: legacy)
+        let sentinel = plan.cacheDirectory
+            .appendingPathComponent("Encoder.mlmodelc", isDirectory: true)
+            .appendingPathComponent("coremldata.bin")
+        try FileManager.default.createDirectory(
+            at: sentinel.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data([0x01]).write(to: sentinel)
+
+        #expect(!HomanModelDownloadCenter.isAvailableLocally(
+            .parakeetMultilingual,
+            supportDirectory: support,
+            legacyModelsRoot: legacy
+        ))
+    }
+
+    @Test("structurally complete legacy Parakeet stays not-ready until runtime adoption")
+    func completeLegacyParakeetRequiresRuntimeAdoption() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-parakeet-legacy-readiness-\(UUID().uuidString)", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let legacy = root.appendingPathComponent("legacy", isDirectory: true)
+        defer { try? FileManager.default.removeItem(at: root) }
+        let plan = ManagedASRModelPlans.parakeetV3(modelsRoot: legacy)
+        for model in ["Preprocessor", "Encoder", "Decoder", "JointDecisionv3"] {
+            let directory = plan.cacheDirectory.appendingPathComponent("\(model).mlmodelc", isDirectory: true)
+            try FileManager.default.createDirectory(
+                at: directory.appendingPathComponent("weights", isDirectory: true),
+                withIntermediateDirectories: true
+            )
+            try Data([0x01]).write(to: directory.appendingPathComponent("coremldata.bin"))
+            try Data([0x02]).write(to: directory.appendingPathComponent("weights/weight.bin"))
+        }
+        try Data(#"{"0":"<blank>"}"#.utf8).write(
+            to: plan.cacheDirectory.appendingPathComponent("parakeet_vocab.json")
+        )
+
+        #expect(plan.isAvailableLocally())
+        #expect(!HomanModelDownloadCenter.isAvailableLocally(
+            .parakeetMultilingual,
+            supportDirectory: support,
+            legacyModelsRoot: legacy
+        ))
+    }
+
+    @Test("Parakeet downloads are pinned to reviewed immutable revisions")
+    func parakeetDownloadsUsePinnedRevisions() {
+        let v2 = ManagedASRModelPlans.parakeetV2(modelsRoot: URL(fileURLWithPath: "/tmp/v2"))
+        let v3 = ManagedASRModelPlans.parakeetV3(modelsRoot: URL(fileURLWithPath: "/tmp/v3"))
+        #expect(v2.revision == "ee09c569f73759e6d44c9bd16766f477b2b36d39")
+        #expect(v3.revision == "7dd20fe6b1797d35f5e3307e8b1732d9a178edfe")
+        #expect(v2.revision != "main")
+        #expect(v3.revision != "main")
+    }
+
+    @Test("deleting a managed Parakeet suppresses but never deletes the shared legacy source")
+    func parakeetLegacySuppressionIsNonDestructive() throws {
+        let root = FileManager.default.temporaryDirectory
+            .appendingPathComponent("homan-parakeet-suppression-\(UUID().uuidString)", isDirectory: true)
+        let support = root.appendingPathComponent("support", isDirectory: true)
+        let legacyFile = root.appendingPathComponent("legacy/model.bin")
+        defer { try? FileManager.default.removeItem(at: root) }
+        try FileManager.default.createDirectory(
+            at: legacyFile.deletingLastPathComponent(),
+            withIntermediateDirectories: true
+        )
+        try Data("legacy".utf8).write(to: legacyFile)
+
+        try HomanModelDownloadCenter.suppressLegacyAdoption(
+            .parakeetMultilingual,
+            supportDirectory: support
+        )
+
+        #expect(HomanModelDownloadCenter.isLegacySuppressed(
+            .parakeetMultilingual,
+            supportDirectory: support
+        ))
+        #expect(FileManager.default.fileExists(atPath: legacyFile.path))
     }
 
     @Test("Whisper models use whisper backend")
@@ -319,13 +419,25 @@ struct BackendOptionTests {
 struct MeetingProcessingMetadataTests {
     @Test("thinking provenance round-trips and old JSON remains compatible")
     func thinkingProvenanceCodableCompatibility() throws {
+        let aecDiagnostics = MeetingAecRunDiagnostics(
+            processor: "localvqe_v1_2",
+            ready: true,
+            processedFrames: 1_000,
+            fullReferenceFrames: 990,
+            partialReferenceFrames: 10,
+            missingReferenceFrames: 0,
+            processingError: nil
+        )
         let run = MeetingProcessingRunMetadata(
             completedAt: Date(timeIntervalSince1970: 123),
             durationSeconds: 34,
             backend: "ollama",
             model: "gemma4:26b-a4b-it-qat",
             displayName: "Ollama · gemma4:26b-a4b-it-qat",
-            thinkingStatus: .used
+            thinkingStatus: .used,
+            audioSource: "raw_source_bundle",
+            aecModel: "localvqe_v1_2",
+            aecDiagnostics: aecDiagnostics
         )
         let decoded = try JSONDecoder().decode(
             MeetingProcessingRunMetadata.self,
@@ -344,6 +456,139 @@ struct MeetingProcessingMetadataTests {
         """.utf8)
         let legacy = try JSONDecoder().decode(MeetingProcessingRunMetadata.self, from: legacyJSON)
         #expect(legacy.thinkingStatus == nil)
+        #expect(legacy.audioSource == nil)
+        #expect(legacy.aecModel == nil)
+        #expect(legacy.aecDiagnostics == nil)
+
+        let preUnitAggregationJSON = Data("""
+        {
+          "processor": "localvqe_v1_2",
+          "ready": true,
+          "processedFrames": 10,
+          "fullReferenceFrames": 10,
+          "partialReferenceFrames": 0,
+          "missingReferenceFrames": 0
+        }
+        """.utf8)
+        let preUnitAggregation = try JSONDecoder().decode(
+            MeetingAecRunDiagnostics.self,
+            from: preUnitAggregationJSON
+        )
+        #expect(preUnitAggregation.sourceUnitCount == 1)
+        #expect(preUnitAggregation.appliedSourceUnitCount == 1)
+    }
+
+    @Test("transcription metadata records actual AEC outcomes across source units")
+    func transcriptionMetadataAggregatesActualAEC() {
+        let completedAt = Date(timeIntervalSince1970: 120)
+        let run = MeetingProcessingMetadataFactory.transcription(
+            backend: .parakeetMultilingual,
+            startedAt: Date(timeIntervalSince1970: 100),
+            completedAt: completedAt,
+            audioSource: "raw_source_bundle",
+            aecModel: "localvqe_v1_2",
+            aecDiagnostics: [
+                MeetingAecDiagnosticsSnapshot(
+                    ready: true,
+                    processor: "localvqe-v1.2",
+                    processedFrames: 100,
+                    fullReferenceFrames: 90,
+                    partialReferenceFrames: 10,
+                    missingReferenceFrames: 0,
+                    systemSamplesReceived: 200,
+                    micSamplesReceived: 200,
+                    bufferedSystemSamples: 0,
+                    bufferedMicSamples: 0,
+                    currentDelayMs: 0,
+                    delayHistory: [],
+                    delaySkipHistory: [],
+                    lastProcessingError: nil
+                ),
+                MeetingAecDiagnosticsSnapshot(
+                    ready: false,
+                    processor: "pass-through",
+                    processedFrames: 25,
+                    fullReferenceFrames: 0,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 25,
+                    systemSamplesReceived: 0,
+                    micSamplesReceived: 50,
+                    bufferedSystemSamples: 0,
+                    bufferedMicSamples: 0,
+                    currentDelayMs: 0,
+                    delayHistory: [],
+                    delaySkipHistory: [],
+                    lastProcessingError: "model unavailable"
+                ),
+            ]
+        )
+
+        #expect(run.completedAt == completedAt)
+        #expect(run.durationSeconds == 20)
+        #expect(run.audioSource == "raw_source_bundle")
+        #expect(run.aecModel == "localvqe_v1_2")
+        #expect(run.aecDiagnostics == MeetingAecRunDiagnostics(
+            processor: "localvqe-v1.2+pass-through",
+            ready: false,
+            processedFrames: 125,
+            fullReferenceFrames: 90,
+            partialReferenceFrames: 10,
+            missingReferenceFrames: 25,
+            sourceUnitCount: 2,
+            appliedSourceUnitCount: 1,
+            processingError: "processing_failed"
+        ))
+    }
+
+    @Test("a zero-frame source unit cannot hide behind another successful AEC unit")
+    func transcriptionMetadataPreservesPartialApplication() {
+        let snapshots = [
+            MeetingAecDiagnosticsSnapshot(
+                ready: true,
+                processor: "localvqe_v1_2",
+                processedFrames: 100,
+                fullReferenceFrames: 100,
+                partialReferenceFrames: 0,
+                missingReferenceFrames: 0,
+                systemSamplesReceived: 200,
+                micSamplesReceived: 200,
+                bufferedSystemSamples: 0,
+                bufferedMicSamples: 0,
+                currentDelayMs: 0,
+                delayHistory: [],
+                delaySkipHistory: [],
+                lastProcessingError: nil
+            ),
+            MeetingAecDiagnosticsSnapshot(
+                ready: true,
+                processor: "localvqe_v1_2",
+                processedFrames: 0,
+                fullReferenceFrames: 0,
+                partialReferenceFrames: 0,
+                missingReferenceFrames: 0,
+                systemSamplesReceived: 0,
+                micSamplesReceived: 0,
+                bufferedSystemSamples: 0,
+                bufferedMicSamples: 0,
+                currentDelayMs: 0,
+                delayHistory: [],
+                delaySkipHistory: [],
+                lastProcessingError: nil
+            ),
+        ]
+
+        let diagnostics = MeetingProcessingMetadataFactory.transcription(
+            backend: .parakeetMultilingual,
+            startedAt: Date(timeIntervalSince1970: 0),
+            completedAt: Date(timeIntervalSince1970: 1),
+            aecDiagnostics: snapshots
+        ).aecDiagnostics
+
+        #expect(diagnostics?.ready == true)
+        #expect(diagnostics?.processedFrames == 100)
+        #expect(diagnostics?.sourceUnitCount == 2)
+        #expect(diagnostics?.appliedSourceUnitCount == 1)
+        #expect(diagnostics?.processingError == nil)
     }
 }
 
@@ -724,8 +969,8 @@ struct AppConfigTests {
         #expect(config.meetingRecordingFileFormat == MeetingRecordingFileFormat.m4a.rawValue)
         #expect(config.resolvedMeetingRecordingFileFormat == .m4a)
         #expect(config.meetingRecordingRetentionDays == 7)
-        #expect(config.meetingAecModel == MeetingAecModel.gtcrn49K.rawValue)
-        #expect(config.resolvedMeetingAecModel == .gtcrn49K)
+        #expect(config.meetingAecModel == MeetingAecModel.localVQEV12.rawValue)
+        #expect(config.resolvedMeetingAecModel == .localVQEV12)
         #expect(config.dictationRetentionHours == nil)
         #expect(config.openRouterAPIKey.isEmpty)
         #expect(config.meetingSummaryRetryCount == MeetingSummaryRetryPolicy.defaultRetryCount)
@@ -1283,7 +1528,7 @@ struct AppConfigTests {
         #expect(config.meetingRecordingFileFormat == MeetingRecordingFileFormat.m4a.rawValue)
         #expect(config.resolvedMeetingRecordingFileFormat == .m4a)
         #expect(config.meetingRecordingRetentionDays == 7)
-        #expect(config.resolvedMeetingAecModel == .gtcrn49K)
+        #expect(config.resolvedMeetingAecModel == .localVQEV12)
         #expect(config.dictationRetentionHours == nil)
         #expect(config.showScheduledMeetingNotifications == true)
         #expect(config.showMeetingDetectionNotification == true)

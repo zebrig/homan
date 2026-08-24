@@ -118,6 +118,7 @@ public enum MeetingProcessingRunPlan {
         case .finalization, .recovery:
             var result: [MeetingProcessingPhase] = [
                 .preparingAudio,
+                .processingAudio,
                 .preparingRecording,
                 .transcribing,
             ]
@@ -130,7 +131,11 @@ public enum MeetingProcessingRunPlan {
             result += [.generatingTitle, .summarizing, .encodingRecording, .saving]
             fullPlan = result
         case .retranscription:
-            var result: [MeetingProcessingPhase] = [.preparingAudio, .transcribing]
+            var result: [MeetingProcessingPhase] = [
+                .preparingAudio,
+                .processingAudio,
+                .transcribing,
+            ]
             if analyzes {
                 result += [.preparingDiarizer, .diarizing]
             }

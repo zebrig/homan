@@ -51,6 +51,9 @@ enum MeetingFinalProcessingService {
         config: AppConfig,
         templateSnapshot: MeetingTemplateSnapshot,
         coordinator: TranscriptionCoordinator,
+        audioSource: String = MeetingTranscriptionAudioSource.derivedSourceBundle.rawValue,
+        aecModel: String? = nil,
+        aecDiagnostics: [MeetingAecDiagnosticsSnapshot] = [],
         priorEvidence: MeetingTranscriptEvidenceBundle? = nil,
         progress: @escaping @Sendable (MeetingProcessingPhase) -> Void = { _ in }
     ) async throws -> RecoveredMeetingProcessingResult {
@@ -141,6 +144,7 @@ enum MeetingFinalProcessingService {
             diarizationProfileID: finalDiarizationPolicy.profileID,
             progress: { stage in
                 switch stage {
+                case .processingAudio: progress(.processingAudio)
                 case .transcribing: progress(.transcribing)
                 case .preparingDiarizer: progress(.preparingDiarizer)
                 case .diarizing: progress(.diarizing)
@@ -150,7 +154,10 @@ enum MeetingFinalProcessingService {
         )
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: backend,
-            startedAt: transcriptionStartedAt
+            startedAt: transcriptionStartedAt,
+            audioSource: audioSource,
+            aecModel: aecModel,
+            aecDiagnostics: aecDiagnostics
         )
         let currentSessionTranscript = transcription.formattedTranscript
         let priorTranscript = meeting.rawTranscript.trimmingCharacters(in: .whitespacesAndNewlines)

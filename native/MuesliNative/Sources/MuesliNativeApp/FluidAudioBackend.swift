@@ -1,6 +1,7 @@
 import FluidAudio
 import Foundation
 import MuesliCore
+import MuesliFluidAudioSupport
 
 /// Native Swift transcription backend using FluidAudio's Parakeet TDT model
 /// running on Apple's Neural Engine (ANE) via CoreML.
@@ -21,50 +22,118 @@ actor FluidAudioTranscriber {
 
     /// Downloads models (if needed) and initializes the ASR manager.
     /// - Parameter version: .v3 for multilingual (25 langs), .v2 for English-only
-    func loadModels(version: AsrModelVersion = .v3, progress: ((Double, String?) -> Void)? = nil) async throws {
+    func loadModels(
+        version: AsrModelVersion = .v3,
+        progress: ((Double, String?) -> Void)? = nil,
+        progressSnapshot: ModelDownloadProgressHandler? = nil
+    ) async throws {
         if loadedVersion == version, asrManager != nil { return }
 
         fputs("[fluidaudio] downloading/loading models (version: \(version))...\n", stderr)
-        let estimatedTotalBytes: Int64 = 450 * 1_000_000
-        let rateEstimator = DownloadRateEstimator()
-        let totalText = Self.formatMegabytes(estimatedTotalBytes)
-        let models = try await AsrModels.downloadAndLoad(version: version) { downloadProgress in
-            let fraction = downloadProgress.fractionCompleted
-            let estimatedDownloadFraction = min(max(fraction / 0.5, 0), 1)
-            let estimatedBytes = Int64(Double(estimatedTotalBytes) * estimatedDownloadFraction)
-            let bytesPerSecond = rateEstimator.bytesPerSecond(for: estimatedBytes)
-            let status: String
-            switch downloadProgress.phase {
-            case .listing:
-                status = "0 MB of \(totalText)"
-            case .downloading(_, _):
-                let completedText = Self.formatMegabytes(estimatedBytes)
-                if bytesPerSecond > 0 {
-                    let rateText = Self.formatMegabytes(Int64(bytesPerSecond))
-                    status = "\(completedText) of \(totalText) • \(rateText)/s"
-                } else {
-                    status = "\(completedText) of \(totalText)"
+        let plan = HomanModelDownloadCenter.parakeetPlan(version: version)
+        let legacyPlan = HomanModelDownloadCenter.legacyParakeetPlan(version: version)
+
+        if !plan.isAvailableLocally(),
+           !HomanModelDownloadCenter.isLegacySuppressed(
+               version == .v2 ? .parakeetEnglish : .parakeetMultilingual
+           ),
+           legacyPlan.isAvailableLocally() {
+            do {
+                let adopted = try await ManagedASRModelDownloader.withRegisteredOperation(plan) {
+                    try plan.reconcileInterruptedInstallation()
+                    guard !plan.isAvailableLocally(),
+                          !HomanModelDownloadCenter.isLegacySuppressed(
+                              version == .v2 ? .parakeetEnglish : .parakeetMultilingual
+                          ),
+                          legacyPlan.isAvailableLocally()
+                    else { return false }
+                    let validating = ModelDownloadProgress.preparing(
+                        modelID: plan.modelID,
+                        message: "Validating existing Parakeet model..."
+                    )
+                    await HomanModelDownloadCenter.shared.publish(validating)
+                    progressSnapshot?(validating)
+                    progress?(0.9, validating.message)
+                    let adopting = validating.replacing(
+                        phase: .preparing,
+                        message: "Importing model into Homan..."
+                    )
+                    await HomanModelDownloadCenter.shared.publish(adopting)
+                    progressSnapshot?(adopting)
+                    progress?(0.96, adopting.message)
+                    let manager = try await plan.adoptValidatedInstallation(from: legacyPlan) { copiedDirectory in
+                        let validatingCopy = adopting.replacing(
+                            phase: .preparing,
+                            message: "Validating imported Parakeet model..."
+                        )
+                        await HomanModelDownloadCenter.shared.publish(validatingCopy)
+                        progressSnapshot?(validatingCopy)
+                        progress?(0.98, validatingCopy.message)
+                        return try await Self.loadManager(from: copiedDirectory, version: version)
+                    }
+                    try Task.checkCancellation()
+                    try await self.commitLoadedManager(manager, version: version)
+                    let ready = adopting.replacing(phase: .ready, message: "Model ready")
+                    await HomanModelDownloadCenter.shared.publish(ready)
+                    progressSnapshot?(ready)
+                    progress?(1, ready.message)
+                    return true
                 }
-            case .compiling(_):
-                status = "Compiling model..."
-            }
-            DispatchQueue.main.async {
-                progress?(fraction, status)
+                if adopted {
+                    fputs("[fluidaudio] existing models validated and ready\n", stderr)
+                    return
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                // Never delete or mutate the old cache. A broken legacy package
+                // falls through to a fresh staged Homan-owned download.
+                fputs("[fluidaudio] existing model validation failed; downloading managed copy: \(error)\n", stderr)
             }
         }
-        let manager = AsrManager(config: .default)
-        try await manager.loadModels(models)
-        self.asrManager = manager
-        self.loadedVersion = version
+
+        _ = try await ManagedASRModelDownloader.loadValidated(
+            plan,
+            progress: progress,
+            progressSnapshot: progressSnapshot,
+            finalize: { manager in
+                try Task.checkCancellation()
+                try await self.commitLoadedManager(manager, version: version)
+                let ready = ModelDownloadProgress.ready(modelID: plan.modelID)
+                await HomanModelDownloadCenter.shared.publish(ready)
+                progressSnapshot?(ready)
+                progress?(1, ready.message)
+            }
+        ) { modelDirectory in
+            let preparing = ModelDownloadProgress.preparing(
+                modelID: plan.modelID,
+                message: "Loading Parakeet into Core ML..."
+            )
+            await HomanModelDownloadCenter.shared.publish(preparing)
+            progressSnapshot?(preparing)
+            progress?(0.98, preparing.message)
+            return try await Self.loadManager(from: modelDirectory, version: version)
+        }
         fputs("[fluidaudio] models ready\n", stderr)
     }
 
-    private static func formatMegabytes(_ bytes: Int64) -> String {
-        let megabytes = Double(bytes) / 1_000_000
-        if megabytes >= 100 {
-            return "\(Int(megabytes.rounded())) MB"
-        }
-        return String(format: "%.1f MB", megabytes)
+    private func commitLoadedManager(
+        _ manager: AsrManager,
+        version: AsrModelVersion
+    ) throws {
+        try Task.checkCancellation()
+        asrManager = manager
+        loadedVersion = version
+    }
+
+    private static func loadManager(
+        from directory: URL,
+        version: AsrModelVersion
+    ) async throws -> AsrManager {
+        let models = try await OfflineParakeetModelLoader.load(from: directory, version: version)
+        let manager = AsrManager(config: .default)
+        try await manager.loadModels(models)
+        return manager
     }
 
     /// Transcribe a WAV file URL directly.
@@ -78,19 +147,9 @@ actor FluidAudioTranscriber {
         asrManager = nil
         loadedVersion = nil
     }
-}
 
-private final class DownloadRateEstimator {
-    private var downloadStartedAt: Date?
-
-    func bytesPerSecond(for estimatedBytes: Int64) -> Double {
-        guard estimatedBytes > 0 else { return 0 }
-        let now = Date()
-        if downloadStartedAt == nil {
-            downloadStartedAt = now
-            return 0
-        }
-        let elapsed = max(now.timeIntervalSince(downloadStartedAt ?? now), 1.0)
-        return Double(estimatedBytes) / elapsed
+    func shutdown(ifLoadedVersion version: AsrModelVersion) {
+        guard loadedVersion == version else { return }
+        shutdown()
     }
 }

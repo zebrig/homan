@@ -155,6 +155,7 @@ extension MeetingSessionResult {
 
 enum MeetingProcessingStage {
     case cleaningWav
+    case processingAudio
     case writingRecording
     case transcribingAudio
     case preparingDiarizer
@@ -1623,12 +1624,14 @@ final class MeetingSession: @unchecked Sendable {
         // Raw capture is finalized before cancellation is observed so an
         // interrupted quit always leaves a recoverable canonical recording.
         try Task.checkCancellation()
+        onProgress?(.processingAudio)
         var stagedAudio = try await MeetingRawAudioPostProcessor.prepare(
             stagedRawAudio,
             aec: neuralAec,
             supportDirectory: processingSupportDirectory,
             inferenceScheduler: inferenceScheduler
         )
+        let postProcessingAECDiagnostics = neuralAec.diagnosticsSnapshot
         onProgress?(.writingRecording)
         let retainedRecordingURL: URL?
         if config.meetingRecordingSavePolicy == .never {
@@ -1692,6 +1695,7 @@ final class MeetingSession: @unchecked Sendable {
             diarizationProfileID: finalDiarizationPolicy.profileID,
             progress: { [weak self] stage in
                 switch stage {
+                case .processingAudio: self?.onProgress?(.processingAudio)
                 case .transcribing: self?.onProgress?(.transcribingAudio)
                 case .preparingDiarizer: self?.onProgress?(.preparingDiarizer)
                 case .diarizing: self?.onProgress?(.diarizing)
@@ -1719,7 +1723,10 @@ final class MeetingSession: @unchecked Sendable {
         let rawTranscript = evidencePublication.activeTranscript
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: finalBackend,
-            startedAt: transcriptionStartedAt
+            startedAt: transcriptionStartedAt,
+            audioSource: MeetingTranscriptionAudioSource.rawSourceBundle.rawValue,
+            aecModel: config.resolvedMeetingAecModel.rawValue,
+            aecDiagnostics: [postProcessingAECDiagnostics]
         )
 
         fputs(

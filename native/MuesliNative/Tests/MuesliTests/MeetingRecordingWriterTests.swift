@@ -149,6 +149,37 @@ struct MeetingRecordingWriterTests {
         #expect(mean(systemSamples) < -0.05)
     }
 
+    @Test("separated channel extraction observes cancellation between bounded blocks")
+    func separatedExtractionIsCancellable() throws {
+        let directory = makeTemporaryDirectory()
+        defer { try? FileManager.default.removeItem(at: directory) }
+        let samples = [Int16](repeating: 2_000, count: 40_000)
+        let microphone = try writeWAV(samples, named: "mic.wav", in: directory)
+        let system = try writeWAV(samples, named: "system.wav", in: directory)
+        let retained = try #require(
+            try MeetingRecordingWriter.makeTemporarySeparatedRecording(
+                microphoneURL: microphone,
+                systemURL: system
+            )
+        )
+        defer { try? FileManager.default.removeItem(at: retained) }
+        var checkpointCount = 0
+
+        #expect(throws: CancellationError.self) {
+            _ = try MeetingRecordingWriter.extractSeparatedChannels(
+                from: retained,
+                sourceLayout: .separateStereoMicrophoneAndSystem,
+                cancellationCheck: {
+                    checkpointCount += 1
+                    if checkpointCount == 3 {
+                        throw CancellationError()
+                    }
+                }
+            )
+        }
+        #expect(checkpointCount == 3)
+    }
+
     @Test("center playback is temporary and leaves retained channels unchanged")
     func centeredPlaybackDoesNotModifySource() throws {
         let directory = makeTemporaryDirectory()

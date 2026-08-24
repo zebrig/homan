@@ -34,10 +34,18 @@ let package = Package(
                 .linkedLibrary("sqlite3"),
             ]
         ),
+        .target(
+            name: "MuesliFluidAudioSupport",
+            dependencies: [
+                .product(name: "FluidAudio", package: "FluidAudio"),
+            ],
+            path: "Sources/MuesliFluidAudioSupport"
+        ),
         .executableTarget(
             name: "MuesliNativeApp",
             dependencies: [
                 "MuesliCore",
+                "MuesliFluidAudioSupport",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "LlamaSwift", package: "llama.swift"),
                 .target(name: "CLiteRTLM_mac", condition: .when(platforms: [.macOS])),
@@ -65,6 +73,7 @@ let package = Package(
             name: "MuesliCLI",
             dependencies: [
                 "MuesliCore",
+                "MuesliFluidAudioSupport",
                 .product(name: "ArgumentParser", package: "swift-argument-parser"),
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
@@ -100,6 +109,7 @@ let package = Package(
             dependencies: [
                 "MuesliNativeApp",
                 "MuesliCore",
+                "MuesliFluidAudioSupport",
                 "MuesliCLI",
                 "AudioGraphExceptionBridge",
                 "LocalVQEBridge",

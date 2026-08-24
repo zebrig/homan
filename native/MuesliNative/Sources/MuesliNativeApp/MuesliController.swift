@@ -401,6 +401,7 @@ final class MuesliController: NSObject {
 
     private var searchTask: Task<Void, Never>?
     private var onboardingModelPreparationTask: Task<Void, Never>?
+    private var modelDownloadObservationTask: Task<Void, Never>?
     private var maraudersMapCountdown: MaraudersMapCountdownController?
 
     private var statusBarController: StatusBarController?
@@ -437,6 +438,8 @@ final class MuesliController: NSObject {
     private var staleLiveMeetingRecoveryFailures = Set<Int64>()
     private var meetingRecoveryInFlightIDs = Set<Int64>()
     private var dictationState: DictationState = .idle
+    private var dictationStateGeneration: UInt64 = 0
+    private var meetingProcessingIndicatorGeneration: UInt64?
     private var dictationBackendReadiness: DictationBackendReadiness = .preparing
     private var dictationStartedAt: Date?
     private var dictationLatencyTraceID: UUID?
@@ -620,6 +623,8 @@ final class MuesliController: NSObject {
     func start() {
         guard runtimeSideEffectsEnabled else { return }
         hasStarted = true
+        startModelDownloadObservationIfNeeded()
+        Task { await HomanModelDownloadCenter.reconcileManagedPackages() }
         do {
             try dictationStore.migrateIfNeeded()
         } catch {
@@ -4120,13 +4125,15 @@ final class MuesliController: NSObject {
         detail: String?,
         progress: Double?,
         isPreparing: Bool,
-        isComplete: Bool
+        isComplete: Bool,
+        terminalPhase: ModelDownloadPhase? = nil
     ) {
         appState.modelPreparationTitle = title
         appState.modelPreparationDetail = detail
         appState.modelPreparationProgress = progress.map { min(max($0, 0), 1) }
         appState.isModelPreparingAfterDownload = isPreparing
         appState.modelPreparationIsComplete = isComplete
+        appState.modelPreparationTerminalPhase = terminalPhase
         if isComplete {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(5))
@@ -4137,6 +4144,7 @@ final class MuesliController: NSObject {
                 appState.modelPreparationProgress = nil
                 appState.isModelPreparingAfterDownload = false
                 appState.modelPreparationIsComplete = false
+                appState.modelPreparationTerminalPhase = nil
             }
         } else if !isPreparing && progress == nil {
             Task { @MainActor in
@@ -4147,7 +4155,60 @@ final class MuesliController: NSObject {
                       !appState.modelPreparationIsComplete else { return }
                 appState.modelPreparationTitle = nil
                 appState.modelPreparationDetail = nil
+                appState.modelPreparationTerminalPhase = nil
             }
+        }
+    }
+
+    private func startModelDownloadObservationIfNeeded() {
+        guard modelDownloadObservationTask == nil else { return }
+        modelDownloadObservationTask = Task { @MainActor [weak self] in
+            let updates = await HomanModelDownloadCenter.shared.progressUpdates()
+            for await snapshot in updates {
+                guard let self, !Task.isCancelled else { return }
+                applyModelDownloadSnapshot(snapshot)
+            }
+        }
+    }
+
+    private func applyModelDownloadSnapshot(_ snapshot: ModelDownloadProgress) {
+        appState.modelDownloadSnapshots[snapshot.modelID] = snapshot
+        let backend = BackendOption.allKnown.first { $0.model == snapshot.modelID }
+        let label = backend?.label ?? snapshot.modelID
+        switch snapshot.phase {
+        case .downloading:
+            updateModelPreparationStatus(
+                title: "Downloading \(label)",
+                detail: ModelDownloadDisplayFormatting.detail(snapshot),
+                progress: snapshot.fractionCompleted,
+                isPreparing: false,
+                isComplete: false
+            )
+        case .preparing:
+            updateModelPreparationStatus(
+                title: "Preparing \(label)",
+                detail: ModelDownloadDisplayFormatting.detail(snapshot),
+                progress: nil,
+                isPreparing: true,
+                isComplete: false
+            )
+        case .ready:
+            updateModelPreparationStatus(
+                title: "\(label) ready",
+                detail: "Ready for transcription",
+                progress: 1,
+                isPreparing: false,
+                isComplete: true
+            )
+        case .paused, .failed:
+            updateModelPreparationStatus(
+                title: snapshot.phase == .paused ? "Download paused" : "Model setup failed",
+                detail: ModelDownloadDisplayFormatting.detail(snapshot),
+                progress: snapshot.fractionCompleted,
+                isPreparing: false,
+                isComplete: false,
+                terminalPhase: snapshot.phase
+            )
         }
     }
 
@@ -4670,17 +4731,49 @@ final class MuesliController: NSObject {
             var didSetProcessing = false
             var processingRunID: UUID?
             do {
-                let recordingUnits = try MeetingRecordingUnitResolver.resolve(
-                    meetingID: meeting.id,
-                    store: self.dictationStore,
-                    supportDirectory: self.configStore.supportDirectory()
+                let recordingUnitRecords = try self.dictationStore.meetingRecordingUnits(
+                    meetingID: meeting.id
                 )
+                guard !recordingUnitRecords.isEmpty,
+                      let recordingReadLease = MeetingRecordingLeaseRegistry.shared.acquireReads(
+                          for: recordingUnitRecords.map {
+                              .recordingID($0.recording.id)
+                          }
+                      ) else {
+                    throw MeetingRetranscriptionError.recordingUnavailable
+                }
+                // Protect canonical bundles and playback fallbacks before the
+                // detached resolver first touches disk. Keep the composite
+                // reader across diarization resolution, model preload, AEC,
+                // ASR, and optional speaker analysis.
+                defer { recordingReadLease.release() }
+                let supportDirectory = self.configStore.supportDirectory()
+                let recordingUnits = try await Task.detached(priority: .userInitiated) {
+                    try MeetingRecordingUnitResolver.resolve(
+                        units: recordingUnitRecords,
+                        supportDirectory: supportDirectory
+                    )
+                }.value
                 guard !recordingUnits.isEmpty else {
                     throw MeetingRetranscriptionError.recordingUnavailable
                 }
                 guard recordingUnits.contains(where: { $0.hasUsableAudio(onDisk: .default) }) else {
                     throw MeetingRetranscriptionError.recordingUnavailable
                 }
+                let requestedAECModel = self.config.resolvedMeetingAecModel
+                let transcriptionAudioSource = MeetingTranscriptionProvenance.audioSource(
+                    for: recordingUnits
+                )
+                let transcriptionAECModel = MeetingTranscriptionProvenance.requestedAECModel(
+                    for: recordingUnits,
+                    requested: requestedAECModel
+                )
+                fputs(
+                    "[meeting-source] retranscription selected="
+                        + "\(transcriptionAudioSource ?? "none") requestedAEC="
+                        + "\(transcriptionAECModel ?? "not_applied")\n",
+                    stderr
+                )
                 let meetingStart = ISO8601DateFormatter().date(from: meeting.startTime)
                     ?? Date(timeIntervalSince1970: 0)
                 let priorEvidence = try self.dictationStore.meetingTranscriptEvidence(
@@ -4725,13 +4818,6 @@ final class MuesliController: NSObject {
                 self.historyWindowController?.reload()
 
                 let transcriptionStartedAt = Date()
-                if let processingRunID {
-                    self.advanceMeetingProcessing(
-                        meetingID: meeting.id,
-                        runID: processingRunID,
-                        phase: .transcribing
-                    )
-                }
                 if backend.backend == BackendOption.homanWhisper.backend {
                     try await self.transcriptionCoordinator.configureHomanWhisper(
                         endpointString: self.config.homanWhisperEndpoint,
@@ -4763,13 +4849,14 @@ final class MuesliController: NSObject {
                         purpose: .retranscribe,
                         systemDiarization: resolvedDiarization.pipelinePolicy,
                         diarizationProfileID: resolvedDiarization.profileID,
-                        aecModel: self.config.resolvedMeetingAecModel,
+                        aecModel: requestedAECModel,
                         reusableDiarization: resolvedDiarization.reusableRevision,
                         progress: { stage in
                             Task { @MainActor [weak self] in
                                 guard let self, let processingRunID else { return }
                                 let phase: MeetingProcessingPhase
                                 switch stage {
+                                case .processingAudio: phase = .processingAudio
                                 case .transcribing: phase = .transcribing
                                 case .preparingDiarizer: phase = .preparingDiarizer
                                 case .diarizing: phase = .diarizing
@@ -4792,6 +4879,10 @@ final class MuesliController: NSObject {
                 } catch MeetingTranscriptionPipelineError.compatibleDiarizationUnavailable {
                     throw MeetingRetranscriptionError.compatibleSpeakerAnalysisUnavailable
                 }
+                // Everything below consumes in-memory transcript/evidence
+                // values only. Release retained audio promptly instead of
+                // blocking deletion during potentially slow summarization.
+                recordingReadLease.release()
                 let reusedDiarization = transcription.reusedDiarizationRevisionID.flatMap { id in
                     priorEvidence?.diarizationRevisions.last { $0.id == id }
                 }
@@ -4812,7 +4903,10 @@ final class MuesliController: NSObject {
                 }
                 let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
                     backend: backend,
-                    startedAt: transcriptionStartedAt
+                    startedAt: transcriptionStartedAt,
+                    audioSource: transcriptionAudioSource,
+                    aecModel: transcriptionAECModel,
+                    aecDiagnostics: transcription.units.compactMap(\.aecDiagnostics)
                 )
 
                 let templateSnapshot = self.meetingTemplateSnapshot(for: meeting)
@@ -5309,6 +5403,10 @@ final class MuesliController: NSObject {
             guard let self else { return }
             var activeStagedAudio = legacyStagedAudio
             var activeRawAudio = stagedRawAudio
+            var recoveryAudioSource = MeetingTranscriptionAudioSource
+                .derivedSourceBundle.rawValue
+            var recoveryAECModel: String?
+            var recoveryAECDiagnostics: [MeetingAecDiagnosticsSnapshot] = []
             do {
                 if var rawAudio = activeRawAudio {
                     rawAudio = try MeetingRawAudioCapture.markProcessing(
@@ -5316,15 +5414,25 @@ final class MuesliController: NSObject {
                     )
                     activeRawAudio = rawAudio
                     if activeStagedAudio == nil {
+                        self.advanceMeetingProcessing(
+                            meetingID: meetingID,
+                            runID: processingRunID,
+                            phase: .processingAudio
+                        )
+                        let recoveryAEC = MeetingNeuralAec(
+                            localVQEModel: self.config.resolvedMeetingAecModel
+                        )
                         activeStagedAudio = try await MeetingRawAudioPostProcessor
                             .prepare(
                                 rawAudio,
-                                aec: MeetingNeuralAec(
-                                    localVQEModel: self.config.resolvedMeetingAecModel
-                                ),
+                                aec: recoveryAEC,
                                 supportDirectory: self.processingSupportDirectory,
                                 inferenceScheduler: .shared
                             )
+                        recoveryAudioSource = MeetingTranscriptionAudioSource
+                            .rawSourceBundle.rawValue
+                        recoveryAECModel = self.config.resolvedMeetingAecModel.rawValue
+                        recoveryAECDiagnostics = [recoveryAEC.diagnosticsSnapshot]
                         self.advanceMeetingProcessing(
                             meetingID: meetingID,
                             runID: processingRunID,
@@ -5341,6 +5449,9 @@ final class MuesliController: NSObject {
                     config: self.config,
                     templateSnapshot: templateSnapshot,
                     coordinator: self.transcriptionCoordinator,
+                    audioSource: recoveryAudioSource,
+                    aecModel: recoveryAECModel,
+                    aecDiagnostics: recoveryAECDiagnostics,
                     priorEvidence: try self.dictationStore.meetingTranscriptEvidence(
                         meetingID: meetingID
                     ),
@@ -7735,6 +7846,8 @@ final class MuesliController: NSObject {
         indicator.setMeetingRecording(false, config: config)
         indicator.setTranscribingTitle("Transcribing", config: config)
         setState(.transcribing)
+        let floatingIndicatorGeneration = dictationStateGeneration
+        meetingProcessingIndicatorGeneration = floatingIndicatorGeneration
         let processingMeetingID = liveMeetingID
         sessionToStop.onProgress = { [weak self] stage in
             Task { @MainActor [weak self] in
@@ -7743,7 +7856,12 @@ final class MuesliController: NSObject {
                       !self.isStartingMeetingRecording,
                       let meetingID = processingMeetingID,
                       let runID = processingRunID else { return }
-                self.setMeetingProcessingStage(stage, meetingID: meetingID, runID: runID)
+                self.setMeetingProcessingStage(
+                    stage,
+                    meetingID: meetingID,
+                    runID: runID,
+                    floatingIndicatorGeneration: floatingIndicatorGeneration
+                )
             }
         }
 
@@ -7767,7 +7885,7 @@ final class MuesliController: NSObject {
         let backgroundTask = Task { [weak self] in
             guard let self else { return }
             defer {
-                self.backgroundMeetingProcessing.remove(id: backgroundTaskID)
+                self.finishBackgroundMeetingProcessing(id: backgroundTaskID)
             }
             var meetingTitle = "Meeting"
             var completedMeetingID: Int64?
@@ -7785,7 +7903,8 @@ final class MuesliController: NSObject {
                         self.advanceMeetingProcessing(
                             meetingID: meetingID,
                             runID: runID,
-                            phase: .encodingRecording
+                            phase: .encodingRecording,
+                            floatingIndicatorGeneration: floatingIndicatorGeneration
                         )
                     }
                 }
@@ -7799,7 +7918,8 @@ final class MuesliController: NSObject {
                         self.advanceMeetingProcessing(
                             meetingID: meetingID,
                             runID: runID,
-                            phase: .saving
+                            phase: .saving,
+                            floatingIndicatorGeneration: floatingIndicatorGeneration
                         )
                     }
                 }
@@ -7889,14 +8009,6 @@ final class MuesliController: NSObject {
                         self.finishMeetingProcessing(meetingID: liveMeetingID, runID: runID)
                     }
                 }
-                if !self.isMeetingRecording()
-                    && !self.isStartingMeetingRecording
-                    && !self.isPreparingForApplicationTermination
-                    && self.backgroundMeetingProcessing.count == 0 {
-                    self.setState(.idle)
-                    self.statusBarController?.refresh()
-                }
-                self.endMeetingActivity()
                 self.historyWindowController?.reload()
                 self.syncAppState()
                 self.clearLiveMeetingTranscript(ownerID: liveMeetingID)
@@ -8858,6 +8970,7 @@ final class MuesliController: NSObject {
     private func setState(_ state: DictationState) {
         pendingPreparingIndicatorWorkItem?.cancel()
         pendingPreparingIndicatorWorkItem = nil
+        dictationStateGeneration &+= 1
         dictationState = state
         appState.dictationState = state
         let status: String
@@ -8990,6 +9103,25 @@ final class MuesliController: NSObject {
         guard let activity = meetingActivity else { return }
         ProcessInfo.processInfo.endActivity(activity)
         meetingActivity = nil
+    }
+
+    /// Finalizes the visible meeting-processing handoff only after the task has
+    /// left the shutdown registry. The generation check prevents a completed
+    /// meeting from overwriting a newer dictation or computer-use indicator.
+    private func finishBackgroundMeetingProcessing(id: UUID) {
+        guard backgroundMeetingProcessing.remove(id: id) else { return }
+
+        let stillOwnsFloatingIndicator = meetingProcessingIndicatorGeneration == dictationStateGeneration
+        meetingProcessingIndicatorGeneration = nil
+        if stillOwnsFloatingIndicator,
+           dictationState == .transcribing,
+           !isMeetingRecording(),
+           !isStartingMeetingRecording,
+           !isPreparingForApplicationTermination {
+            setState(.idle)
+            statusBarController?.refresh()
+        }
+        endMeetingActivity()
     }
 
     private func dismissPresentedMeetingDetection() {
@@ -9267,7 +9399,9 @@ final class MuesliController: NSObject {
     /// meeting list/detail use the full persisted phase, counter and timers.
     private static func processingShortLabel(for phase: MeetingProcessingPhase) -> String {
         switch phase {
-        case .preparingAudio, .preparingRecording: return "Cleaning"
+        case .preparingAudio: return "Preparing audio"
+        case .processingAudio: return "Processing audio"
+        case .preparingRecording: return "Preparing recording"
         case .transcribing: return "Transcribing"
         case .preparingDiarizer: return "Loading speakers"
         case .diarizing: return "Analyzing speakers"
@@ -9283,11 +9417,13 @@ final class MuesliController: NSObject {
     private func setMeetingProcessingStage(
         _ stage: MeetingProcessingStage,
         meetingID: Int64,
-        runID: UUID
+        runID: UUID,
+        floatingIndicatorGeneration: UInt64? = nil
     ) {
         let phase: MeetingProcessingPhase
         switch stage {
         case .cleaningWav: phase = .preparingAudio
+        case .processingAudio: phase = .processingAudio
         case .writingRecording: phase = .preparingRecording
         case .transcribingAudio: phase = .transcribing
         case .preparingDiarizer: phase = .preparingDiarizer
@@ -9296,7 +9432,12 @@ final class MuesliController: NSObject {
         case .generatingTitle: phase = .generatingTitle
         case .summarizingNotes: phase = .summarizing
         }
-        advanceMeetingProcessing(meetingID: meetingID, runID: runID, phase: phase)
+        advanceMeetingProcessing(
+            meetingID: meetingID,
+            runID: runID,
+            phase: phase,
+            floatingIndicatorGeneration: floatingIndicatorGeneration
+        )
     }
 
     /// Starts the canonical local run and changes the meeting status atomically.
@@ -9509,7 +9650,8 @@ final class MuesliController: NSObject {
     private func advanceMeetingProcessing(
         meetingID: Int64,
         runID: UUID,
-        phase: MeetingProcessingPhase
+        phase: MeetingProcessingPhase,
+        floatingIndicatorGeneration: UInt64? = nil
     ) {
         guard let current = appState.meetingProcessing[meetingID],
               current.runID == runID,
@@ -9524,9 +9666,12 @@ final class MuesliController: NSObject {
         }
         appState.meetingProcessing[meetingID] = advanced
         let shortLabel = Self.processingShortLabel(for: phase)
-        statusBarController?.setStatus(shortLabel)
-        statusBarController?.refresh()
-        indicator.setTranscribingTitle(shortLabel, config: config)
+        if floatingIndicatorGeneration == nil
+            || floatingIndicatorGeneration == dictationStateGeneration {
+            statusBarController?.setStatus(shortLabel)
+            statusBarController?.refresh()
+            indicator.setTranscribingTitle(shortLabel, config: config)
+        }
     }
 
     /// Finishes only the matching run. Passing a status makes status and cleanup atomic.

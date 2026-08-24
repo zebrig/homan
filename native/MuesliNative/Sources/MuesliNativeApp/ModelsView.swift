@@ -10,6 +10,8 @@ struct ModelsView: View {
     @State private var downloadProgress: [String: Double] = [:]
     @State private var downloadedModels: Set<String> = []
     @State private var downloadTasks: [String: Task<Void, Never>] = [:]
+    @State private var downloadGenerations: [String: UUID] = [:]
+    @State private var cancellingModels: Set<String> = []
     @State private var modelToDelete: BackendOption?
     @State private var selectedParakeetModel: String
     @State private var selectedWhisperModel: String
@@ -989,10 +991,17 @@ struct ModelsView: View {
         options: [BackendOption]
     ) -> some View {
         let selectedOption = options.first(where: { $0.model == selection.wrappedValue }) ?? options[0]
-        let isActive = appState.selectedBackend == selectedOption
+        let snapshot = appState.modelDownloadSnapshots[selectedOption.model]
         let isDownloaded = downloadedModels.contains(selectedOption.model)
+            || (selectedOption.backend == "fluidaudio"
+                && HomanModelDownloadCenter.isAvailableLocally(selectedOption))
+        let hasSetupFailure = ModelDownloadDisplayFormatting.blocksActivation(snapshot)
+        let isActive = appState.selectedBackend == selectedOption
+            && isDownloaded
+            && !hasSetupFailure
         let isDownloading = downloadingModels.contains(selectedOption.model)
-        let progress = downloadProgress[selectedOption.model] ?? 0
+            || ModelDownloadDisplayFormatting.isActiveJob(snapshot)
+        let progress = snapshot?.fractionCompleted ?? downloadProgress[selectedOption.model] ?? 0
 
         return VStack(alignment: .leading, spacing: MuesliTheme.spacing12) {
             HStack(alignment: .top, spacing: MuesliTheme.spacing12) {
@@ -1050,13 +1059,25 @@ struct ModelsView: View {
                 VStack(alignment: .leading, spacing: 4) {
                     ProgressView(value: progress)
                         .tint(MuesliTheme.accent)
-                    Text("\(Int(progress * 100))% downloading...")
+                    Text(snapshot.map { ModelDownloadDisplayFormatting.detail($0) }
+                        ?? "\(Int(progress * 100))% downloading...")
                         .font(.system(size: 11))
                         .foregroundStyle(MuesliTheme.textTertiary)
                 }
+            } else if let snapshot,
+                      snapshot.phase == .paused || snapshot.phase == .failed {
+                Text(ModelDownloadDisplayFormatting.detail(snapshot))
+                    .font(.system(size: 11))
+                    .foregroundStyle(snapshot.phase == .failed ? .red : MuesliTheme.textTertiary)
             }
 
-            actionButtons(for: selectedOption, isActive: isActive, isDownloaded: isDownloaded, isDownloading: isDownloading)
+            actionButtons(
+                for: selectedOption,
+                isActive: isActive,
+                isDownloaded: isDownloaded,
+                isDownloading: isDownloading,
+                hasSetupFailure: hasSetupFailure
+            )
         }
         .padding(MuesliTheme.spacing16)
         .background(MuesliTheme.backgroundRaised)
@@ -1123,15 +1144,17 @@ struct ModelsView: View {
         isActive: Bool,
         isDownloaded: Bool,
         isDownloading: Bool,
+        hasSetupFailure: Bool = false,
         actionTitle: String = "Set Active",
         activationDisabledReason: String? = nil,
         onSetActive: (() -> Void)? = nil
     ) -> some View {
         HStack(spacing: MuesliTheme.spacing8) {
             if isDownloading {
-                Button("Cancel") {
+                Button(cancellingModels.contains(option.model) ? "Cancelling…" : "Cancel") {
                     cancelDownload(option)
                 }
+                .disabled(cancellingModels.contains(option.model))
                 .buttonStyle(.plain)
                 .font(.system(size: 12, weight: .medium))
                 .foregroundStyle(MuesliTheme.textSecondary)
@@ -1139,6 +1162,29 @@ struct ModelsView: View {
                 .padding(.vertical, 4)
                 .background(MuesliTheme.surfacePrimary)
                 .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+            } else if hasSetupFailure {
+                Button("Retry") {
+                    startDownload(option)
+                }
+                .buttonStyle(.plain)
+                .font(.system(size: 12, weight: .medium))
+                .foregroundStyle(MuesliTheme.accent)
+                .padding(.horizontal, MuesliTheme.spacing12)
+                .padding(.vertical, 4)
+                .background(MuesliTheme.accentSubtle)
+                .clipShape(RoundedRectangle(cornerRadius: MuesliTheme.cornerSmall))
+
+                if isDownloaded {
+                    Button {
+                        modelToDelete = option
+                    } label: {
+                        Image(systemName: "trash")
+                            .font(.system(size: 12))
+                            .foregroundStyle(.red.opacity(0.6))
+                            .frame(width: 20, height: 20)
+                    }
+                    .buttonStyle(.plain)
+                }
             } else if isDownloaded {
                 if !isActive {
                     Button(actionTitle) {
@@ -1548,6 +1594,10 @@ struct ModelsView: View {
     // MARK: - Actions
 
     private func startDownload(_ option: BackendOption) {
+        guard downloadTasks[option.model] == nil,
+              !cancellingModels.contains(option.model) else { return }
+        let generation = UUID()
+        downloadGenerations[option.model] = generation
         withAnimation { _ = downloadingModels.insert(option.model) }
         downloadProgress[option.model] = 0.05  // Show initial progress immediately
 
@@ -1556,12 +1606,15 @@ struct ModelsView: View {
             do {
                 try await controller.transcriptionCoordinator.preloadRequired(
                     backend: option,
-                    includeMeetingHelpers: controller.config.resolvedOnboardingUseCase.includesMeetings
-                ) { progress, _ in
-                    DispatchQueue.main.async {
-                        downloadProgress[option.model] = max(progress, 0.05)
+                    includeMeetingHelpers: controller.config.resolvedOnboardingUseCase.includesMeetings,
+                    progress: { progress, _ in
+                        DispatchQueue.main.async {
+                            guard downloadGenerations[option.model] == generation,
+                                  !cancellingModels.contains(option.model) else { return }
+                            downloadProgress[option.model] = max(progress, 0.05)
+                        }
                     }
-                }
+                )
                 guard isModelDownloaded(option, fm: FileManager.default) else {
                     throw NSError(
                         domain: "MuesliModelDownload",
@@ -1571,11 +1624,7 @@ struct ModelsView: View {
                 }
                 guard !Task.isCancelled else {
                     await MainActor.run {
-                        withAnimation {
-                            downloadingModels.remove(option.model)
-                            downloadProgress.removeValue(forKey: option.model)
-                            downloadTasks.removeValue(forKey: option.model)
-                        }
+                        finishDownload(option, generation: generation, downloaded: false)
                     }
                     return
                 }
@@ -1585,35 +1634,75 @@ struct ModelsView: View {
                     try? await Task.sleep(nanoseconds: UInt64((1.5 - elapsed) * 1_000_000_000))
                 }
                 await MainActor.run {
-                    withAnimation {
-                        downloadingModels.remove(option.model)
-                        downloadedModels.insert(option.model)
-                        downloadProgress.removeValue(forKey: option.model)
-                        downloadTasks.removeValue(forKey: option.model)
-                    }
+                    finishDownload(option, generation: generation, downloaded: true)
                 }
             } catch {
                 await MainActor.run {
-                    withAnimation {
-                        downloadingModels.remove(option.model)
-                        downloadProgress.removeValue(forKey: option.model)
-                        downloadTasks.removeValue(forKey: option.model)
-                    }
+                    finishDownload(option, generation: generation, downloaded: false)
                 }
                 if !(error is CancellationError) {
                     fputs("[muesli-native] model download failed for \(option.backend)/\(option.model): \(error)\n", stderr)
                 }
             }
         }
-        downloadTasks[option.model] = task
+        if downloadGenerations[option.model] == generation {
+            downloadTasks[option.model] = task
+        } else {
+            task.cancel()
+        }
     }
 
     private func cancelDownload(_ option: BackendOption) {
-        downloadTasks[option.model]?.cancel()
+        guard !cancellingModels.contains(option.model) else { return }
+        guard let task = downloadTasks[option.model],
+              let generation = downloadGenerations[option.model] else {
+            guard option.backend == "fluidaudio",
+                  let phase = appState.modelDownloadSnapshots[option.model]?.phase,
+                  phase == .downloading || phase == .preparing else { return }
+            cancellingModels.insert(option.model)
+            Task {
+                await ManagedASRModelDownloader.cancelAndWait(modelID: option.model)
+                await MainActor.run {
+                    cancellingModels.remove(option.model)
+                    downloadingModels.remove(option.model)
+                    downloadProgress.removeValue(forKey: option.model)
+                }
+            }
+            return
+        }
+        cancellingModels.insert(option.model)
+        task.cancel()
+        Task {
+            if option.backend == "fluidaudio" {
+                await ManagedASRModelDownloader.cancelAndWait(modelID: option.model)
+            }
+            await task.value
+            await MainActor.run {
+                guard downloadGenerations[option.model] == generation else { return }
+                withAnimation {
+                    cancellingModels.remove(option.model)
+                    downloadingModels.remove(option.model)
+                    downloadProgress.removeValue(forKey: option.model)
+                    downloadTasks.removeValue(forKey: option.model)
+                    downloadGenerations.removeValue(forKey: option.model)
+                }
+            }
+        }
+    }
+
+    private func finishDownload(
+        _ option: BackendOption,
+        generation: UUID,
+        downloaded: Bool
+    ) {
+        guard downloadGenerations[option.model] == generation,
+              !cancellingModels.contains(option.model) else { return }
         withAnimation {
             downloadingModels.remove(option.model)
+            if downloaded { downloadedModels.insert(option.model) }
             downloadProgress.removeValue(forKey: option.model)
             downloadTasks.removeValue(forKey: option.model)
+            downloadGenerations.removeValue(forKey: option.model)
         }
     }
 
@@ -1683,16 +1772,20 @@ struct ModelsView: View {
             await controller.transcriptionCoordinator.unloadGemma4LiteRTTranscriber()
             try Gemma4LiteRTModelStore.deleteModelFiles(fileManager: fm)
         case "fluidaudio":
-            // FluidAudio models are in ~/Library/Application Support/FluidAudio/Models/
-            let supportDir = fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/FluidAudio/Models")
-            if option.model.contains("parakeet") {
-                let version = option.model.contains("v2") ? "v2" : "v3"
-                if let contents = try? fm.contentsOfDirectory(at: supportDir, includingPropertiesForKeys: nil) {
-                    for dir in contents where dir.lastPathComponent.contains("parakeet") && dir.lastPathComponent.contains(version) {
-                        try removeItemIfPresent(at: dir, fileManager: fm)
-                    }
-                }
+            guard let ownedPlan = HomanModelDownloadCenter.parakeetPlan(for: option) else { break }
+            let deletionToken = try await ManagedASRModelDownloader.beginDeletion(ownedPlan)
+            do {
+                await controller.transcriptionCoordinator.unloadFluidAudioTranscriber(for: option)
+                // Persist the user's intent first. If the process stops between
+                // these operations, the shared FluidAudio cache still cannot
+                // silently resurrect the model on the next launch.
+                try HomanModelDownloadCenter.suppressLegacyAdoption(option, fileManager: fm)
+                try ownedPlan.delete(fileManager: fm)
+                await HomanModelDownloadCenter.shared.clearProgress(modelID: option.model)
+                await ManagedASRModelDownloader.endDeletion(deletionToken)
+            } catch {
+                await ManagedASRModelDownloader.endDeletion(deletionToken)
+                throw error
             }
         case "qwen":
             let path = fm.homeDirectoryForCurrentUser
@@ -1752,16 +1845,7 @@ struct ModelsView: View {
                 .appendingPathComponent(".cache/muesli/models/nemotron35-multilingual-2240ms/encoder.mlmodelc/coremldata.bin")
             return fm.fileExists(atPath: path.path)
         case "fluidaudio":
-            // Check FluidAudio's cache
-            let supportDir = fm.homeDirectoryForCurrentUser
-                .appendingPathComponent("Library/Application Support/FluidAudio/Models")
-            if option.model.contains("parakeet") {
-                let version = option.model.contains("v2") ? "v2" : "v3"
-                if let contents = try? fm.contentsOfDirectory(at: supportDir, includingPropertiesForKeys: nil) {
-                    return contents.contains { $0.lastPathComponent.contains("parakeet") && $0.lastPathComponent.contains(version) }
-                }
-            }
-            return false
+            return HomanModelDownloadCenter.isAvailableLocally(option)
         case "qwen":
             let supportDir = fm.homeDirectoryForCurrentUser
                 .appendingPathComponent("Library/Application Support/FluidAudio/Models/qwen3-asr-0.6b-coreml")

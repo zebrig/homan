@@ -1,6 +1,7 @@
 @preconcurrency import AVFoundation
 import Foundation
 import MuesliCore
+import os
 
 enum MeetingRawAudioPostProcessorError: Error, LocalizedError {
     case unsupportedDerivedFormat(String)
@@ -22,6 +23,7 @@ struct MeetingPreparedRawAudio: Sendable {
     let microphoneSampleCount: Int
     let systemSampleCount: Int
     let sampleRate: Int
+    let aecDiagnostics: MeetingAecDiagnosticsSnapshot
 
     func removeTemporaryFiles(fileManager: FileManager = .default) {
         if let microphoneURL {
@@ -39,6 +41,10 @@ struct MeetingPreparedRawAudio: Sendable {
 /// microphone-derived source, but it never changes the system-derived source or
 /// any canonical raw payload.
 enum MeetingRawAudioPostProcessor {
+    private static let logger = Logger(
+        subsystem: "com.muesli.native",
+        category: "MeetingAEC"
+    )
     /// Keep post-capture AEC work interruptible. 4,096 frames are exactly
     /// divisible by both bundled processor frame sizes (256 and 512), while
     /// limiting the interval before a newly-started recording can preempt this
@@ -125,11 +131,13 @@ enum MeetingRawAudioPostProcessor {
                     Int(processingBlockFrames),
                     targetFrames - processedFrames
                 )
-                let systemSamples = try readPadded(
-                    from: systemReader,
-                    count: requestedFrames
-                )
-                aec.feedSystemSamples(systemSamples)
+                if let systemReader {
+                    let systemSamples = try readPadded(
+                        from: systemReader,
+                        count: requestedFrames
+                    )
+                    aec.feedSystemSamples(systemSamples)
+                }
 
                 if let microphoneReader {
                     let microphoneSamples = try readPadded(
@@ -151,6 +159,18 @@ enum MeetingRawAudioPostProcessor {
                 microphoneWriter?.append(flushed)
                 microphoneSamplesWritten += flushed.count
             }
+            let diagnostics = aec.diagnosticsSnapshot
+            logger.info(
+                "post-processing processor=\(diagnostics.processor, privacy: .public) ready=\(diagnostics.ready) frames=\(diagnostics.processedFrames) referenceFull=\(diagnostics.fullReferenceFrames) referencePartial=\(diagnostics.partialReferenceFrames) referenceMissing=\(diagnostics.missingReferenceFrames)"
+            )
+            fputs(
+                "[meeting-aec] post-processing processor=\(diagnostics.processor) "
+                    + "ready=\(diagnostics.ready) frames=\(diagnostics.processedFrames) "
+                    + "referenceFull=\(diagnostics.fullReferenceFrames) "
+                    + "referencePartial=\(diagnostics.partialReferenceFrames) "
+                    + "referenceMissing=\(diagnostics.missingReferenceFrames)\n",
+                stderr
+            )
             let microphoneURL = microphoneWriter?.stop()
             microphoneWriter = nil
             if let rawMicrophoneURL = rendered.microphoneURL {
@@ -161,7 +181,8 @@ enum MeetingRawAudioPostProcessor {
                 systemURL: rendered.systemURL,
                 microphoneSampleCount: microphoneSamplesWritten,
                 systemSampleCount: systemReader == nil ? 0 : targetFrames,
-                sampleRate: rendered.sampleRate
+                sampleRate: rendered.sampleRate,
+                aecDiagnostics: diagnostics
             )
         } catch {
             microphoneWriter?.cancel()

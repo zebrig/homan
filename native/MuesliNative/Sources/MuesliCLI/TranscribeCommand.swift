@@ -3,6 +3,7 @@ import AVFoundation
 import FluidAudio
 import Foundation
 import MuesliCore
+import MuesliFluidAudioSupport
 
 enum TranscribeOutputFormat: String, CaseIterable, ExpressibleByArgument {
     case text
@@ -100,7 +101,13 @@ struct TranscribeCommand: AsyncParsableCommand {
             throw CLIError.notFound("Audio file does not exist: \(sourceURL.path)", fix: "Pass a local .mp3, .mp4, .m4a, or .wav file path.")
         }
 
-        let pipeline = MuesliAudioTranscriptionPipeline()
+        let pipeline = MuesliAudioTranscriptionPipeline(
+            transcriber: FluidAudioCLITranscriber(
+                modelsRoot: context.supportDirectory
+                    .appendingPathComponent("Models", isDirectory: true)
+                    .appendingPathComponent("ManagedASR", isDirectory: true)
+            )
+        )
         let result = try await pipeline.run(
             request: MuesliAudioTranscriptionRequest(
                 sourceURL: sourceURL,
@@ -523,6 +530,19 @@ struct MuesliAudioFilePreparer: AudioPreparing {
 actor FluidAudioCLITranscriber: AudioTranscribing {
     private var asrManager: AsrManager?
     private var loadedModel: TranscribeModel?
+    private let modelsRoot: URL
+    private let supportDirectory: URL
+
+    init(
+        modelsRoot: URL = MuesliPaths.defaultSupportDirectoryURL()
+            .appendingPathComponent("Models", isDirectory: true)
+            .appendingPathComponent("ManagedASR", isDirectory: true)
+    ) {
+        self.modelsRoot = modelsRoot
+        self.supportDirectory = modelsRoot
+            .deletingLastPathComponent()
+            .deletingLastPathComponent()
+    }
 
     func transcribe(wavURL: URL, model: TranscribeModel, progress: @escaping (String) -> Void) async throws -> HeadlessTranscription {
         try await load(model: model, progress: progress)
@@ -541,15 +561,81 @@ actor FluidAudioCLITranscriber: AudioTranscribing {
     private func load(model: TranscribeModel, progress: @escaping (String) -> Void) async throws {
         if loadedModel == model, asrManager != nil { return }
         progress("loading \(model.rawValue)")
-        let models = try await AsrModels.downloadAndLoad(version: model.asrModelVersion) { downloadProgress in
-            let percent = Int((downloadProgress.fractionCompleted * 100).rounded())
-            progress("model \(percent)%")
+        let plan = model == .parakeetV2
+            ? ManagedASRModelPlans.parakeetV2(modelsRoot: modelsRoot)
+            : ManagedASRModelPlans.parakeetV3(modelsRoot: modelsRoot)
+        let legacyRoot = MuesliPaths.isRunningTests
+            ? modelsRoot.appendingPathComponent("LegacyFluidAudio", isDirectory: true)
+            : nil
+        let legacyPlan = model == .parakeetV2
+            ? ManagedASRModelPlans.parakeetV2(modelsRoot: legacyRoot)
+            : ManagedASRModelPlans.parakeetV3(modelsRoot: legacyRoot)
+        let policySupportDirectory = supportDirectory
+
+        if !plan.isAvailableLocally(),
+           !ManagedASRLegacyAdoptionPolicy.isSuppressed(
+               modelID: plan.modelID,
+               supportDirectory: policySupportDirectory
+           ),
+           legacyPlan.isAvailableLocally() {
+            do {
+                let manager = try await ManagedASRModelDownloader.withRegisteredOperation(plan) { () async throws -> AsrManager? in
+                    try plan.reconcileInterruptedInstallation()
+                    guard !plan.isAvailableLocally(),
+                          !ManagedASRLegacyAdoptionPolicy.isSuppressed(
+                              modelID: plan.modelID,
+                              supportDirectory: policySupportDirectory
+                          ),
+                          legacyPlan.isAvailableLocally()
+                    else { return nil }
+                    let manager = try await plan.adoptValidatedInstallation(from: legacyPlan) { copiedDirectory in
+                        try await Self.loadManager(
+                            from: copiedDirectory,
+                            version: model.asrModelVersion
+                        )
+                    }
+                    try Task.checkCancellation()
+                    return Optional(manager)
+                }
+                if let manager {
+                    asrManager = manager
+                    loadedModel = model
+                    progress("model ready")
+                    return
+                }
+            } catch is CancellationError {
+                throw CancellationError()
+            } catch {
+                fputs("[homan-cli] legacy Parakeet validation failed: \(error)\n", stderr)
+            }
         }
-        let manager = AsrManager(config: .default)
-        try await manager.loadModels(models)
+
+        let manager = try await ManagedASRModelDownloader.loadValidated(
+            plan,
+            progressSnapshot: { snapshot in
+                let detail = snapshot.message ?? snapshot.phase.rawValue
+                if let fraction = snapshot.fractionCompleted {
+                    progress("model \(Int((fraction * 100).rounded()))% • \(detail)")
+                } else {
+                    progress("model • \(detail)")
+                }
+            }
+        ) { directory in
+            try await Self.loadManager(from: directory, version: model.asrModelVersion)
+        }
         asrManager = manager
         loadedModel = model
         progress("model ready")
+    }
+
+    private static func loadManager(
+        from directory: URL,
+        version: AsrModelVersion
+    ) async throws -> AsrManager {
+        let models = try await OfflineParakeetModelLoader.load(from: directory, version: version)
+        let manager = AsrManager(config: .default)
+        try await manager.loadModels(models)
+        return manager
     }
 }
 

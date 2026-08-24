@@ -2,7 +2,7 @@ import Foundation
 import MuesliCore
 
 extension MeetingProcessingProgress {
-    /// "3/7 Transcribing · 0:42 · 2:15" — phase, per-phase elapsed, total elapsed.
+    /// "4/8 Transcribing · 0:42 · 2:15" — phase, per-phase elapsed, total elapsed.
     func displayTitle(now: Date) -> String {
         "\(phaseIndex)/\(phaseCount) \(phaseLabel) · \(Self.elapsedString(from: phaseStartedAt, to: now)) · \(Self.elapsedString(from: totalStartedAt, to: now))"
     }

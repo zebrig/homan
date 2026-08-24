@@ -222,6 +222,8 @@ enum AudioFileImportController {
             aecModel: config.resolvedMeetingAecModel,
             progress: { stage in
                 switch stage {
+                case .processingAudio:
+                    progress("Processing audio...")
                 case .transcribing:
                     progress("Transcribing audio...")
                 case .preparingDiarizer:
@@ -248,7 +250,8 @@ enum AudioFileImportController {
         }
         let transcriptionMetadata = MeetingProcessingMetadataFactory.transcription(
             backend: backend,
-            startedAt: transcriptionStartedAt
+            startedAt: transcriptionStartedAt,
+            audioSource: MeetingTranscriptionAudioSource.legacyMixed.rawValue
         )
 
         try Task.checkCancellation()

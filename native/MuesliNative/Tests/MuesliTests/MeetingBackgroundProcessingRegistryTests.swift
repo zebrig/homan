@@ -38,6 +38,21 @@ struct MeetingBackgroundProcessingRegistryTests {
         #expect(await probe.didObserveCancellation)
         #expect(await probe.didFinish)
     }
+
+    @Test("only removing the final owned task reports an idle registry")
+    func finalRemovalReportsIdle() {
+        let registry = MeetingBackgroundProcessingRegistry()
+        let firstID = UUID()
+        let secondID = UUID()
+        registry.insert(Task {}, id: firstID)
+        registry.insert(Task {}, id: secondID)
+
+        #expect(!registry.remove(id: firstID))
+        #expect(registry.count == 1)
+        #expect(registry.remove(id: secondID))
+        #expect(registry.count == 0)
+        #expect(!registry.remove(id: secondID))
+    }
 }
 
 private actor CancellationProbe {

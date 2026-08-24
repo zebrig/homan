@@ -328,21 +328,30 @@ struct MeetingProcessingProgressTests {
         let progress = MeetingProcessingProgress(
             runID: UUID(uuidString: "00000000-0000-0000-0000-000000000001")!,
             operation: .finalization,
-            phaseIndex: 3,
-            phaseCount: 7,
+            phaseIndex: 4,
+            phaseCount: 8,
             phase: .transcribing,
             phaseStartedAt: Date(timeIntervalSince1970: 0),
             totalStartedAt: Date(timeIntervalSince1970: -51)
         )
-        #expect(progress.displayTitle(now: Date(timeIntervalSince1970: 12)) == "3/7 Transcribing · 0:12 · 1:03")
+        #expect(progress.displayTitle(now: Date(timeIntervalSince1970: 12)) == "4/8 Transcribing · 0:12 · 1:03")
     }
 
     @Test("each operation exposes its real ordered phase plan")
     func operationPlans() {
-        #expect(MeetingProcessingOperation.finalization.phases.count == 7)
+        #expect(MeetingProcessingOperation.finalization.phases == [
+            .preparingAudio,
+            .processingAudio,
+            .preparingRecording,
+            .transcribing,
+            .generatingTitle,
+            .summarizing,
+            .encodingRecording,
+            .saving,
+        ])
         #expect(MeetingProcessingOperation.recovery.phases == MeetingProcessingOperation.finalization.phases)
         #expect(MeetingProcessingOperation.retranscription.phases == [
-            .preparingAudio, .transcribing, .summarizing, .saving,
+            .preparingAudio, .processingAudio, .transcribing, .summarizing, .saving,
         ])
         #expect(MeetingProcessingOperation.resummarization.phases == [.summarizing, .saving])
     }
@@ -380,12 +389,17 @@ struct MeetingProcessingProgressTests {
             operation: .retranscription,
             now: startedAt
         )
-        let transcribing = try #require(progress.advancing(
-            to: .transcribing,
+        let processingAudio = try #require(progress.advancing(
+            to: .processingAudio,
             now: Date(timeIntervalSince1970: 112)
         ))
-        #expect(transcribing.phaseIndex == 2)
-        #expect(transcribing.phaseStartedAt == Date(timeIntervalSince1970: 112))
+        #expect(processingAudio.phaseIndex == 2)
+        let transcribing = try #require(processingAudio.advancing(
+            to: .transcribing,
+            now: Date(timeIntervalSince1970: 120)
+        ))
+        #expect(transcribing.phaseIndex == 3)
+        #expect(transcribing.phaseStartedAt == Date(timeIntervalSince1970: 120))
         #expect(transcribing.totalStartedAt == startedAt)
         #expect(transcribing.advancing(to: .preparingAudio) == nil)
         #expect(transcribing.advancing(to: .generatingTitle) == nil)
@@ -404,6 +418,126 @@ struct MeetingProcessingProgressTests {
         #expect(MeetingProcessingProgress.elapsedString(from: start, to: Date(timeIntervalSince1970: 63)) == "1:03")
         #expect(MeetingProcessingProgress.elapsedString(from: start, to: Date(timeIntervalSince1970: 600)) == "10:00")
         #expect(MeetingProcessingProgress.elapsedString(from: Date(timeIntervalSince1970: 10), to: start) == "0:00")
+    }
+}
+
+@Suite("Meeting processing metadata display")
+struct MeetingProcessingMetadataDisplayTests {
+    @Test("completed transcription names successful actual AEC")
+    func successfulAECLabel() {
+        let label = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "localvqe_v1_2",
+                    ready: true,
+                    processedFrames: 12,
+                    fullReferenceFrames: 12,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 0
+                )
+            )
+        )
+
+        #expect(label.contains("AEC LocalVQE v1.2"))
+    }
+
+    @Test("completed transcription does not present fallback as successful AEC")
+    func unsuccessfulAECLabels() {
+        let unavailable = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "unavailable",
+                    ready: false,
+                    processedFrames: 0,
+                    fullReferenceFrames: 0,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 0
+                )
+            )
+        )
+        let degraded = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "localvqe_v1_2",
+                    ready: true,
+                    processedFrames: 12,
+                    fullReferenceFrames: 12,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 0,
+                    processingError: "inference failed"
+                )
+            )
+        )
+        let notApplied = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "localvqe_v1_2",
+                    ready: true,
+                    processedFrames: 0,
+                    fullReferenceFrames: 0,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 0
+                )
+            )
+        )
+        let noReference = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "localvqe_v1_2",
+                    ready: true,
+                    processedFrames: 12,
+                    fullReferenceFrames: 0,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 12
+                )
+            )
+        )
+        let partial = MeetingDetailView.processingRunLabel(
+            title: "Transcribed",
+            run: run(
+                diagnostics: MeetingAecRunDiagnostics(
+                    processor: "localvqe_v1_2",
+                    ready: true,
+                    processedFrames: 12,
+                    fullReferenceFrames: 12,
+                    partialReferenceFrames: 0,
+                    missingReferenceFrames: 0,
+                    sourceUnitCount: 2,
+                    appliedSourceUnitCount: 1
+                )
+            )
+        )
+
+        #expect(unavailable.contains("AEC unavailable"))
+        #expect(!unavailable.contains("AEC LocalVQE"))
+        #expect(degraded.contains("AEC degraded"))
+        #expect(!degraded.contains("AEC LocalVQE"))
+        #expect(notApplied.contains("AEC not applied"))
+        #expect(!notApplied.contains("AEC LocalVQE"))
+        #expect(noReference.contains("AEC no reference"))
+        #expect(!noReference.contains("AEC LocalVQE"))
+        #expect(partial.contains("AEC partially applied"))
+        #expect(!partial.contains("AEC LocalVQE"))
+    }
+
+    private func run(
+        diagnostics: MeetingAecRunDiagnostics
+    ) -> MeetingProcessingRunMetadata {
+        MeetingProcessingRunMetadata(
+            completedAt: Date(timeIntervalSince1970: 0),
+            durationSeconds: 1,
+            backend: "parakeet",
+            model: "parakeet",
+            displayName: "Parakeet",
+            audioSource: "raw_source_bundle",
+            aecModel: "localvqe_v1_2",
+            aecDiagnostics: diagnostics
+        )
     }
 }
 

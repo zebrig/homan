@@ -228,6 +228,7 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
         backend: BackendOption,
         enablePostProcessor: Bool = false,
         includeMeetingHelpers: Bool = true,
+        progressSnapshot: ModelDownloadProgressHandler? = nil,
         progress: ((Double, String?) -> Void)? = nil
     ) async throws {
         activeBackend = backend.backend
@@ -244,7 +245,11 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
             progress?(1.0, nil)
         case "fluidaudio":
             let version: AsrModelVersion = backend.model.contains("v2") ? .v2 : .v3
-            try await fluidTranscriber.loadModels(version: version, progress: progress)
+            try await fluidTranscriber.loadModels(
+                version: version,
+                progress: progress,
+                progressSnapshot: progressSnapshot
+            )
         case "whisper":
             try await whisperTranscriber.loadModel(modelName: backend.model, progress: progress)
             // Warmup ANE/GPU so first dictation doesn't pay CoreML compilation cost
@@ -547,6 +552,12 @@ actor TranscriptionCoordinator: MeetingBatchTranscriptionProviding {
                 await gemma4.shutdown()
             }
         }
+    }
+
+    func unloadFluidAudioTranscriber(for backend: BackendOption) async {
+        guard backend.backend == "fluidaudio" else { return }
+        let version: AsrModelVersion = backend.model.contains("v2") ? .v2 : .v3
+        await fluidTranscriber.shutdown(ifLoadedVersion: version)
     }
 
     private static func wavDuration(at url: URL) -> TimeInterval? {

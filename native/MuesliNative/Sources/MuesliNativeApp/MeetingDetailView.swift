@@ -472,6 +472,9 @@ struct MeetingDetailView: View {
                 parts.append("Thinking not reported")
             }
         }
+        if let diagnostics = run.aecDiagnostics {
+            parts.append(aecRunStatusLabel(diagnostics))
+        }
         parts.append(processingDurationLabel(run.durationSeconds))
         return parts.joined(separator: " · ")
     }
@@ -484,7 +487,57 @@ struct MeetingDetailView: View {
         if let thinkingStatus = run.thinkingStatus {
             help += "\nThinking: \(thinkingStatus.rawValue)"
         }
+        if let audioSource = run.audioSource {
+            help += "\nAudio source: \(audioSource)"
+        }
+        if let aecModel = run.aecModel {
+            help += "\nRequested AEC: \(aecLabel(aecModel))"
+        }
+        if let diagnostics = run.aecDiagnostics {
+            help += "\nActual AEC: \(aecLabel(diagnostics.processor))"
+            help += "\nAEC ready: \(diagnostics.ready ? "yes" : "no")"
+            help += "\nAEC frames: \(diagnostics.processedFrames)"
+            help += "\nAEC source units: \(diagnostics.appliedSourceUnitCount)/"
+                + "\(diagnostics.sourceUnitCount) applied"
+            help += "\nSystem reference: \(diagnostics.fullReferenceFrames) full, "
+                + "\(diagnostics.partialReferenceFrames) partial, "
+                + "\(diagnostics.missingReferenceFrames) missing"
+            if let error = diagnostics.processingError {
+                help += "\nAEC processing error: \(error)"
+            }
+        }
         return help
+    }
+
+    private static func aecRunStatusLabel(
+        _ diagnostics: MeetingAecRunDiagnostics
+    ) -> String {
+        if diagnostics.processingError != nil {
+            return "AEC degraded"
+        }
+        if diagnostics.appliedSourceUnitCount == diagnostics.sourceUnitCount,
+           diagnostics.sourceUnitCount > 0 {
+            return "AEC \(aecLabel(diagnostics.processor))"
+        }
+        if diagnostics.appliedSourceUnitCount > 0 {
+            return "AEC partially applied"
+        }
+        guard diagnostics.ready else { return "AEC unavailable" }
+        guard diagnostics.processedFrames > 0 else { return "AEC not applied" }
+        if diagnostics.fullReferenceFrames + diagnostics.partialReferenceFrames == 0 {
+            return "AEC no reference"
+        }
+        return "AEC degraded"
+    }
+
+    private static func aecLabel(_ value: String) -> String {
+        switch value {
+        case "localvqe_v1_2": return "LocalVQE v1.2"
+        case "localvqe_gtcrn_49k": return "LocalVQE GTCRN 49K"
+        case "dtln": return "DTLN"
+        case "unavailable": return "Unavailable"
+        default: return value
+        }
     }
 
     @ViewBuilder

@@ -203,6 +203,10 @@ final class AppState {
     var modelPreparationProgress: Double?
     var isModelPreparingAfterDownload: Bool = false
     var modelPreparationIsComplete: Bool = false
+    var modelPreparationTerminalPhase: ModelDownloadPhase?
+    /// Process-wide typed snapshots from the unified model download center.
+    /// UI surfaces read the same source instead of inferring state from labels.
+    var modelDownloadSnapshots: [String: ModelDownloadProgress] = [:]
 
     // Dictation pagination & filtering
     var dictationPageSize: Int = 50

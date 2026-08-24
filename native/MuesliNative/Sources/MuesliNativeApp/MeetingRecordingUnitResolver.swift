@@ -28,27 +28,18 @@ enum MeetingRecordingUnitResolver {
         units: [MeetingRecordingUnitRecord],
         supportDirectory: URL
     ) throws -> [MeetingRecordingUnitInput] {
-        try units.map { unit in
+        units.map { unit in
             let playbackURL = URL(fileURLWithPath: unit.recording.path)
-            if let sourceLayout = unit.recording.sourceLayout {
-                return .separatedChannels(MeetingSeparatedRecordingInput(
-                    recording: unit.recording,
-                    recordingURL: playbackURL,
-                    sourceLayout: sourceLayout
-                ))
-            }
+            let fallbackInput = playbackFallback(unit, playbackURL: playbackURL)
             guard let sourceBundle = unit.sourceBundle else {
-                return .legacyMixed(MeetingLegacyRecordingInput(
-                    recording: unit.recording,
-                    playbackURL: playbackURL
-                ))
+                return fallbackInput
             }
             let supportedVersions = [
                 MeetingRecordingBundleManifest.legacySchemaVersion,
                 MeetingRecordingBundleManifest.currentSchemaVersion,
             ]
             guard supportedVersions.contains(sourceBundle.schemaVersion) else {
-                return legacyFallback(
+                return playbackFallback(
                     unit,
                     playbackURL: playbackURL,
                     degradation: .sourceBundleVersionUnsupported(
@@ -61,21 +52,31 @@ enum MeetingRecordingUnitResolver {
                     directoryURL: URL(fileURLWithPath: sourceBundle.bundlePath),
                     supportDirectory: supportDirectory
                 )
-                return .sourceBundle(MeetingSourceBundleInput(
+                let sourceInput = MeetingRecordingUnitInput.sourceBundle(MeetingSourceBundleInput(
                     recording: unit.recording,
                     playbackURL: playbackURL,
                     bundle: bundle
                 ))
-            } catch MeetingRecordingBundleError.missingManifest {
-                return legacyFallback(unit, playbackURL: playbackURL)
-            } catch MeetingRecordingBundleError.directoryOutsideManagedRoot {
-                return legacyFallback(unit, playbackURL: playbackURL)
+
+                if bundle.sourceState == .complete {
+                    return sourceInput
+                }
+                if case .separatedChannels = fallbackInput,
+                   fallbackInput.hasUsableAudio() {
+                    return fallbackInput
+                }
+                if sourceInput.hasUsableAudio() {
+                    return sourceInput
+                }
+                return fallbackInput
             } catch MeetingRecordingBundleError.unsupportedSchemaVersion(let version) {
-                return legacyFallback(
+                return playbackFallback(
                     unit,
                     playbackURL: playbackURL,
                     degradation: .sourceBundleVersionUnsupported(version)
                 )
+            } catch {
+                return fallbackInput
             }
         }.sorted { lhs, rhs in
             if lhs.createdAt == rhs.createdAt {
@@ -83,6 +84,35 @@ enum MeetingRecordingUnitResolver {
             }
             return lhs.createdAt < rhs.createdAt
         }
+    }
+
+    private static func playbackFallback(
+        _ unit: MeetingRecordingUnitRecord,
+        playbackURL: URL
+    ) -> MeetingRecordingUnitInput {
+        if let sourceLayout = unit.recording.sourceLayout {
+            return .separatedChannels(MeetingSeparatedRecordingInput(
+                recording: unit.recording,
+                recordingURL: playbackURL,
+                sourceLayout: sourceLayout
+            ))
+        }
+        return legacyFallback(unit, playbackURL: playbackURL)
+    }
+
+    private static func playbackFallback(
+        _ unit: MeetingRecordingUnitRecord,
+        playbackURL: URL,
+        degradation: MeetingProcessingDegradation
+    ) -> MeetingRecordingUnitInput {
+        if unit.recording.sourceLayout != nil {
+            return playbackFallback(unit, playbackURL: playbackURL)
+        }
+        return legacyFallback(
+            unit,
+            playbackURL: playbackURL,
+            degradation: degradation
+        )
     }
 
     private static func legacyFallback(

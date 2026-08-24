@@ -6,7 +6,7 @@ enum MeetingAecModel: String, Codable, CaseIterable, Identifiable, Sendable {
     case gtcrn49K = "gtcrn_49k"
     case localVQEV12 = "localvqe_v1_2"
 
-    static let defaultModel = MeetingAecModel.gtcrn49K
+    static let defaultModel = MeetingAecModel.localVQEV12
 
     var id: String { rawValue }
 
@@ -29,9 +29,9 @@ enum MeetingAecModel: String, Codable, CaseIterable, Identifiable, Sendable {
     var settingsDescription: String {
         switch self {
         case .gtcrn49K:
-            return "Recommended. Low-CPU echo cancellation, noise suppression, and dereverberation."
+            return "Lower-CPU echo cancellation, noise suppression, and dereverberation."
         case .localVQEV12:
-            return "Stronger echo suppression and faster adaptation, with substantially higher CPU use."
+            return "Default. Stronger echo suppression and faster adaptation, with substantially higher CPU use."
         }
     }
 

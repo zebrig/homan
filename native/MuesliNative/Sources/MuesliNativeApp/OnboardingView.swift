@@ -1967,6 +1967,7 @@ struct OnboardingView: View {
         appState.modelPreparationProgress = progress.map { min(max($0, 0), 1) }
         appState.isModelPreparingAfterDownload = isPreparing
         appState.modelPreparationIsComplete = isComplete
+        appState.modelPreparationTerminalPhase = nil
         if isComplete {
             Task { @MainActor in
                 try? await Task.sleep(for: .seconds(5))
@@ -1977,6 +1978,7 @@ struct OnboardingView: View {
                 appState.modelPreparationProgress = nil
                 appState.isModelPreparingAfterDownload = false
                 appState.modelPreparationIsComplete = false
+                appState.modelPreparationTerminalPhase = nil
             }
         } else if !isPreparing && progress == nil {
             Task { @MainActor in
@@ -1987,6 +1989,7 @@ struct OnboardingView: View {
                       !appState.modelPreparationIsComplete else { return }
                 appState.modelPreparationTitle = nil
                 appState.modelPreparationDetail = nil
+                appState.modelPreparationTerminalPhase = nil
             }
         }
     }

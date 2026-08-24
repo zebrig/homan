@@ -53,6 +53,42 @@ struct MeetingRecordingBundleTestSupport {
         )
     }
 
+    func makeSeparatedPlaybackFile(
+        named name: String = "separated-playback.wav"
+    ) throws -> URL {
+        let microphoneURL = supportDirectory.appendingPathComponent(
+            "\(UUID().uuidString.lowercased())-microphone.wav"
+        )
+        let systemURL = supportDirectory.appendingPathComponent(
+            "\(UUID().uuidString.lowercased())-system.wav"
+        )
+        defer {
+            try? FileManager.default.removeItem(at: microphoneURL)
+            try? FileManager.default.removeItem(at: systemURL)
+        }
+        try MeetingAudioTestFixtures.writeMonoPCM16WAV(
+            samples: MeetingAudioTestFixtures.microphoneOnly().microphone,
+            to: microphoneURL
+        )
+        try MeetingAudioTestFixtures.writeMonoPCM16WAV(
+            samples: MeetingAudioTestFixtures.systemOnly().system,
+            to: systemURL
+        )
+        let temporary = try #require(
+            try MeetingRecordingWriter.makeTemporarySeparatedRecording(
+                microphoneURL: microphoneURL,
+                systemURL: systemURL
+            )
+        )
+        let destination = recordingsRoot.appendingPathComponent(name)
+        try FileManager.default.createDirectory(
+            at: recordingsRoot,
+            withIntermediateDirectories: true
+        )
+        try FileManager.default.moveItem(at: temporary, to: destination)
+        return destination
+    }
+
     func assertExists(_ url: URL, sourceLocation: SourceLocation = #_sourceLocation) {
         #expect(FileManager.default.fileExists(atPath: url.path), sourceLocation: sourceLocation)
     }
