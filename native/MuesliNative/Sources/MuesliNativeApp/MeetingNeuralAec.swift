@@ -5,8 +5,38 @@ protocol MeetingAecProcessor: AnyObject {
     var name: String { get }
     var frameSize: Int { get }
     var sampleRate: Int { get }
+    var inferenceThreads: Int? { get }
     func reset()
     func processFrame(mic: [Float], reference: [Float]) throws -> [Float]
+}
+
+extension MeetingAecProcessor {
+    var inferenceThreads: Int? { nil }
+}
+
+struct MeetingAecPerformanceSnapshot: Equatable, Sendable {
+    let processor: String
+    let inferenceThreads: Int?
+    let processedAudioSamples: Int
+    let sampleRate: Int
+    let pureInferenceSeconds: Double
+
+    var processedAudioSeconds: Double {
+        guard sampleRate > 0 else { return 0 }
+        return Double(processedAudioSamples) / Double(sampleRate)
+    }
+
+    /// Pure native AEC time divided by processed source duration.
+    var realtimeFactor: Double {
+        guard processedAudioSeconds > 0 else { return 0 }
+        return pureInferenceSeconds / processedAudioSeconds
+    }
+
+    /// Processed source duration divided by pure native AEC time.
+    var processingSpeed: Double {
+        guard pureInferenceSeconds > 0 else { return 0 }
+        return processedAudioSeconds / pureInferenceSeconds
+    }
 }
 
 enum MeetingAecModelBundle {
@@ -105,7 +135,11 @@ final class MeetingNeuralAec {
     private let sampleRate = 16_000
     private let selection: MeetingAecProcessorSelection
     private let localVQEModel: MeetingAecModel
+    private let localVQEThreads: Int?
+    private let monotonicNow: () -> TimeInterval
     private var lastProcessingError: String?
+    private var pureInferenceSeconds = 0.0
+    private var measuredAudioSamples = 0
 
     // Accessed only from MeetingSession's chunkRotationQueue.
     //
@@ -135,15 +169,28 @@ final class MeetingNeuralAec {
 
     init(
         selection: MeetingAecProcessorSelection = .environmentDefault,
-        localVQEModel: MeetingAecModel = .defaultModel
+        localVQEModel: MeetingAecModel = .defaultModel,
+        localVQEThreads: Int? = nil,
+        monotonicNow: @escaping () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        }
     ) {
         self.selection = selection
         self.localVQEModel = localVQEModel
+        self.localVQEThreads = localVQEThreads
+        self.monotonicNow = monotonicNow
     }
 
-    init(preloadedProcessor processor: MeetingAecProcessor) {
+    init(
+        preloadedProcessor processor: MeetingAecProcessor,
+        monotonicNow: @escaping () -> TimeInterval = {
+            ProcessInfo.processInfo.systemUptime
+        }
+    ) {
         self.selection = .production
         self.localVQEModel = .defaultModel
+        self.localVQEThreads = nil
+        self.monotonicNow = monotonicNow
         self.processor = processor
         self.frameSize = processor.frameSize
         self.isLoaded = true
@@ -165,7 +212,10 @@ final class MeetingNeuralAec {
 
         if selection != .dtlnOnly {
             do {
-                let localVQE = try await LocalVQEAudioProcessor.load(model: localVQEModel)
+                let localVQE = try await LocalVQEAudioProcessor.load(
+                    model: localVQEModel,
+                    threads: localVQEThreads
+                )
                 processor = localVQE
                 frameSize = localVQE.frameSize
                 isLoaded = true
@@ -216,6 +266,8 @@ final class MeetingNeuralAec {
         delayHistory.removeAll(keepingCapacity: true)
         delaySkipHistory.removeAll(keepingCapacity: true)
         lastProcessingError = nil
+        pureInferenceSeconds = 0
+        measuredAudioSamples = 0
     }
 
     /// Buffer system audio samples indexed by absolute position.
@@ -279,7 +331,14 @@ final class MeetingNeuralAec {
             let systemFrame = systemFrame(forMicFrameStartingAt: pendingMicStartSample, processor: processor)
             autoreleasepool {
                 do {
-                    cleaned.append(contentsOf: try processor.processFrame(mic: micFrame, reference: systemFrame))
+                    cleaned.append(
+                        contentsOf: try measuredProcessFrame(
+                            processor: processor,
+                            mic: micFrame,
+                            reference: systemFrame,
+                            sourceSampleCount: frameSize
+                        )
+                    )
                 } catch {
                     lastProcessingError = "\(error)"
                     fputs("[meeting-aec] \(processor.name) processing failed: \(error); passing through raw frame\n", stderr)
@@ -300,7 +359,12 @@ final class MeetingNeuralAec {
             var cleanedFrame: [Float] = []
             autoreleasepool {
                 do {
-                    cleanedFrame = try processor.processFrame(mic: micFrame, reference: systemFrame)
+                    cleanedFrame = try measuredProcessFrame(
+                        processor: processor,
+                        mic: micFrame,
+                        reference: systemFrame,
+                        sourceSampleCount: actualCount
+                    )
                 } catch {
                     lastProcessingError = "\(error)"
                     fputs("[meeting-aec] \(processor.name) flush processing failed: \(error); passing through raw frame\n", stderr)
@@ -314,6 +378,23 @@ final class MeetingNeuralAec {
 
         trimHistoryBuffersIfNeeded()
         return cleaned
+    }
+
+    /// Measures only the processor invocation. Rendering, decoding, delay
+    /// estimation, file I/O, scheduler waits, and model loading stay outside
+    /// this interval by construction.
+    private func measuredProcessFrame(
+        processor: MeetingAecProcessor,
+        mic: [Float],
+        reference: [Float],
+        sourceSampleCount: Int
+    ) throws -> [Float] {
+        let startedAt = monotonicNow()
+        defer {
+            pureInferenceSeconds += max(0, monotonicNow() - startedAt)
+            measuredAudioSamples += sourceSampleCount
+        }
+        return try processor.processFrame(mic: mic, reference: reference)
     }
 
     private func canProcessFrameStartingAt(_ micStart: Int, processor: MeetingAecProcessor) -> Bool {
@@ -545,6 +626,16 @@ final class MeetingNeuralAec {
             delayHistory: delayHistory,
             delaySkipHistory: delaySkipHistory,
             lastProcessingError: lastProcessingError
+        )
+    }
+
+    var performanceSnapshot: MeetingAecPerformanceSnapshot {
+        MeetingAecPerformanceSnapshot(
+            processor: processor?.name ?? "unavailable",
+            inferenceThreads: processor?.inferenceThreads,
+            processedAudioSamples: measuredAudioSamples,
+            sampleRate: sampleRate,
+            pureInferenceSeconds: pureInferenceSeconds
         )
     }
 }

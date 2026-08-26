@@ -262,6 +262,7 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
     let model: MeetingAecModel
     let modelPath: String
     let libraryPath: String
+    let inferenceThreads: Int?
 
     private var context: OpaquePointer?
     private(set) var frameSize = 256
@@ -295,6 +296,7 @@ final class LocalVQEAudioProcessor: MeetingAecProcessor {
         name = model.processorName
         modelPath = modelURL.path
         libraryPath = libraryURL.path
+        inferenceThreads = threads
         var error = [CChar](repeating: 0, count: 2048)
         context = LocalVQENativeRuntimeGate.withLock {
             modelPath.withCString { modelCString in

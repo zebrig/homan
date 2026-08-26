@@ -227,6 +227,33 @@ struct MeetingNeuralAecTests {
         #expect(processor.processedFrameCount == 4)
     }
 
+    @Test("pure AEC timing excludes surrounding streaming work")
+    func pureAecTimingMeasuresOnlyProcessorCalls() {
+        let processor = PassthroughAecProcessor(frameSize: 256)
+        let clock = SequenceMonotonicClock([10, 10.25, 11, 11.50])
+        let aec = MeetingNeuralAec(
+            preloadedProcessor: processor,
+            monotonicNow: clock.now
+        )
+        aec.resetForStreaming()
+        aec.feedSystemSamples([Float](repeating: 0.1, count: 512))
+
+        let output = aec.processStreamingMic([Float](repeating: 0.2, count: 512))
+        let performance = aec.performanceSnapshot
+
+        #expect(output.count == 512)
+        #expect(performance.processor == processor.name)
+        #expect(performance.processedAudioSamples == 512)
+        #expect(performance.processedAudioSeconds == 0.032)
+        #expect(performance.pureInferenceSeconds == 0.75)
+        #expect(performance.realtimeFactor == 23.4375)
+        #expect(abs(performance.processingSpeed - (0.032 / 0.75)) < 0.000_001)
+
+        aec.resetForStreaming()
+        #expect(aec.performanceSnapshot.processedAudioSamples == 0)
+        #expect(aec.performanceSnapshot.pureInferenceSeconds == 0)
+    }
+
     @Test("streaming AEC waits for delayed system reference")
     func streamingAecWaitsForDelayedSystemReference() {
         let processor = PassthroughAecProcessor(frameSize: 256)
@@ -364,6 +391,19 @@ private final class RuntimeGateProbe: @unchecked Sendable {
         lock.withLock {
             activeCalls -= 1
         }
+    }
+}
+
+private final class SequenceMonotonicClock {
+    private var values: [TimeInterval]
+
+    init(_ values: [TimeInterval]) {
+        self.values = values
+    }
+
+    func now() -> TimeInterval {
+        precondition(!values.isEmpty, "The test clock ran out of values")
+        return values.removeFirst()
     }
 }
 

@@ -5,9 +5,12 @@ import MuesliCore
 @main
 @MainActor
 enum MuesliMain {
-    static func main() {
+    static func main() async {
         if CommandLine.arguments.contains("--packaged-resource-smoke-test") {
             exit(runPackagedResourceSmokeTest())
+        }
+        if CommandLine.arguments.contains("--aec-benchmark") {
+            exit(await MeetingAecBenchmarkRunner.run(arguments: CommandLine.arguments))
         }
 
         let application = NSApplication.shared

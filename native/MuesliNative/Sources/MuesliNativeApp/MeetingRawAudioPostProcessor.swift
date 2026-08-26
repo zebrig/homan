@@ -24,6 +24,7 @@ struct MeetingPreparedRawAudio: Sendable {
     let systemSampleCount: Int
     let sampleRate: Int
     let aecDiagnostics: MeetingAecDiagnosticsSnapshot
+    let aecPerformance: MeetingAecPerformanceSnapshot
 
     func removeTemporaryFiles(fileManager: FileManager = .default) {
         if let microphoneURL {
@@ -160,15 +161,18 @@ enum MeetingRawAudioPostProcessor {
                 microphoneSamplesWritten += flushed.count
             }
             let diagnostics = aec.diagnosticsSnapshot
+            let performance = aec.performanceSnapshot
             logger.info(
-                "post-processing processor=\(diagnostics.processor, privacy: .public) ready=\(diagnostics.ready) frames=\(diagnostics.processedFrames) referenceFull=\(diagnostics.fullReferenceFrames) referencePartial=\(diagnostics.partialReferenceFrames) referenceMissing=\(diagnostics.missingReferenceFrames)"
+                "post-processing processor=\(diagnostics.processor, privacy: .public) ready=\(diagnostics.ready) frames=\(diagnostics.processedFrames) referenceFull=\(diagnostics.fullReferenceFrames) referencePartial=\(diagnostics.partialReferenceFrames) referenceMissing=\(diagnostics.missingReferenceFrames) pureAECSeconds=\(performance.pureInferenceSeconds) speed=\(performance.processingSpeed)"
             )
             fputs(
                 "[meeting-aec] post-processing processor=\(diagnostics.processor) "
                     + "ready=\(diagnostics.ready) frames=\(diagnostics.processedFrames) "
                     + "referenceFull=\(diagnostics.fullReferenceFrames) "
                     + "referencePartial=\(diagnostics.partialReferenceFrames) "
-                    + "referenceMissing=\(diagnostics.missingReferenceFrames)\n",
+                    + "referenceMissing=\(diagnostics.missingReferenceFrames) "
+                    + "pureAECSeconds=\(String(format: "%.3f", performance.pureInferenceSeconds)) "
+                    + "speed=\(String(format: "%.3f", performance.processingSpeed))x\n",
                 stderr
             )
             let microphoneURL = microphoneWriter?.stop()
@@ -182,7 +186,8 @@ enum MeetingRawAudioPostProcessor {
                 microphoneSampleCount: microphoneSamplesWritten,
                 systemSampleCount: systemReader == nil ? 0 : targetFrames,
                 sampleRate: rendered.sampleRate,
-                aecDiagnostics: diagnostics
+                aecDiagnostics: diagnostics,
+                aecPerformance: performance
             )
         } catch {
             microphoneWriter?.cancel()
