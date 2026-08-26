@@ -335,6 +335,12 @@ struct MeetingProcessingProgressTests {
             totalStartedAt: Date(timeIntervalSince1970: -51)
         )
         #expect(progress.displayTitle(now: Date(timeIntervalSince1970: 12)) == "4/8 Transcribing · 0:12 · 1:03")
+        #expect(
+            progress.displayTitle(
+                now: Date(timeIntervalSince1970: 12),
+                isPausedForRecording: true
+            ) == "4/8 Transcribing · Пауза на время записи · 1:03"
+        )
     }
 
     @Test("each operation exposes its real ordered phase plan")

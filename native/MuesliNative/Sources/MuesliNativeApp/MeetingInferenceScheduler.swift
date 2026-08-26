@@ -1,5 +1,52 @@
 import Foundation
 
+struct MeetingInferenceWaitSnapshot: Equatable, Sendable {
+    let revision: UInt64
+    let isWaitingForCapture: Bool
+}
+
+/// Aggregates every scheduler wait owned by one meeting-processing run. The
+/// monotonically increasing revision lets the MainActor ignore callbacks that
+/// arrive out of order after crossing executors.
+final class MeetingInferenceWaitObserver: @unchecked Sendable {
+    private let lock = NSLock()
+    private var waiterIDs: Set<UUID> = []
+    private var revision: UInt64 = 0
+    private let didChange: @Sendable (MeetingInferenceWaitSnapshot) -> Void
+
+    init(didChange: @escaping @Sendable (MeetingInferenceWaitSnapshot) -> Void) {
+        self.didChange = didChange
+    }
+
+    func waitDidBegin(id: UUID) {
+        publishChange {
+            waiterIDs.insert(id)
+        }
+    }
+
+    func waitDidEnd(id: UUID) {
+        publishChange {
+            waiterIDs.remove(id)
+        }
+    }
+
+    private func publishChange(_ update: () -> Void) {
+        lock.lock()
+        update()
+        revision &+= 1
+        let snapshot = MeetingInferenceWaitSnapshot(
+            revision: revision,
+            isWaitingForCapture: !waiterIDs.isEmpty
+        )
+        lock.unlock()
+        didChange(snapshot)
+    }
+}
+
+enum MeetingInferenceWaitContext {
+    @TaskLocal static var observer: MeetingInferenceWaitObserver?
+}
+
 /// Coordinates heavyweight meeting inference with raw audio capture without
 /// ever putting a permit in the capture callback path.
 ///
@@ -8,11 +55,16 @@ import Foundation
 /// checkpoint. Multiple recording sessions are supported so an old session
 /// cannot accidentally resume work while a newer one is still capturing.
 final class MeetingInferenceScheduler: @unchecked Sendable {
+    private struct AsyncWaiter {
+        let continuation: CheckedContinuation<Bool, Never>
+        let observer: MeetingInferenceWaitObserver?
+    }
+
     static let shared = MeetingInferenceScheduler()
 
     private let condition = NSCondition()
     private var captureOwners: Set<UUID> = []
-    private var waiters: [UUID: CheckedContinuation<Bool, Never>] = [:]
+    private var waiters: [UUID: AsyncWaiter] = [:]
     private var cancelledWaiters: Set<UUID> = []
     private var cancelOnCaptureHandlers: [UUID: @Sendable () -> Void] = [:]
 
@@ -34,12 +86,15 @@ final class MeetingInferenceScheduler: @unchecked Sendable {
             condition.unlock()
             return
         }
-        let continuations = Array(waiters.values)
+        let admittedWaiters = Array(waiters)
         waiters.removeAll()
         condition.broadcast()
         condition.unlock()
 
-        continuations.forEach { $0.resume(returning: true) }
+        admittedWaiters.forEach { id, waiter in
+            waiter.observer?.waitDidEnd(id: id)
+            waiter.continuation.resume(returning: true)
+        }
     }
 
     var isCaptureActive: Bool {
@@ -75,6 +130,7 @@ final class MeetingInferenceScheduler: @unchecked Sendable {
     func waitUntilCaptureAllowsInference() async throws {
         try Task.checkCancellation()
         let waiterID = UUID()
+        let observer = MeetingInferenceWaitContext.observer
         let admitted = await withTaskCancellationHandler {
             await withCheckedContinuation { continuation in
                 condition.lock()
@@ -85,7 +141,11 @@ final class MeetingInferenceScheduler: @unchecked Sendable {
                     condition.unlock()
                     continuation.resume(returning: true)
                 } else {
-                    waiters[waiterID] = continuation
+                    waiters[waiterID] = AsyncWaiter(
+                        continuation: continuation,
+                        observer: observer
+                    )
+                    observer?.waitDidBegin(id: waiterID)
                     condition.unlock()
                 }
             }
@@ -102,6 +162,18 @@ final class MeetingInferenceScheduler: @unchecked Sendable {
     /// worker here is intentional and prevents the following Core ML chunk
     /// from competing with an active recording.
     func waitAtInferenceCheckpoint() {
+        let waiterID = UUID()
+        let observer = MeetingInferenceWaitContext.observer
+        condition.lock()
+        guard !captureOwners.isEmpty else {
+            condition.unlock()
+            return
+        }
+        condition.unlock()
+
+        observer?.waitDidBegin(id: waiterID)
+        defer { observer?.waitDidEnd(id: waiterID) }
+
         condition.lock()
         while !captureOwners.isEmpty {
             condition.wait()
@@ -111,9 +183,10 @@ final class MeetingInferenceScheduler: @unchecked Sendable {
 
     private func cancelWaiter(_ id: UUID) {
         condition.lock()
-        if let continuation = waiters.removeValue(forKey: id) {
+        if let waiter = waiters.removeValue(forKey: id) {
             condition.unlock()
-            continuation.resume(returning: false)
+            waiter.observer?.waitDidEnd(id: id)
+            waiter.continuation.resume(returning: false)
             return
         }
         cancelledWaiters.insert(id)

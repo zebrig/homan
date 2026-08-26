@@ -109,6 +109,11 @@ struct ActiveMeetingMicrophoneState: Equatable {
     let availableDevices: [AudioInputDeviceInfo]
 }
 
+struct MeetingProcessingPauseState: Equatable {
+    let runID: UUID
+    let revision: UInt64
+}
+
 @MainActor
 @Observable
 final class AppState {
@@ -118,6 +123,9 @@ final class AppState {
     /// Canonical local processing progress, keyed by meeting id. Rehydrated from the
     /// local store by `syncAppState` so retry/recovery survives view changes and relaunches.
     var meetingProcessing: [Int64: MeetingProcessingProgress] = [:]
+    /// Transient, runtime-only truth from workers actually blocked by active
+    /// capture. It is intentionally not inferred from `isMeetingRecording`.
+    var meetingProcessingPauses: [Int64: MeetingProcessingPauseState] = [:]
     var totalMeetingCount: Int = 0
     var meetingCountsByFolder: [Int64: Int] = [:]
     var directMeetingCountsByFolder: [Int64: Int] = [:]

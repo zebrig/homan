@@ -2533,7 +2533,11 @@ struct MeetingDetailView: View {
             }
         } else if meeting.status == .processing,
                   let progress = appState.meetingProcessing[meeting.id] {
-            processingProgressCard(statusChip: statusChip(for: meeting), progress: progress)
+            processingProgressCard(
+                statusChip: statusChip(for: meeting),
+                meetingID: meeting.id,
+                progress: progress
+            )
         } else {
             statusChip(for: meeting)
         }
@@ -2542,18 +2546,30 @@ struct MeetingDetailView: View {
     /// Per-meeting processing progress in the detail toolbar: status chip + phase + timers.
     private func processingProgressCard(
         statusChip: some View,
+        meetingID: Int64,
         progress: MeetingProcessingProgress
     ) -> some View {
-        VStack(alignment: .leading, spacing: 3) {
+        let isPausedForRecording = appState.meetingProcessingPauses[meetingID]?.runID
+            == progress.runID
+        return VStack(alignment: .leading, spacing: 3) {
             statusChip
             TimelineView(.periodic(from: .now, by: 0.5)) { context in
                 VStack(alignment: .leading, spacing: 2) {
                     Text("Фаза: \(progress.phaseIndex)/\(progress.phaseCount) \(progress.phaseLabel)")
                         .font(.system(size: 12, weight: .medium))
                         .foregroundStyle(MuesliTheme.textSecondary)
-                    Text("Фаза: \(MeetingProcessingProgress.elapsedString(from: progress.phaseStartedAt, to: context.date)) · Всего: \(MeetingProcessingProgress.elapsedString(from: progress.totalStartedAt, to: context.date))")
-                        .font(MuesliTheme.caption())
-                        .foregroundStyle(MuesliTheme.textTertiary)
+                    if isPausedForRecording {
+                        Text("Обработка приостановлена на время записи")
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MeetingStatus.processing.displayColor)
+                        Text("Продолжим автоматически после окончания звонка, чтобы не нагружать процессор · Всего: \(MeetingProcessingProgress.elapsedString(from: progress.totalStartedAt, to: context.date))")
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MuesliTheme.textTertiary)
+                    } else {
+                        Text("Фаза: \(MeetingProcessingProgress.elapsedString(from: progress.phaseStartedAt, to: context.date)) · Всего: \(MeetingProcessingProgress.elapsedString(from: progress.totalStartedAt, to: context.date))")
+                            .font(MuesliTheme.caption())
+                            .foregroundStyle(MuesliTheme.textTertiary)
+                    }
                 }
             }
         }

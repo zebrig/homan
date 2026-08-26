@@ -3,8 +3,11 @@ import MuesliCore
 
 extension MeetingProcessingProgress {
     /// "4/8 Transcribing · 0:42 · 2:15" — phase, per-phase elapsed, total elapsed.
-    func displayTitle(now: Date) -> String {
-        "\(phaseIndex)/\(phaseCount) \(phaseLabel) · \(Self.elapsedString(from: phaseStartedAt, to: now)) · \(Self.elapsedString(from: totalStartedAt, to: now))"
+    func displayTitle(now: Date, isPausedForRecording: Bool = false) -> String {
+        if isPausedForRecording {
+            return "\(phaseIndex)/\(phaseCount) \(phaseLabel) · Пауза на время записи · \(Self.elapsedString(from: totalStartedAt, to: now))"
+        }
+        return "\(phaseIndex)/\(phaseCount) \(phaseLabel) · \(Self.elapsedString(from: phaseStartedAt, to: now)) · \(Self.elapsedString(from: totalStartedAt, to: now))"
     }
 
     /// "m:ss" with zero padding, e.g. `0:12`, `1:03`, `10:00`.

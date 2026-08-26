@@ -437,6 +437,7 @@ final class MuesliController: NSObject {
     private let liveManualNotesPersistInterval: TimeInterval = 0.75
     private var staleLiveMeetingRecoveryFailures = Set<Int64>()
     private var meetingRecoveryInFlightIDs = Set<Int64>()
+    private var meetingInferenceWaitRevisions: [Int64: (runID: UUID, revision: UInt64)] = [:]
     private var dictationState: DictationState = .idle
     private var dictationStateGeneration: UInt64 = 0
     private var meetingProcessingIndicatorGeneration: UInt64?
@@ -4805,7 +4806,7 @@ final class MuesliController: NSObject {
                     backend = configuredBackend
                 }
 
-                processingRunID = try self.beginMeetingProcessing(
+                let newRunID = try self.beginMeetingProcessing(
                     meetingID: meeting.id,
                     operation: .retranscription,
                     phases: MeetingProcessingRunPlan.phases(
@@ -4813,7 +4814,12 @@ final class MuesliController: NSObject {
                         diarizationMode: resolvedDiarization.planMode
                     )
                 )
+                processingRunID = newRunID
                 didSetProcessing = true
+                let inferenceWaitObserver = self.makeMeetingInferenceWaitObserver(
+                    meetingID: meeting.id,
+                    runID: newRunID
+                )
                 self.syncAppState()
                 self.historyWindowController?.reload()
 
@@ -4824,11 +4830,15 @@ final class MuesliController: NSObject {
                         apiKey: self.config.homanWhisperAPIKey
                     )
                 }
-                try await self.transcriptionCoordinator.preloadRequired(
-                    backend: backend,
-                    enablePostProcessor: false,
-                    includeMeetingHelpers: true
-                )
+                try await MeetingInferenceWaitContext.$observer.withValue(
+                    inferenceWaitObserver
+                ) {
+                    try await self.transcriptionCoordinator.preloadRequired(
+                        backend: backend,
+                        enablePostProcessor: false,
+                        includeMeetingHelpers: true
+                    )
+                }
                 if backend.backend == BackendOption.nemotron35Multilingual.backend {
                     await self.transcriptionCoordinator.setNemotron35PromptId(
                         self.config.resolvedNemotron35Language.promptId
@@ -4836,40 +4846,44 @@ final class MuesliController: NSObject {
                 }
                 let transcription: MeetingTranscriptionResult
                 do {
-                    transcription = try await MeetingTranscriptionPipeline(
-                        coordinator: self.transcriptionCoordinator
-                    ).process(MeetingTranscriptionRequest(
-                        units: recordingUnits,
-                        backend: backend,
-                        languages: MeetingLanguageSnapshot(
-                            cohereLanguage: self.config.resolvedCohereLanguage.rawValue,
-                            indicASRLanguage: self.config.resolvedIndicASRLanguage.rawValue,
-                            nemotron35Language: self.config.resolvedNemotron35Language.rawValue
-                        ),
-                        purpose: .retranscribe,
-                        systemDiarization: resolvedDiarization.pipelinePolicy,
-                        diarizationProfileID: resolvedDiarization.profileID,
-                        aecModel: requestedAECModel,
-                        reusableDiarization: resolvedDiarization.reusableRevision,
-                        progress: { stage in
-                            Task { @MainActor [weak self] in
-                                guard let self, let processingRunID else { return }
-                                let phase: MeetingProcessingPhase
-                                switch stage {
-                                case .processingAudio: phase = .processingAudio
-                                case .transcribing: phase = .transcribing
-                                case .preparingDiarizer: phase = .preparingDiarizer
-                                case .diarizing: phase = .diarizing
-                                case .applyingSpeakerLabels: phase = .applyingSpeakerLabels
+                    transcription = try await MeetingInferenceWaitContext.$observer.withValue(
+                        inferenceWaitObserver
+                    ) {
+                        try await MeetingTranscriptionPipeline(
+                            coordinator: self.transcriptionCoordinator
+                        ).process(MeetingTranscriptionRequest(
+                            units: recordingUnits,
+                            backend: backend,
+                            languages: MeetingLanguageSnapshot(
+                                cohereLanguage: self.config.resolvedCohereLanguage.rawValue,
+                                indicASRLanguage: self.config.resolvedIndicASRLanguage.rawValue,
+                                nemotron35Language: self.config.resolvedNemotron35Language.rawValue
+                            ),
+                            purpose: .retranscribe,
+                            systemDiarization: resolvedDiarization.pipelinePolicy,
+                            diarizationProfileID: resolvedDiarization.profileID,
+                            aecModel: requestedAECModel,
+                            reusableDiarization: resolvedDiarization.reusableRevision,
+                            progress: { stage in
+                                Task { @MainActor [weak self] in
+                                    guard let self, let processingRunID else { return }
+                                    let phase: MeetingProcessingPhase
+                                    switch stage {
+                                    case .processingAudio: phase = .processingAudio
+                                    case .transcribing: phase = .transcribing
+                                    case .preparingDiarizer: phase = .preparingDiarizer
+                                    case .diarizing: phase = .diarizing
+                                    case .applyingSpeakerLabels: phase = .applyingSpeakerLabels
+                                    }
+                                    self.advanceMeetingProcessing(
+                                        meetingID: meeting.id,
+                                        runID: processingRunID,
+                                        phase: phase
+                                    )
                                 }
-                                self.advanceMeetingProcessing(
-                                    meetingID: meeting.id,
-                                    runID: processingRunID,
-                                    phase: phase
-                                )
                             }
-                        }
-                    ))
+                        ))
+                    }
                 } catch MeetingTranscriptionPipelineError.emptyTranscript {
                     throw MeetingRetranscriptionError.emptyTranscript
                 } catch MeetingTranscriptionPipelineError.noUsableAudio {
@@ -5211,6 +5225,10 @@ final class MuesliController: NSObject {
                     phases: MeetingProcessingRunPlan.phases(operation: .rediarization)
                 )
                 runID = newRunID
+                let inferenceWaitObserver = self.makeMeetingInferenceWaitObserver(
+                    meetingID: meeting.id,
+                    runID: newRunID
+                )
                 self.syncAppState()
                 self.historyWindowController?.reload()
 
@@ -5231,11 +5249,15 @@ final class MuesliController: NSObject {
                     runID: newRunID,
                     phase: .diarizing
                 )
-                let analysis = try await self.transcriptionCoordinator.diarizeSystemTimeline(
-                    MeetingSystemTimelineInput(url: timeline.url, map: timeline.map),
-                    profileID: profileID,
-                    progress: { _ in }
-                )
+                let analysis = try await MeetingInferenceWaitContext.$observer.withValue(
+                    inferenceWaitObserver
+                ) {
+                    try await self.transcriptionCoordinator.diarizeSystemTimeline(
+                        MeetingSystemTimelineInput(url: timeline.url, map: timeline.map),
+                        profileID: profileID,
+                        progress: { _ in }
+                    )
+                }
                 try Task.checkCancellation()
                 self.advanceMeetingProcessing(
                     meetingID: meeting.id,
@@ -5399,6 +5421,10 @@ final class MuesliController: NSObject {
         historyWindowController?.reload()
 
         let templateSnapshot = meetingTemplateSnapshot(for: meeting)
+        let inferenceWaitObserver = makeMeetingInferenceWaitObserver(
+            meetingID: meetingID,
+            runID: processingRunID
+        )
         Task { @MainActor [weak self] in
             guard let self else { return }
             var activeStagedAudio = legacyStagedAudio
@@ -5422,13 +5448,15 @@ final class MuesliController: NSObject {
                         let recoveryAEC = MeetingNeuralAec(
                             localVQEModel: self.config.resolvedMeetingAecModel
                         )
-                        activeStagedAudio = try await MeetingRawAudioPostProcessor
-                            .prepare(
-                                rawAudio,
-                                aec: recoveryAEC,
-                                supportDirectory: self.processingSupportDirectory,
-                                inferenceScheduler: .shared
-                            )
+                        activeStagedAudio = try await MeetingInferenceWaitContext.$observer
+                            .withValue(inferenceWaitObserver) {
+                                try await MeetingRawAudioPostProcessor.prepare(
+                                    rawAudio,
+                                    aec: recoveryAEC,
+                                    supportDirectory: self.processingSupportDirectory,
+                                    inferenceScheduler: .shared
+                                )
+                            }
                         recoveryAudioSource = MeetingTranscriptionAudioSource
                             .rawSourceBundle.rawValue
                         recoveryAECModel = self.config.resolvedMeetingAecModel.rawValue
@@ -5443,28 +5471,32 @@ final class MuesliController: NSObject {
                 guard let stagedAudio = activeStagedAudio else {
                     throw MeetingFinalProcessingError.noCapturedAudio
                 }
-                let recovered = try await MeetingFinalProcessingService.process(
-                    stagedAudio: stagedAudio,
-                    meeting: meeting,
-                    config: self.config,
-                    templateSnapshot: templateSnapshot,
-                    coordinator: self.transcriptionCoordinator,
-                    audioSource: recoveryAudioSource,
-                    aecModel: recoveryAECModel,
-                    aecDiagnostics: recoveryAECDiagnostics,
-                    priorEvidence: try self.dictationStore.meetingTranscriptEvidence(
-                        meetingID: meetingID
-                    ),
-                    progress: { [weak self] phase in
-                        Task { @MainActor [weak self] in
-                            self?.advanceMeetingProcessing(
-                                meetingID: meetingID,
-                                runID: processingRunID,
-                                phase: phase
-                            )
+                let recovered = try await MeetingInferenceWaitContext.$observer.withValue(
+                    inferenceWaitObserver
+                ) {
+                    try await MeetingFinalProcessingService.process(
+                        stagedAudio: stagedAudio,
+                        meeting: meeting,
+                        config: self.config,
+                        templateSnapshot: templateSnapshot,
+                        coordinator: self.transcriptionCoordinator,
+                        audioSource: recoveryAudioSource,
+                        aecModel: recoveryAECModel,
+                        aecDiagnostics: recoveryAECDiagnostics,
+                        priorEvidence: try self.dictationStore.meetingTranscriptEvidence(
+                            meetingID: meetingID
+                        ),
+                        progress: { [weak self] phase in
+                            Task { @MainActor [weak self] in
+                                self?.advanceMeetingProcessing(
+                                    meetingID: meetingID,
+                                    runID: processingRunID,
+                                    phase: phase
+                                )
+                            }
                         }
-                    }
-                )
+                    )
+                }
                 let isResume = !meeting.rawTranscript
                     .trimmingCharacters(in: .whitespacesAndNewlines)
                     .isEmpty
@@ -7849,6 +7881,11 @@ final class MuesliController: NSObject {
         let floatingIndicatorGeneration = dictationStateGeneration
         meetingProcessingIndicatorGeneration = floatingIndicatorGeneration
         let processingMeetingID = liveMeetingID
+        let inferenceWaitObserver = liveMeetingID.flatMap { meetingID in
+            processingRunID.map {
+                makeMeetingInferenceWaitObserver(meetingID: meetingID, runID: $0)
+            }
+        }
         sessionToStop.onProgress = { [weak self] stage in
             Task { @MainActor [weak self] in
                 guard let self,
@@ -7894,7 +7931,11 @@ final class MuesliController: NSObject {
             var shouldRemoveProcessingStaging = false
             var wasCancelled = false
             do {
-                let stopped = try await sessionToStop.stop()
+                let stopped = try await MeetingInferenceWaitContext.$observer.withValue(
+                    inferenceWaitObserver
+                ) {
+                    try await sessionToStop.stop()
+                }
                 let result = await self.mergedResumeResult(for: stopped, meetingID: liveMeetingID)
                 meetingResult = result
                 meetingTitle = result.title
@@ -9453,6 +9494,8 @@ final class MuesliController: NSObject {
         )
         try dictationStore.beginMeetingProcessing(id: meetingID, progress: progress)
         appState.meetingProcessing[meetingID] = progress
+        meetingInferenceWaitRevisions[meetingID] = (progress.runID, 0)
+        appState.meetingProcessingPauses[meetingID] = nil
         scheduleICloudSyncAfterLocalChange()
         historyWindowController?.reload()
         return progress.runID
@@ -9690,11 +9733,55 @@ final class MuesliController: NSObject {
             if appState.meetingProcessing[meetingID]?.runID == runID {
                 appState.meetingProcessing[meetingID] = nil
             }
+            if meetingInferenceWaitRevisions[meetingID]?.runID == runID {
+                meetingInferenceWaitRevisions[meetingID] = nil
+            }
+            if appState.meetingProcessingPauses[meetingID]?.runID == runID {
+                appState.meetingProcessingPauses[meetingID] = nil
+            }
             if status != nil {
                 scheduleICloudSyncAfterLocalChange()
             }
         } catch {
             fputs("[muesli-native] failed to finish meeting progress for \(meetingID): \(error)\n", stderr)
+        }
+    }
+
+    private func makeMeetingInferenceWaitObserver(
+        meetingID: Int64,
+        runID: UUID
+    ) -> MeetingInferenceWaitObserver {
+        MeetingInferenceWaitObserver { [weak self] snapshot in
+            Task { @MainActor [weak self] in
+                self?.applyMeetingInferenceWaitSnapshot(
+                    snapshot,
+                    meetingID: meetingID,
+                    runID: runID
+                )
+            }
+        }
+    }
+
+    @MainActor
+    private func applyMeetingInferenceWaitSnapshot(
+        _ snapshot: MeetingInferenceWaitSnapshot,
+        meetingID: Int64,
+        runID: UUID
+    ) {
+        guard appState.meetingProcessing[meetingID]?.runID == runID else { return }
+        if let current = meetingInferenceWaitRevisions[meetingID],
+           current.runID == runID,
+           current.revision >= snapshot.revision {
+            return
+        }
+        meetingInferenceWaitRevisions[meetingID] = (runID, snapshot.revision)
+        if snapshot.isWaitingForCapture {
+            appState.meetingProcessingPauses[meetingID] = MeetingProcessingPauseState(
+                runID: runID,
+                revision: snapshot.revision
+            )
+        } else if appState.meetingProcessingPauses[meetingID]?.runID == runID {
+            appState.meetingProcessingPauses[meetingID] = nil
         }
     }
 

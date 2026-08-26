@@ -90,6 +90,88 @@ struct MeetingInferenceSchedulerTests {
         scheduler.unregisterCancellationOnCapture(registration)
         scheduler.endCapture(ownerID: owner)
     }
+
+    @Test("async wait reports only the interval actually blocked by capture")
+    func asyncWaitObservation() async throws {
+        let scheduler = MeetingInferenceScheduler()
+        let owner = UUID()
+        let probe = InferenceWaitProbe()
+        let observer = MeetingInferenceWaitObserver { probe.append($0) }
+        scheduler.beginCapture(ownerID: owner)
+
+        let waiter = Task {
+            try await MeetingInferenceWaitContext.$observer.withValue(observer) {
+                try await scheduler.waitUntilCaptureAllowsInference()
+            }
+        }
+
+        #expect(await probe.waitForSnapshotCount(1))
+        #expect(probe.snapshots.last?.isWaitingForCapture == true)
+        scheduler.endCapture(ownerID: owner)
+        try await waiter.value
+        #expect(await probe.waitForSnapshotCount(2))
+        #expect(probe.snapshots.map(\.isWaitingForCapture) == [true, false])
+        #expect(probe.snapshots.map(\.revision) == [1, 2])
+    }
+
+    @Test("cancelled async wait clears its reported pause")
+    func cancelledWaitObservation() async throws {
+        let scheduler = MeetingInferenceScheduler()
+        let owner = UUID()
+        let probe = InferenceWaitProbe()
+        let observer = MeetingInferenceWaitObserver { probe.append($0) }
+        scheduler.beginCapture(ownerID: owner)
+
+        let waiter = Task {
+            try await MeetingInferenceWaitContext.$observer.withValue(observer) {
+                try await scheduler.waitUntilCaptureAllowsInference()
+            }
+        }
+
+        #expect(await probe.waitForSnapshotCount(1))
+        waiter.cancel()
+        await #expect(throws: CancellationError.self) {
+            try await waiter.value
+        }
+        #expect(await probe.waitForSnapshotCount(2))
+        #expect(probe.snapshots.map(\.isWaitingForCapture) == [true, false])
+        scheduler.endCapture(ownerID: owner)
+    }
+
+    @Test("synchronous checkpoint reports a balanced capture wait")
+    func synchronousWaitObservation() async throws {
+        let scheduler = MeetingInferenceScheduler()
+        let owner = UUID()
+        let probe = InferenceWaitProbe()
+        let observer = MeetingInferenceWaitObserver { probe.append($0) }
+        scheduler.beginCapture(ownerID: owner)
+
+        let waiter = Task.detached {
+            MeetingInferenceWaitContext.$observer.withValue(observer) {
+                scheduler.waitAtInferenceCheckpoint()
+            }
+        }
+
+        #expect(await probe.waitForSnapshotCount(1))
+        scheduler.endCapture(ownerID: owner)
+        await waiter.value
+        #expect(await probe.waitForSnapshotCount(2))
+        #expect(probe.snapshots.map(\.isWaitingForCapture) == [true, false])
+    }
+
+    @Test("unblocked inference emits no pause status")
+    func unblockedInferenceObservation() async throws {
+        let scheduler = MeetingInferenceScheduler()
+        let probe = InferenceWaitProbe()
+        let observer = MeetingInferenceWaitObserver { probe.append($0) }
+
+        try await MeetingInferenceWaitContext.$observer.withValue(observer) {
+            try await scheduler.waitUntilCaptureAllowsInference()
+            scheduler.waitAtInferenceCheckpoint()
+        }
+
+        #expect(probe.snapshots.isEmpty)
+    }
 }
 
 private final class CaptureCancellationProbe: @unchecked Sendable {
@@ -102,5 +184,26 @@ private final class CaptureCancellationProbe: @unchecked Sendable {
 
     func noteCancellation() {
         lock.withLock { count += 1 }
+    }
+}
+
+private final class InferenceWaitProbe: @unchecked Sendable {
+    private let lock = NSLock()
+    private var storage: [MeetingInferenceWaitSnapshot] = []
+
+    var snapshots: [MeetingInferenceWaitSnapshot] {
+        lock.withLock { storage }
+    }
+
+    func append(_ snapshot: MeetingInferenceWaitSnapshot) {
+        lock.withLock { storage.append(snapshot) }
+    }
+
+    func waitForSnapshotCount(_ count: Int) async -> Bool {
+        let deadline = ContinuousClock.now + .seconds(2)
+        while snapshots.count < count, ContinuousClock.now < deadline {
+            try? await Task.sleep(for: .milliseconds(5))
+        }
+        return snapshots.count >= count
     }
 }

@@ -286,7 +286,11 @@ struct MeetingListItemView: View {
     private var statusBadge: some View {
         if record.status == .processing, let progress = appState.meetingProcessing[record.id] {
             TimelineView(.periodic(from: .now, by: 0.5)) { context in
-                Text(progress.displayTitle(now: context.date))
+                Text(progress.displayTitle(
+                    now: context.date,
+                    isPausedForRecording: appState.meetingProcessingPauses[record.id]?.runID
+                        == progress.runID
+                ))
                     .font(.system(size: 10, weight: .semibold))
                     .foregroundStyle(MeetingStatus.processing.displayColor)
                     .padding(.horizontal, 6)
