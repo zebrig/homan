@@ -64,7 +64,7 @@ enum MeetingAecModel: String, Codable, CaseIterable, Identifiable, Sendable {
         case .gtcrn49K:
             return 1
         case .localVQEV12:
-            return 2
+            return 4
         }
     }
 
