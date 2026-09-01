@@ -30,6 +30,24 @@ struct GemmaSummaryOutputCleanerTests {
         #expect(cleaned.contains("## Notes"))
     }
 
+    @Test("strips Gemma thought channel and preserves Markdown layout")
+    func stripsThoughtChannelWithoutFlatteningMarkdown() {
+        let input = """
+        <|channel>thought
+        I should organize the answer.
+        <channel|><|channel>final
+        ## Decisions
+
+        - Ship v1
+        - Keep tests
+        <turn|>
+        """
+        let cleaned = GemmaSummaryOutputCleaner.clean(input)
+        #expect(!cleaned.contains("I should organize"))
+        #expect(!cleaned.contains("<|channel>"))
+        #expect(cleaned == "## Decisions\n\n- Ship v1\n- Keep tests")
+    }
+
     @Test("accepts real markdown output")
     func acceptsRealOutput() {
         #expect(GemmaSummaryOutputCleaner.isUsable("## Decisions\n- Ship it"))

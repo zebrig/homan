@@ -63,7 +63,7 @@ enum MeetingProcessingMetadataFactory {
             backend: backend.backend,
             model: model,
             displayName: model.isEmpty ? backend.label : "\(backend.label) · \(model)",
-            thinkingStatus: backend == .ollama ? thinkingStatus : nil
+            thinkingStatus: backend == .ollama || backend == .gemmaLocal ? thinkingStatus : nil
         )
     }
 }

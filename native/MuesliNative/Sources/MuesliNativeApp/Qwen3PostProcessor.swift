@@ -272,10 +272,11 @@ private actor Qwen3PostProcessorManager {
             try Task.checkCancellation()
             let runtime = try loadRuntime()
             let formattedInput = Qwen3PostProcessorConfig.formatInput(text, appContext: appContext)
-            let raw = runtime.respond(
+            let raw = try runtime.respond(
                 systemPrompt: systemPrompt,
                 userPrompt: formattedInput,
-                maxOutputTokens: 2048
+                maxOutputTokens: 2048,
+                promptMode: .legacyChatML
             )
             let cleaned = Qwen3PostProcessorOutputCleaner.clean(raw)
             Qwen3PostProcessorLogging.logVerbose("Qwen3 GGUF prompt chars=\(formattedInput.count)")
@@ -307,18 +308,15 @@ private actor Qwen3PostProcessorManager {
         }
         let runtime = SummaryRuntime()
         // Greedy cleanup sampling (topK=1, temp=0) — matches the old LLM.swift config.
-        guard runtime.load(
+        try runtime.load(
             modelURL: modelURL,
             contextTokens: Qwen3PostProcessorConfig.maxContextTokens,
             topK: 1,
             topP: 1.0,
             temp: 0.0,
-            seed: 7
-        ) else {
-            throw NSError(domain: "Qwen3PostProcessor", code: 2, userInfo: [
-                NSLocalizedDescriptionKey: "Failed to load Qwen3 GGUF model at \(modelURL.path)",
-            ])
-        }
+            seed: 7,
+            promptFamily: .legacyChatML
+        )
         self.runtime = runtime
         return runtime
     }

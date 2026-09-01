@@ -1,10 +1,10 @@
 import Foundation
 
 /// On-device meeting-summarization backend: Gemma 4 (E4B-QAT default, or E4B/E2B
-/// variants) GGUF via `SummaryRuntime` (mattt/llama.swift, llama.cpp b10276, Metal).
+/// variants) GGUF via `SummaryRuntime` (mattt/llama.swift, llama.cpp b10280, Metal).
 ///
-/// Uses the model's embedded chat template (`llama_chat_apply_template(nil, …)`),
-/// thinking stripped post-hoc by `GemmaSummaryOutputCleaner`. Sampler defaults are
+/// Uses the model's embedded Jinja chat template through Project Niko, with
+/// thinking independently controlled by the caller. Sampler defaults are
 /// Google's recommended Gemma 4 settings — `temp=1.0, top_p=0.95, top_k=64`, repeat
 /// penalty off — and must not be lowered for quality (Gemma 4 degrades at low
 /// temperature / greedy top_k=1).
@@ -41,7 +41,8 @@ actor GemmaSummaryBackend {
         systemPrompt: String,
         userPrompt: String,
         modelID: String,
-        settings: SummaryGenerationSettings
+        settings: SummaryGenerationSettings,
+        enableThinking: Bool
     ) async throws -> String {
         // Actors can re-enter while the blocking C generation runs; serialize access via the gate.
         try await inferenceGate.acquire()
@@ -49,15 +50,15 @@ actor GemmaSummaryBackend {
             try Task.checkCancellation()
             let runtime = try loadRuntime(modelID: modelID, settings: settings)
             let maxOut = Int32(settings.normalized.maxOutputTokens ?? Self.defaultMaxOutputTokens)
-            let raw = runtime.respond(
+            let raw = try runtime.respond(
                 systemPrompt: systemPrompt,
                 userPrompt: userPrompt,
-                maxOutputTokens: maxOut
+                maxOutputTokens: maxOut,
+                promptMode: .gemma(enableThinking: enableThinking)
             )
             let cleaned = GemmaSummaryOutputCleaner.clean(raw)
             // T020: map empty/degenerate output to a plain failure — no auto-retry.
             guard GemmaSummaryOutputCleaner.isUsable(cleaned) else {
-                await inferenceGate.release()
                 throw MeetingSummaryError.degenerateOutput(backend: Self.displayName)
             }
             await inferenceGate.release()
@@ -111,22 +112,15 @@ actor GemmaSummaryBackend {
             self.runtime = nil
         }
         let runtime = runtime ?? SummaryRuntime()
-        guard runtime.load(
+        try runtime.load(
             modelURL: model.modelURL,
             contextTokens: context,
             topK: Self.defaultTopK,
             topP: topP,
             temp: temperature,
-            seed: 7
-        ) else {
-            throw NSError(
-                domain: "GemmaSummaryBackend",
-                code: 2,
-                userInfo: [
-                    NSLocalizedDescriptionKey: "Failed to load Gemma 4 summary model at \(model.modelURL.path).",
-                ]
-            )
-        }
+            seed: 7,
+            promptFamily: .gemmaJinja
+        )
         self.runtime = runtime
         loadedModelID = modelID
         return runtime
@@ -150,7 +144,23 @@ enum GemmaSummaryOutputCleaner {
             options: .regularExpression
         )
         result = result.replacingOccurrences(
-            of: #"<\|turn\|>"#,
+            of: #"(?is)<\|channel>thought\s*[\s\S]*?<channel\|>"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(
+            of: #"(?is)<\|channel>thought\s*[\s\S]*$"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(
+            of: #"(?i)<\|channel>(?:final|analysis)?\s*"#,
+            with: "",
+            options: .regularExpression
+        )
+        result = result.replacingOccurrences(of: "<channel|>", with: "")
+        result = result.replacingOccurrences(
+            of: #"<(?:\|turn\||\|turn|turn\|)>"#,
             with: " ",
             options: .regularExpression
         )
@@ -174,11 +184,11 @@ enum GemmaSummaryOutputCleaner {
             with: " ",
             options: .regularExpression
         )
-        result = result.replacingOccurrences(
-            of: #"\s{2,}"#,
-            with: " ",
-            options: .regularExpression
-        )
+        // Keep Markdown paragraph/list boundaries. Only collapse horizontal runs
+        // and excessive blank lines; the previous `\s{2,}` erased all layout.
+        result = result.replacingOccurrences(of: #"[ \t]{2,}"#, with: " ", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"[ \t]+\n"#, with: "\n", options: .regularExpression)
+        result = result.replacingOccurrences(of: #"\n{3,}"#, with: "\n\n", options: .regularExpression)
         return result.trimmingCharacters(in: .whitespacesAndNewlines)
     }
 

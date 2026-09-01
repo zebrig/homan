@@ -340,7 +340,7 @@ enum MeetingSummaryClient {
             )
             return MeetingSummaryGenerationResult(
                 notes: notesByRetainingManualNotes(generatedNotes: generatedNotes, manualNotes: manualNotesToRetain),
-                thinkingStatus: nil
+                thinkingStatus: config.gemmaSummaryThinkingEnabled ? .used : .notUsed
             )
         }
         generatedNotes = try await summarizeWithOpenAI(
@@ -1002,12 +1002,18 @@ enum MeetingSummaryClient {
             backend: .gemmaLocal,
             model: config.resolvedMeetingSummaryModel(for: .gemmaLocal)
         )
-        let systemPrompt = summaryInstructions(
+        let baseSystemPrompt = summaryInstructions(
             for: template,
             manualNotes: manualNotes,
             previousMeetingNotes: previousMeetingNotes,
             userName: config.userName,
             promptTemplate: config.resolvedMeetingSummarySystemPrompt
+        )
+        let systemPrompt = GemmaSummaryLanguagePolicy.applying(
+            to: baseSystemPrompt,
+            transcript: transcript,
+            mode: config.resolvedGemmaSummaryLanguageMode,
+            customLanguage: config.gemmaSummaryCustomLanguage
         )
         let userPrompt = summaryUserPrompt(
             transcript: transcript,
@@ -1023,7 +1029,8 @@ enum MeetingSummaryClient {
             systemPrompt: systemPrompt,
             userPrompt: userPrompt,
             modelID: modelID,
-            settings: settings
+            settings: settings,
+            enableThinking: config.gemmaSummaryThinkingEnabled
         )
     }
 
@@ -1658,11 +1665,18 @@ enum MeetingSummaryClient {
                 backend: .gemmaLocal,
                 model: config.resolvedMeetingSummaryModel(for: .gemmaLocal)
             )
+            let titleSystemPrompt = GemmaSummaryLanguagePolicy.applying(
+                to: titleInstructions,
+                transcript: transcript,
+                mode: config.resolvedGemmaSummaryLanguageMode,
+                customLanguage: config.gemmaSummaryCustomLanguage
+            )
             let title = try await GemmaSummaryBackend.shared.summarize(
-                systemPrompt: titleInstructions,
+                systemPrompt: titleSystemPrompt,
                 userPrompt: transcript,
                 modelID: modelID,
-                settings: settings
+                settings: settings,
+                enableThinking: config.gemmaSummaryThinkingEnabled
             )
             let trimmed = title.trimmingCharacters(in: .whitespacesAndNewlines.union(.init(charactersIn: "\"")))
             guard !trimmed.isEmpty else {

@@ -1480,6 +1480,11 @@ struct AppConfig: Codable {
     /// Which Gemma 4 model handles on-device meeting summarization. Uses the
     /// `GemmaSummaryModel` catalog id (default: non-QAT E4B, the benchmark winner).
     var gemmaSummaryModel: String = GemmaSummaryModel.defaultModel.id
+    /// Project Niko controls. Language policy and thinking are intentionally
+    /// independent so any language mode can be used with either template branch.
+    var gemmaSummaryLanguageMode: String = GemmaSummaryLanguageMode.modelDecides.rawValue
+    var gemmaSummaryCustomLanguage: String = ""
+    var gemmaSummaryThinkingEnabled: Bool = false
     var defaultMeetingTemplateID: String = MeetingTemplates.autoID
     var whisperModel: String = BackendOption.whisper.model
     var idleTimeout: Double = 120
@@ -1627,6 +1632,9 @@ struct AppConfig: Codable {
         case homanWhisperAPIKey = "homan_whisper_api_key"
         case meetingSummaryBackend = "meeting_summary_backend"
         case gemmaSummaryModel = "gemma_summary_model"
+        case gemmaSummaryLanguageMode = "gemma_summary_language_mode"
+        case gemmaSummaryCustomLanguage = "gemma_summary_custom_language"
+        case gemmaSummaryThinkingEnabled = "gemma_summary_thinking_enabled"
         case defaultMeetingTemplateID = "default_meeting_template_id"
         case whisperModel = "whisper_model"
         case idleTimeout = "idle_timeout"
@@ -1773,6 +1781,12 @@ struct AppConfig: Codable {
         homanWhisperAPIKey = (try? c.decode(String.self, forKey: .homanWhisperAPIKey)) ?? defaults.homanWhisperAPIKey
         meetingSummaryBackend = (try? c.decode(String.self, forKey: .meetingSummaryBackend)) ?? defaults.meetingSummaryBackend
         gemmaSummaryModel = (try? c.decode(String.self, forKey: .gemmaSummaryModel)) ?? defaults.gemmaSummaryModel
+        gemmaSummaryLanguageMode = (try? c.decode(String.self, forKey: .gemmaSummaryLanguageMode))
+            ?? defaults.gemmaSummaryLanguageMode
+        gemmaSummaryCustomLanguage = (try? c.decode(String.self, forKey: .gemmaSummaryCustomLanguage))
+            ?? defaults.gemmaSummaryCustomLanguage
+        gemmaSummaryThinkingEnabled = (try? c.decode(Bool.self, forKey: .gemmaSummaryThinkingEnabled))
+            ?? defaults.gemmaSummaryThinkingEnabled
         defaultMeetingTemplateID = (try? c.decode(String.self, forKey: .defaultMeetingTemplateID)) ?? defaults.defaultMeetingTemplateID
         whisperModel = (try? c.decode(String.self, forKey: .whisperModel)) ?? defaults.whisperModel
         idleTimeout = (try? c.decode(Double.self, forKey: .idleTimeout)) ?? defaults.idleTimeout
@@ -2075,6 +2089,10 @@ struct AppConfig: Codable {
 }
 
 extension AppConfig {
+    var resolvedGemmaSummaryLanguageMode: GemmaSummaryLanguageMode {
+        GemmaSummaryLanguageMode(rawValue: gemmaSummaryLanguageMode) ?? .modelDecides
+    }
+
     var resolvedMeetingSummarySystemPrompt: String {
         let value = meetingSummarySystemPromptOverride?
             .trimmingCharacters(in: .whitespacesAndNewlines) ?? ""

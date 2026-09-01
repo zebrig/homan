@@ -20,6 +20,12 @@ let package = Package(
         // runtime and the Qwen GGUF post-processor use it. LLM.swift (b10068) was removed
         // (upstream inactive; its llama.h conflicted with llama.swift's newer API). Swift 6 tools.
         .package(url: "https://github.com/mattt/llama.swift.git", from: "2.10276.0"),
+        // Project Niko: execute the exact Jinja template embedded in Gemma GGUFs.
+        // Pin application code independently from the intentionally unpinned model revision.
+        .package(
+            url: "https://github.com/huggingface/swift-jinja.git",
+            revision: "7d0b8880ef8e567dd4e0089f8b99fb354129017c"
+        ),
         .package(url: "https://github.com/sparkle-project/Sparkle", from: "2.9.3"),
         .package(url: "https://github.com/TelemetryDeck/SwiftSDK", from: "2.0.0"),
         .package(url: "https://github.com/MimicScribe/dtln-aec-coreml.git", from: "0.4.0-beta"),
@@ -48,6 +54,7 @@ let package = Package(
                 "MuesliFluidAudioSupport",
                 .product(name: "FluidAudio", package: "FluidAudio"),
                 .product(name: "LlamaSwift", package: "llama.swift"),
+                .product(name: "Jinja", package: "swift-jinja"),
                 .target(name: "CLiteRTLM_mac", condition: .when(platforms: [.macOS])),
                 .product(name: "WhisperKit", package: "WhisperKit"),
                 .product(name: "Sparkle", package: "Sparkle"),

@@ -1383,6 +1383,42 @@ struct SettingsView: View {
                 }
                 Divider().background(MuesliTheme.surfaceBorder)
 
+                settingsRow("Summary language", controlWidth: meetingControlWidth) {
+                    Picker("", selection: gemmaSummaryLanguageModeSelection) {
+                        ForEach(GemmaSummaryLanguageMode.allCases, id: \.self) { mode in
+                            Text(mode.label).tag(mode)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                }
+                Divider().background(MuesliTheme.surfaceBorder)
+
+                if appState.config.resolvedGemmaSummaryLanguageMode == .custom {
+                    settingsRow("Language", controlWidth: meetingControlWidth) {
+                        PastableTextField(
+                            text: appState.config.gemmaSummaryCustomLanguage,
+                            placeholder: "e.g. Polish or Russian",
+                            onChange: { value in
+                                controller.updateConfig {
+                                    $0.gemmaSummaryCustomLanguage = GemmaSummaryLanguagePolicy
+                                        .normalizedCustomLanguage(value)
+                                }
+                            }
+                        )
+                        .frame(height: 22)
+                    }
+                    Divider().background(MuesliTheme.surfaceBorder)
+                }
+
+                settingsRow("Thinking", controlWidth: meetingControlWidth) {
+                    settingsSwitch(isOn: appState.config.gemmaSummaryThinkingEnabled) { enabled in
+                        controller.updateConfig { $0.gemmaSummaryThinkingEnabled = enabled }
+                    }
+                }
+                settingsDescription("Thinking and summary language are independent. Thinking is off by default for faster, cleaner meeting notes.")
+                Divider().background(MuesliTheme.surfaceBorder)
+
                 let selectedGemmaModel = GemmaSummaryModel.resolve(id: appState.config.gemmaSummaryModel)
                 DownloadableModelCardView(
                     model: selectedGemmaModel,
@@ -3610,6 +3646,13 @@ struct SettingsView: View {
         Binding(
             get: { appState.config.gemmaSummaryModel },
             set: { newValue in controller.updateConfig { $0.gemmaSummaryModel = newValue } }
+        )
+    }
+
+    private var gemmaSummaryLanguageModeSelection: Binding<GemmaSummaryLanguageMode> {
+        Binding(
+            get: { appState.config.resolvedGemmaSummaryLanguageMode },
+            set: { mode in controller.updateConfig { $0.gemmaSummaryLanguageMode = mode.rawValue } }
         )
     }
 

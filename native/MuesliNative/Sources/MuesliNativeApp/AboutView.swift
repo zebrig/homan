@@ -119,6 +119,11 @@ struct AboutView: View {
                         name: "WhisperKit by Argmax",
                         description: "Swift Whisper inference on CoreML/ANE powering the app's Whisper Small, Medium, and Large Turbo backends."
                     )
+                    Divider().background(MuesliTheme.surfaceBorder)
+                    acknowledgement(
+                        name: "swift-jinja by Hugging Face",
+                        description: "Apache-2.0 Jinja template engine used to render the chat format embedded in Gemma models."
+                    )
                 }
 
                 Spacer(minLength: MuesliTheme.spacing32)
