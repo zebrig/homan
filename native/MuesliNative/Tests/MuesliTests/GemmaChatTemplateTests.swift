@@ -1,4 +1,5 @@
 import Foundation
+import NaturalLanguage
 import Testing
 @testable import MuesliNativeApp
 
@@ -127,12 +128,10 @@ struct GemmaChatTemplateTests {
         }
     }
 
-    @Test("external audited templates match all twelve Jinja2 goldens when supplied")
+    @Test("audited templates always match all twelve bundled Jinja2 goldens")
     func auditedFullTemplateMatrix() throws {
-        guard let auditDirectory = ProcessInfo.processInfo.environment["HOMAN_NIKO_AUDIT_DIR"] else {
-            return
-        }
-        let root = URL(fileURLWithPath: auditDirectory, isDirectory: true)
+        let root = try #require(Bundle.module.resourceURL)
+            .appendingPathComponent("ProjectNiko", isDirectory: true)
         let fixtures: [(id: String, systemPrompt: String)] = [
             ("model_decides", "Produce a concise meeting summary. Use the language that best fits the meeting."),
             ("force_detected", "Produce a concise meeting summary. Write all notes in Russian (ru)."),
@@ -165,5 +164,78 @@ struct GemmaChatTemplateTests {
                 }
             }
         }
+    }
+}
+
+@Suite("Project Niko installed-model validation", .serialized)
+struct GemmaInstalledModelValidationTests {
+    @Test("installed model keeps detected English across six seeds when HOMAN_NIKO_MODEL_PATH is supplied")
+    func detectedEnglishAcrossSeeds() throws {
+        guard let modelPath = ProcessInfo.processInfo.environment["HOMAN_NIKO_MODEL_PATH"] else {
+            return
+        }
+
+        let transcript = (1...24).map { index in
+            "Others: In agenda item \(index), the engineering team reviewed platform reliability, customer feedback, delivery risks, and the concrete work planned for next week."
+        }.joined(separator: "\n") + """
+
+        You: Спасибо, в конце я кратко подтверждаю договорённости.
+        Others: Да, завершаем встречу и возвращаемся к задачам завтра.
+        """
+        #expect(GemmaSummaryLanguagePolicy.detectLanguageCode(in: transcript) == "en")
+
+        let notesPrompt = GemmaSummaryLanguagePolicy.applying(
+            to: "Summarize the meeting in one paragraph of 60 to 100 words. Return only the final notes.",
+            transcript: transcript,
+            mode: .detectTranscript,
+            customLanguage: ""
+        )
+        let titlePrompt = GemmaSummaryLanguagePolicy.applying(
+            to: "Generate a descriptive meeting title of 3 to 7 words. Return only the title.",
+            transcript: transcript,
+            mode: .detectTranscript,
+            customLanguage: ""
+        )
+        let modelURL = URL(fileURLWithPath: modelPath)
+
+        for seed: UInt32 in [1, 2, 3, 4, 5, 6] {
+            let runtime = SummaryRuntime()
+            try runtime.load(
+                modelURL: modelURL,
+                contextTokens: 8_192,
+                topK: GemmaSummaryBackend.defaultTopK,
+                topP: Float(GemmaSummaryBackend.defaultTopP),
+                temp: Float(GemmaSummaryBackend.defaultTemperature),
+                seed: seed,
+                promptFamily: .gemmaJinja
+            )
+
+            let rawNotes = try runtime.respond(
+                systemPrompt: notesPrompt,
+                userPrompt: transcript,
+                maxOutputTokens: 256,
+                promptMode: .gemma(enableThinking: false)
+            )
+            let notes = GemmaSummaryOutputCleaner.clean(rawNotes)
+            #expect(!notes.isEmpty, "Empty notes at seed \(seed)")
+            #expect(detectedLanguage(of: notes) == .english, "Non-English notes at seed \(seed): \(notes)")
+
+            let rawTitle = try runtime.respond(
+                systemPrompt: titlePrompt,
+                userPrompt: transcript,
+                maxOutputTokens: 64,
+                promptMode: .gemma(enableThinking: false)
+            )
+            let title = GemmaSummaryOutputCleaner.clean(rawTitle)
+            #expect(!title.isEmpty, "Empty title at seed \(seed)")
+            #expect(detectedLanguage(of: title) == .english, "Non-English title at seed \(seed): \(title)")
+            runtime.shutdown()
+        }
+    }
+
+    private func detectedLanguage(of text: String) -> NLLanguage? {
+        let recognizer = NLLanguageRecognizer()
+        recognizer.processString(text)
+        return recognizer.dominantLanguage
     }
 }

@@ -38,10 +38,17 @@ silently rendered as ChatML.
 
 ## Verification Record
 
-- Project Niko renderer: 9 tests passed, including 12/12 external Python Jinja2 goldens.
+- Project Niko renderer: the two audited templates and all 12 Python Jinja2 goldens are bundled as
+  hermetic test resources; the parity test has no environment-variable skip path.
 - Gemma summary/policy/cleanup: 26 tests passed.
 - Qwen and meeting-summary compatibility: 75 tests passed.
 - Serial full suite: 1893 tests executed. Its 24 issues are exclusively pre-existing environment
   failures in AVFoundation AAC/ALAC and `NSPasteboard` under the Codex sandbox; no Niko, Gemma,
   Qwen, settings, or summary-pipeline test failed.
 - Production SwiftPM builds passed for both `MuesliNativeApp` and `homan-cli`.
+- Installed-model validation used the local E4B-QAT GGUF (`tokenizer.chat_template` SHA-256
+  `241c50d86bdfe5e43307da87f559cd2416aacd67a8de46c15acc0105ef2200b7`) on Apple M4/Metal. With
+  a fixed mixed EN/RU transcript whose dominant language was English, `Detect from transcript`,
+  thinking off, and production sampler settings, notes and titles were English for all six seeds
+  (12/12 generations). The original reporter's private meeting-id-12 transcript was not available
+  on this Mac, so the test uses a committed-equivalent synthetic reproduction fixture.

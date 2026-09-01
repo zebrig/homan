@@ -55,12 +55,19 @@ struct GemmaSummaryLanguagePolicyTests {
         #expect(directive.contains(normalized))
     }
 
-    @Test("thinking and language defaults decode from legacy config")
+    @Test("legacy config receives safe language detection with thinking off")
     func legacyConfigDefaults() throws {
         let config = try JSONDecoder().decode(AppConfig.self, from: Data("{}".utf8))
-        #expect(config.resolvedGemmaSummaryLanguageMode == .modelDecides)
+        #expect(config.resolvedGemmaSummaryLanguageMode == .detectTranscript)
         #expect(config.gemmaSummaryCustomLanguage.isEmpty)
         #expect(!config.gemmaSummaryThinkingEnabled)
+    }
+
+    @Test("invalid persisted language mode fails closed to transcript detection")
+    func invalidLanguageModeFallback() {
+        var config = AppConfig()
+        config.gemmaSummaryLanguageMode = "unknown-future-mode"
+        #expect(config.resolvedGemmaSummaryLanguageMode == .detectTranscript)
     }
 
     @Test("language and thinking settings round-trip independently")

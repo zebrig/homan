@@ -1392,6 +1392,7 @@ struct SettingsView: View {
                     .labelsHidden()
                     .pickerStyle(.menu)
                 }
+                settingsDescription("Detect from transcript is the default and avoids language drift without enabling thinking.")
                 Divider().background(MuesliTheme.surfaceBorder)
 
                 if appState.config.resolvedGemmaSummaryLanguageMode == .custom {

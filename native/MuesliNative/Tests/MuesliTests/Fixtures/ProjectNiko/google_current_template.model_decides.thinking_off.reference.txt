@@ -1,0 +1,7 @@
+<bos><|turn>system
+Produce a concise meeting summary. Use the language that best fits the meeting.<turn|>
+<|turn>user
+Transcript:
+Анна: Hello, team.
+Борис: Привет.<turn|>
+<|turn>model

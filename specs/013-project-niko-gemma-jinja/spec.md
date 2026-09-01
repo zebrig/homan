@@ -50,7 +50,8 @@ or specified by me as text.
 2. `Detect from transcript` detects a dominant language from bounded transcript text and adds an
    explicit language directive; uncertain detection falls back to model choice.
 3. `Custom` adds the user's non-empty language instruction as data, with a bounded length.
-4. Existing configurations decode to `Model decides` without migration failure.
+4. Existing configurations decode to `Detect from transcript` without migration failure, so the
+   original language-drift defect is not the out-of-box behavior.
 
 ### User Story 3 — Control thinking independently (P1)
 
@@ -60,7 +61,8 @@ without changing my language setting.
 **Acceptance scenarios**:
 
 1. Every language mode renders with thinking both enabled and disabled.
-2. Thinking disabled is the default for existing and fresh configurations.
+2. Thinking disabled is the default for existing and fresh configurations; transcript detection
+   provides the low-latency language safeguard independently.
 3. Thinking-channel output is stripped without destroying Markdown paragraph or list boundaries.
 
 ### User Story 4 — Preserve the legacy Qwen path (P1)

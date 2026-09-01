@@ -1,0 +1,8 @@
+<bos><|turn>system
+<|think|>
+Produce a concise meeting summary. Write all notes in Russian (ru).<turn|>
+<|turn>user
+Transcript:
+Анна: Hello, team.
+Борис: Привет.<turn|>
+<|turn>model

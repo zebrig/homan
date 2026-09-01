@@ -124,6 +124,9 @@ let package = Package(
                 .product(name: "FluidAudio", package: "FluidAudio"),
             ],
             path: "Tests/MuesliTests",
+            resources: [
+                .copy("Fixtures/ProjectNiko"),
+            ],
             linkerSettings: [
                 .linkedLibrary("sqlite3"),
             ]

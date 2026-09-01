@@ -1,0 +1,8 @@
+<bos><|turn>system
+<|think|>
+Produce a concise meeting summary. Язык итогов: польский. Zachowaj nazwy własne.<turn|>
+<|turn>user
+Transcript:
+Анна: Hello, team.
+Борис: Привет.<turn|>
+<|turn>model

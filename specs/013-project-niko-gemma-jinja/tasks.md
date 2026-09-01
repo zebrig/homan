@@ -46,3 +46,8 @@
 - [x] T024 Produce release builds of `MuesliNativeApp` and `homan-cli` without installing,
   publishing, or bumping version.
 - [x] T025 Review `main`, branches, and worktrees for an orderly handoff.
+- [x] T026 Make transcript detection the safe fresh/legacy/invalid-config default.
+- [x] T027 Bundle both audited templates and all twelve Python Jinja2 goldens so CI cannot skip
+  template parity silently.
+- [x] T028 Validate the installed E4B-QAT GGUF over Metal on a mixed EN/RU transcript: notes and
+  titles remained English for all six seeds with transcript detection on and thinking off.

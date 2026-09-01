@@ -1482,7 +1482,7 @@ struct AppConfig: Codable {
     var gemmaSummaryModel: String = GemmaSummaryModel.defaultModel.id
     /// Project Niko controls. Language policy and thinking are intentionally
     /// independent so any language mode can be used with either template branch.
-    var gemmaSummaryLanguageMode: String = GemmaSummaryLanguageMode.modelDecides.rawValue
+    var gemmaSummaryLanguageMode: String = GemmaSummaryLanguageMode.detectTranscript.rawValue
     var gemmaSummaryCustomLanguage: String = ""
     var gemmaSummaryThinkingEnabled: Bool = false
     var defaultMeetingTemplateID: String = MeetingTemplates.autoID
@@ -2090,7 +2090,7 @@ struct AppConfig: Codable {
 
 extension AppConfig {
     var resolvedGemmaSummaryLanguageMode: GemmaSummaryLanguageMode {
-        GemmaSummaryLanguageMode(rawValue: gemmaSummaryLanguageMode) ?? .modelDecides
+        GemmaSummaryLanguageMode(rawValue: gemmaSummaryLanguageMode) ?? .detectTranscript
     }
 
     var resolvedMeetingSummarySystemPrompt: String {
