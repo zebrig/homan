@@ -3,6 +3,13 @@
 Homan 0.8.5 improves meeting audio processing feedback and makes Gemma meeting summaries more
 predictable across languages.
 
+## Teams recording reliability — refreshed build
+
+- A temporary loss of the Teams activity signal now shows a warning while recording continues;
+  automatic dismissal or failure to show that warning can no longer stop the recording.
+- Meeting continuity now survives detector-session ID changes, including longer Teams signal gaps.
+- Added privacy-safe signal-loss and recovery diagnostics for investigating future reports.
+
 ## Meeting audio processing
 
 - Meeting processing now clearly reports when it is paused while another meeting is being
