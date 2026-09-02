@@ -59,6 +59,21 @@ struct MeetingMediaSessionTrackerTests {
         )
     }
 
+    private func teamsAudioCandidate(now: Date) -> MeetingCandidate {
+        MeetingCandidate(
+            id: "app:com.microsoft.teams2:session:\(Int(now.timeIntervalSince1970))",
+            platform: .teams,
+            appName: "Teams",
+            url: nil,
+            evidence: [.audioInputProcess, .dedicatedApp],
+            startedAt: now,
+            meetingTitle: nil,
+            sourceBundleID: "com.microsoft.teams2",
+            sourcePID: 4321,
+            suppressionID: "app:com.microsoft.teams2:session:\(Int(now.timeIntervalSince1970))"
+        )
+    }
+
     @Test("browser URL and generic browser audio candidates share a stable media session")
     func browserURLAndGenericAudioShareSession() async {
         let tracker = MeetingMediaSessionTracker(quietWindow: 30)
@@ -96,6 +111,8 @@ struct MeetingMediaSessionTrackerTests {
         #expect(first?.id == "meeting-session:browser:com.google.Chrome:room:meet.google.com/pwm-txwq-txy:1800000000")
         #expect(later?.id == "meeting-session:browser:com.google.Chrome:room:meet.google.com/pwm-txwq-txy:1800000045")
         #expect(later?.id != first?.id)
+        #expect(later?.continuityIdentity == first?.continuityIdentity)
+        #expect(later?.continuityIdentity == .browserRoom(normalizedURL: "meet.google.com/pwm-txwq-txy"))
     }
 
     @Test("different browser rooms in the quiet window get different media sessions")
@@ -122,8 +139,27 @@ struct MeetingMediaSessionTrackerTests {
         #expect(first?.id == "meeting-session:browser:com.google.Chrome:room:meet.google.com/pwm-txwq-txy:1800000000")
         #expect(second?.id == "meeting-session:browser:com.google.Chrome:room:meet.google.com/abc-defg-hij:1800000010")
         #expect(second?.id != first?.id)
-        #expect(genericAfterSecondRoom?.id == second?.id)
-        #expect(genericAfterSecondRoom?.url == "meet.google.com/abc-defg-hij")
+        #expect(genericAfterSecondRoom?.id == "meeting-session:browser:com.google.Chrome:media:1800000011")
+        #expect(genericAfterSecondRoom?.url == nil)
+        #expect(genericAfterSecondRoom?.continuityIdentity == nil)
+    }
+
+    @Test("dedicated app sessions keep continuity identity after quiet-window expiry")
+    func dedicatedAppContinuitySurvivesSessionExpiry() async {
+        let tracker = MeetingMediaSessionTracker(quietWindow: 30)
+
+        let first = await tracker.stabilize(
+            candidate: teamsAudioCandidate(now: now),
+            snapshot: snapshot(now: now)
+        )
+        let later = await tracker.stabilize(
+            candidate: teamsAudioCandidate(now: now.addingTimeInterval(45)),
+            snapshot: snapshot(now: now.addingTimeInterval(45))
+        )
+
+        #expect(first?.id != later?.id)
+        #expect(first?.continuityIdentity == .dedicatedApplication(bundleID: "com.microsoft.teams2"))
+        #expect(later?.continuityIdentity == first?.continuityIdentity)
     }
 
     @Test("non-media browser URL candidate keeps original identity")

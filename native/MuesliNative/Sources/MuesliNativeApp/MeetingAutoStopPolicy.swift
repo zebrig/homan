@@ -131,6 +131,7 @@ struct MeetingAutoStopSource: Equatable {
     let suppressionID: String?
     let normalizedURL: String?
     let sourceBundleID: String?
+    let continuityIdentity: MeetingContinuityIdentity?
     let hasObservedCandidate: Bool
 
     private init(
@@ -138,12 +139,14 @@ struct MeetingAutoStopSource: Equatable {
         suppressionID: String?,
         normalizedURL: String?,
         sourceBundleID: String?,
+        continuityIdentity: MeetingContinuityIdentity?,
         hasObservedCandidate: Bool
     ) {
         self.candidateID = candidateID
         self.suppressionID = suppressionID
         self.normalizedURL = normalizedURL
         self.sourceBundleID = sourceBundleID
+        self.continuityIdentity = continuityIdentity
         self.hasObservedCandidate = hasObservedCandidate
     }
 
@@ -152,6 +155,7 @@ struct MeetingAutoStopSource: Equatable {
         self.suppressionID = candidate.suppressionID
         self.normalizedURL = candidate.url
         self.sourceBundleID = candidate.sourceBundleID
+        self.continuityIdentity = candidate.continuityIdentity
         self.hasObservedCandidate = true
     }
 
@@ -163,6 +167,7 @@ struct MeetingAutoStopSource: Equatable {
         self.suppressionID = normalized.id
         self.normalizedURL = normalized.url
         self.sourceBundleID = nil
+        self.continuityIdentity = .browserRoom(normalizedURL: normalized.url)
         self.hasObservedCandidate = false
     }
 
@@ -175,6 +180,7 @@ struct MeetingAutoStopSource: Equatable {
             suppressionID: refinedSuppressionID,
             normalizedURL: normalizedURL ?? candidate.url,
             sourceBundleID: sourceBundleID ?? candidate.sourceBundleID,
+            continuityIdentity: continuityIdentity ?? candidate.continuityIdentity,
             hasObservedCandidate: true
         )
     }
@@ -252,6 +258,11 @@ enum MeetingAutoStopPolicy {
         }
 
         if let normalizedURL = source.normalizedURL, candidate.url == normalizedURL {
+            return true
+        }
+
+        if let continuityIdentity = source.continuityIdentity,
+           candidate.continuityIdentity == continuityIdentity {
             return true
         }
 

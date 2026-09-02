@@ -70,6 +70,89 @@ struct MeetingAutoStopPolicyTests {
         #expect(!MeetingAutoStopPolicy.matches(candidate: otherTabAudio, source: source))
     }
 
+    @Test("matches a restarted Teams detector session by dedicated-app continuity")
+    func matchesRestartedTeamsSessionByContinuityIdentity() {
+        let source = MeetingAutoStopSource(candidate: teamsCandidate(
+            sessionTimestamp: 1_800_000_000
+        ))
+        let restartedSession = teamsCandidate(sessionTimestamp: 1_800_000_062)
+
+        #expect(source.candidateID != restartedSession.id)
+        #expect(source.suppressionID != restartedSession.suppressionID)
+        #expect(MeetingAutoStopPolicy.matches(candidate: restartedSession, source: source))
+    }
+
+    @Test("does not treat another dedicated app as the same meeting")
+    func ignoresDifferentDedicatedApplicationIdentity() {
+        let source = MeetingAutoStopSource(candidate: teamsCandidate())
+        let zoomCandidate = MeetingCandidate(
+            id: "meeting-session:app:us.zoom.xos:1800000062",
+            platform: .zoom,
+            appName: "Zoom",
+            url: nil,
+            evidence: [.audioInputProcess, .dedicatedApp],
+            startedAt: Date(timeIntervalSince1970: 1_800_000_062),
+            meetingTitle: nil,
+            sourceBundleID: "us.zoom.xos",
+            sourcePID: 5678,
+            suppressionID: "meeting-session:app:us.zoom.xos:1800000062",
+            continuityIdentity: .dedicatedApplication(bundleID: "us.zoom.xos")
+        )
+
+        #expect(!MeetingAutoStopPolicy.matches(candidate: zoomCandidate, source: source))
+    }
+
+    @Test("matches a restarted browser session only for the same room")
+    func matchesRestartedBrowserSessionByRoomContinuity() {
+        let sourceCandidate = googleMeetCandidate(
+            sessionTimestamp: 1_800_000_000,
+            continuityIdentity: .browserRoom(normalizedURL: "meet.google.com/aaa-bbbb-ccc")
+        )
+        let restartedSameRoom = googleMeetCandidate(
+            sessionTimestamp: 1_800_000_062,
+            continuityIdentity: .browserRoom(normalizedURL: "meet.google.com/aaa-bbbb-ccc")
+        )
+        let differentRoom = MeetingCandidate(
+            id: "meeting-session:browser:com.google.Chrome:room:meet.google.com/ddd-eeee-fff:1800000062",
+            platform: .googleMeet,
+            appName: "Chrome",
+            url: "meet.google.com/ddd-eeee-fff",
+            evidence: [.browserURL, .audioInputProcess],
+            startedAt: Date(timeIntervalSince1970: 1_800_000_062),
+            meetingTitle: nil,
+            sourceBundleID: "com.google.Chrome",
+            sourcePID: 1234,
+            suppressionID: "meeting-session:browser:com.google.Chrome:room:meet.google.com/ddd-eeee-fff:1800000062",
+            continuityIdentity: .browserRoom(normalizedURL: "meet.google.com/ddd-eeee-fff")
+        )
+        let source = MeetingAutoStopSource(candidate: sourceCandidate)
+
+        #expect(MeetingAutoStopPolicy.matches(candidate: restartedSameRoom, source: source))
+        #expect(!MeetingAutoStopPolicy.matches(candidate: differentRoom, source: source))
+    }
+
+    @Test("generic browser media never gains room continuity by bundle alone")
+    func genericBrowserMediaDoesNotMatchRoomContinuity() {
+        let source = MeetingAutoStopSource(candidate: googleMeetCandidate(
+            continuityIdentity: .browserRoom(normalizedURL: "meet.google.com/aaa-bbbb-ccc")
+        ))
+        let genericMedia = MeetingCandidate(
+            id: "meeting-session:browser:com.google.Chrome:media:1800000062",
+            platform: .unknown,
+            appName: "Chrome",
+            url: nil,
+            evidence: [.audioInputProcess],
+            startedAt: Date(timeIntervalSince1970: 1_800_000_062),
+            meetingTitle: nil,
+            sourceBundleID: "com.google.Chrome",
+            sourcePID: 1234,
+            suppressionID: "meeting-session:browser:com.google.Chrome:media:1800000062",
+            continuityIdentity: nil
+        )
+
+        #expect(!MeetingAutoStopPolicy.matches(candidate: genericMedia, source: source))
+    }
+
     @Test("ignores unrelated calendar-only activity")
     func ignoresUnrelatedCalendarOnlyActivity() {
         let source = MeetingAutoStopSource(candidate: googleMeetCandidate())
@@ -305,9 +388,14 @@ struct MeetingAutoStopPolicyTests {
         #expect(shouldStopAfterGrace)
     }
 
-    private func googleMeetCandidate() -> MeetingCandidate {
+    private func googleMeetCandidate(
+        sessionTimestamp: Int = 1_800_000_000,
+        continuityIdentity: MeetingContinuityIdentity? = nil
+    ) -> MeetingCandidate {
         MeetingCandidate(
-            id: "googleMeet:meet.google.com/aaa-bbbb-ccc",
+            id: sessionTimestamp == 1_800_000_000
+                ? "googleMeet:meet.google.com/aaa-bbbb-ccc"
+                : "meeting-session:browser:com.google.Chrome:room:meet.google.com/aaa-bbbb-ccc:\(sessionTimestamp)",
             platform: .googleMeet,
             appName: "Chrome",
             url: "meet.google.com/aaa-bbbb-ccc",
@@ -316,13 +404,16 @@ struct MeetingAutoStopPolicyTests {
             meetingTitle: nil,
             sourceBundleID: "com.google.Chrome",
             sourcePID: 1234,
-            suppressionID: "browser:com.google.Chrome:session:1800000000"
+            suppressionID: sessionTimestamp == 1_800_000_000
+                ? "browser:com.google.Chrome:session:1800000000"
+                : "meeting-session:browser:com.google.Chrome:room:meet.google.com/aaa-bbbb-ccc:\(sessionTimestamp)",
+            continuityIdentity: continuityIdentity
         )
     }
 
-    private func teamsCandidate() -> MeetingCandidate {
+    private func teamsCandidate(sessionTimestamp: Int = 1_800_000_000) -> MeetingCandidate {
         MeetingCandidate(
-            id: "app:com.microsoft.teams2:session:1800000000",
+            id: "meeting-session:app:com.microsoft.teams2:\(sessionTimestamp)",
             platform: .teams,
             appName: "Teams",
             url: nil,
@@ -331,7 +422,8 @@ struct MeetingAutoStopPolicyTests {
             meetingTitle: nil,
             sourceBundleID: "com.microsoft.teams2",
             sourcePID: 4321,
-            suppressionID: "app:com.microsoft.teams2:session:1800000000"
+            suppressionID: "meeting-session:app:com.microsoft.teams2:\(sessionTimestamp)",
+            continuityIdentity: .dedicatedApplication(bundleID: "com.microsoft.teams2")
         )
     }
 }

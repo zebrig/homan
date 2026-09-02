@@ -1,9 +1,15 @@
 import Foundation
 
 actor MeetingMediaSessionTracker {
+    private struct SessionIdentity {
+        let key: String
+        let continuityIdentity: MeetingContinuityIdentity?
+    }
+
     private struct Session {
         let id: String
         let key: String
+        let continuityIdentity: MeetingContinuityIdentity?
         let startedAt: Date
         var lastActiveAt: Date
         var platform: MeetingCandidate.Platform
@@ -26,12 +32,12 @@ actor MeetingMediaSessionTracker {
     ) -> MeetingCandidate? {
         pruneExpiredSessions(now: snapshot.now)
         guard let candidate else { return nil }
-        guard let key = sessionKey(for: candidate, now: snapshot.now),
+        guard let identity = sessionIdentity(for: candidate, now: snapshot.now),
               isMediaBacked(candidate, snapshot: snapshot) else {
             return candidate
         }
 
-        let session = updateSession(for: key, with: candidate, now: snapshot.now)
+        let session = updateSession(for: identity, with: candidate, now: snapshot.now)
         return MeetingCandidate(
             id: session.id,
             platform: session.platform,
@@ -42,7 +48,8 @@ actor MeetingMediaSessionTracker {
             meetingTitle: session.meetingTitle,
             sourceBundleID: candidate.sourceBundleID,
             sourcePID: candidate.sourcePID,
-            suppressionID: session.id
+            suppressionID: session.id,
+            continuityIdentity: session.continuityIdentity
         )
     }
 
@@ -51,10 +58,11 @@ actor MeetingMediaSessionTracker {
     }
 
     private func updateSession(
-        for key: String,
+        for identity: SessionIdentity,
         with candidate: MeetingCandidate,
         now: Date
     ) -> Session {
+        let key = identity.key
         if var session = sessionsByKey[key],
            now.timeIntervalSince(session.lastActiveAt) <= quietWindow {
             session.lastActiveAt = now
@@ -70,6 +78,7 @@ actor MeetingMediaSessionTracker {
         let session = Session(
             id: "meeting-session:\(key):\(Int(now.timeIntervalSince1970))",
             key: key,
+            continuityIdentity: identity.continuityIdentity,
             startedAt: now,
             lastActiveAt: now,
             platform: candidate.platform,
@@ -82,21 +91,44 @@ actor MeetingMediaSessionTracker {
         return session
     }
 
-    private func sessionKey(for candidate: MeetingCandidate, now: Date) -> String? {
+    private func sessionIdentity(
+        for candidate: MeetingCandidate,
+        now: Date
+    ) -> SessionIdentity? {
         if let sourceBundleID = candidate.sourceBundleID {
             if MeetingCandidateResolver.browserApps[sourceBundleID] != nil {
                 if let roomIdentity = roomIdentity(for: candidate) {
-                    return "browser:\(sourceBundleID):room:\(roomIdentity)"
+                    return SessionIdentity(
+                        key: "browser:\(sourceBundleID):room:\(roomIdentity)",
+                        continuityIdentity: .browserRoom(normalizedURL: roomIdentity)
+                    )
                 }
 
-                return mostRecentBrowserSessionKey(for: sourceBundleID, now: now)
-                    ?? "browser:\(sourceBundleID):media"
+                if let roomSession = unambiguousRecentBrowserRoomSession(
+                    for: sourceBundleID,
+                    now: now
+                ) {
+                    return SessionIdentity(
+                        key: roomSession.key,
+                        continuityIdentity: roomSession.continuityIdentity
+                    )
+                }
+
+                // Browser-wide media activity cannot safely identify a tab or
+                // room when zero or multiple meeting rooms are plausible.
+                return SessionIdentity(
+                    key: "browser:\(sourceBundleID):media",
+                    continuityIdentity: nil
+                )
             }
-            return "app:\(sourceBundleID)"
+            return SessionIdentity(
+                key: "app:\(sourceBundleID)",
+                continuityIdentity: .dedicatedApplication(bundleID: sourceBundleID)
+            )
         }
 
         if candidate.id.hasPrefix("browser:") || candidate.id.hasPrefix("app:") {
-            return candidate.id
+            return SessionIdentity(key: candidate.id, continuityIdentity: nil)
         }
 
         return nil
@@ -111,16 +143,18 @@ actor MeetingMediaSessionTracker {
         return nil
     }
 
-    private func mostRecentBrowserSessionKey(for bundleID: String, now: Date) -> String? {
-        let prefix = "browser:\(bundleID):"
-        return sessionsByKey.values
+    private func unambiguousRecentBrowserRoomSession(
+        for bundleID: String,
+        now: Date
+    ) -> Session? {
+        let prefix = "browser:\(bundleID):room:"
+        let candidates = sessionsByKey.values
             .filter { session in
                 session.key.hasPrefix(prefix)
                     && now.timeIntervalSince(session.lastActiveAt) <= quietWindow
             }
-            .sorted { lhs, rhs in lhs.lastActiveAt > rhs.lastActiveAt }
-            .first?
-            .key
+        guard candidates.count == 1 else { return nil }
+        return candidates[0]
     }
 
     private func isMediaBacked(

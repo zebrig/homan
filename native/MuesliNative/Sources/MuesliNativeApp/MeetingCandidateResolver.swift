@@ -1,5 +1,20 @@
 import Foundation
 
+/// Stable, non-ephemeral evidence that two detector observations can belong to
+/// the same ongoing meeting. This is deliberately separate from `id` and
+/// `suppressionID`, which identify one short-lived detector/media session.
+enum MeetingContinuityIdentity: Equatable {
+    case browserRoom(normalizedURL: String)
+    case dedicatedApplication(bundleID: String)
+
+    var diagnosticKind: String {
+        switch self {
+        case .browserRoom: return "browser_room"
+        case .dedicatedApplication: return "dedicated_application"
+        }
+    }
+}
+
 struct MeetingCandidate: Equatable {
     enum Platform: String, Equatable {
         case googleMeet
@@ -45,6 +60,7 @@ struct MeetingCandidate: Equatable {
     let sourceBundleID: String?
     let sourcePID: pid_t?
     let suppressionID: String
+    let continuityIdentity: MeetingContinuityIdentity?
 
     init(
         id: String,
@@ -56,7 +72,8 @@ struct MeetingCandidate: Equatable {
         meetingTitle: String?,
         sourceBundleID: String? = nil,
         sourcePID: pid_t? = nil,
-        suppressionID: String? = nil
+        suppressionID: String? = nil,
+        continuityIdentity: MeetingContinuityIdentity? = nil
     ) {
         self.id = id
         self.platform = platform
@@ -68,6 +85,7 @@ struct MeetingCandidate: Equatable {
         self.sourceBundleID = sourceBundleID
         self.sourcePID = sourcePID
         self.suppressionID = suppressionID ?? id
+        self.continuityIdentity = continuityIdentity
     }
 
     var subtitle: String {
@@ -84,6 +102,7 @@ struct MeetingCandidate: Equatable {
             && lhs.sourceBundleID == rhs.sourceBundleID
             && lhs.sourcePID == rhs.sourcePID
             && lhs.suppressionID == rhs.suppressionID
+            && lhs.continuityIdentity == rhs.continuityIdentity
     }
 }
 
