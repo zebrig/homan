@@ -98,6 +98,7 @@ enum MeetingSignalLossPromptPolicy {
 struct MeetingSignalLossPromptState: Equatable {
     private(set) var isPromptSuppressed = false
     private(set) var isDismissedForRecording = false
+    private(set) var isSignalLossDetected = false
 
     var canPresentPrompt: Bool {
         !isPromptSuppressed && !isDismissedForRecording
@@ -106,14 +107,25 @@ struct MeetingSignalLossPromptState: Equatable {
     mutating func resetForRecording() {
         isPromptSuppressed = false
         isDismissedForRecording = false
+        isSignalLossDetected = false
     }
 
     mutating func markPromptPresented() {
         isPromptSuppressed = true
     }
 
-    mutating func markSourceRecovered() {
+    mutating func markSignalLossDetected() -> Bool {
+        guard !isSignalLossDetected else { return false }
+        isSignalLossDetected = true
+        return true
+    }
+
+    @discardableResult
+    mutating func markSourceRecovered() -> Bool {
+        let recoveredFromLoss = isSignalLossDetected
+        isSignalLossDetected = false
         isPromptSuppressed = false
+        return recoveredFromLoss
     }
 
     mutating func markDismissedByUser() {
@@ -247,25 +259,48 @@ struct MeetingAutoStopTracker: Equatable {
     }
 }
 
+enum MeetingAutoStopMatchKind: Equatable {
+    case candidateID
+    case suppressionID
+    case normalizedURL
+    case continuityIdentity
+
+    var diagnosticName: String {
+        switch self {
+        case .candidateID: return "candidate_id"
+        case .suppressionID: return "suppression_id"
+        case .normalizedURL: return "normalized_url"
+        case .continuityIdentity: return "continuity_identity"
+        }
+    }
+}
+
 enum MeetingAutoStopPolicy {
-    static func matches(candidate: MeetingCandidate, source: MeetingAutoStopSource) -> Bool {
+    static func matchKind(
+        candidate: MeetingCandidate,
+        source: MeetingAutoStopSource
+    ) -> MeetingAutoStopMatchKind? {
         if let candidateID = source.candidateID, candidate.id == candidateID {
-            return true
+            return .candidateID
         }
 
         if let suppressionID = source.suppressionID, candidate.suppressionID == suppressionID {
-            return true
+            return .suppressionID
         }
 
         if let normalizedURL = source.normalizedURL, candidate.url == normalizedURL {
-            return true
+            return .normalizedURL
         }
 
         if let continuityIdentity = source.continuityIdentity,
            candidate.continuityIdentity == continuityIdentity {
-            return true
+            return .continuityIdentity
         }
 
-        return false
+        return nil
+    }
+
+    static func matches(candidate: MeetingCandidate, source: MeetingAutoStopSource) -> Bool {
+        matchKind(candidate: candidate, source: source) != nil
     }
 }

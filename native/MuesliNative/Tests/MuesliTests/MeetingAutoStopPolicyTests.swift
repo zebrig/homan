@@ -79,6 +79,10 @@ struct MeetingAutoStopPolicyTests {
 
         #expect(source.candidateID != restartedSession.id)
         #expect(source.suppressionID != restartedSession.suppressionID)
+        #expect(MeetingAutoStopPolicy.matchKind(
+            candidate: restartedSession,
+            source: source
+        ) == .continuityIdentity)
         #expect(MeetingAutoStopPolicy.matches(candidate: restartedSession, source: source))
     }
 
@@ -96,7 +100,7 @@ struct MeetingAutoStopPolicyTests {
             sourceBundleID: "us.zoom.xos",
             sourcePID: 5678,
             suppressionID: "meeting-session:app:us.zoom.xos:1800000062",
-            continuityIdentity: .dedicatedApplication(bundleID: "us.zoom.xos")
+            continuityIdentity: .dedicatedApplicationPresence(bundleID: "us.zoom.xos")
         )
 
         #expect(!MeetingAutoStopPolicy.matches(candidate: zoomCandidate, source: source))
@@ -272,11 +276,76 @@ struct MeetingAutoStopPolicyTests {
         var state = MeetingSignalLossPromptState()
 
         #expect(state.canPresentPrompt)
+        let firstLossTransition = state.markSignalLossDetected()
+        let repeatedLossTransition = state.markSignalLossDetected()
+        #expect(firstLossTransition)
+        #expect(!repeatedLossTransition)
         state.markPromptPresented()
         #expect(!state.canPresentPrompt)
 
-        state.markSourceRecovered()
+        let firstRecoveryTransition = state.markSourceRecovered()
+        let repeatedRecoveryTransition = state.markSourceRecovered()
+        #expect(firstRecoveryTransition)
+        #expect(!repeatedRecoveryTransition)
         #expect(state.canPresentPrompt)
+        #expect(!state.isSignalLossDetected)
+    }
+
+    @Test("long Teams detector gaps keep recording and permit a later warning cycle")
+    func longTeamsDetectorGapsFailSafeAndRecover() {
+        for gap: TimeInterval in [62, 119] {
+            let startedAt = Date(timeIntervalSince1970: 1_800_000_000)
+            let original = teamsCandidate(sessionTimestamp: 1_800_000_000)
+            let recovered = teamsCandidate(sessionTimestamp: 1_800_000_000 + Int(gap))
+            var tracker = MeetingAutoStopTracker()
+            var promptState = MeetingSignalLossPromptState()
+
+            tracker.arm(source: MeetingAutoStopSource(candidate: original))
+            let signalLostAtStart = tracker.observe(
+                candidate: original,
+                now: startedAt,
+                gracePeriod: 20
+            )
+            let firstSignalLoss = tracker.observe(
+                candidate: nil,
+                now: startedAt.addingTimeInterval(21),
+                gracePeriod: 20
+            )
+            let firstLossTransition = promptState.markSignalLossDetected()
+            #expect(!signalLostAtStart)
+            #expect(firstSignalLoss)
+            #expect(firstLossTransition)
+            promptState.markPromptPresented()
+            promptState.markAutoDismissed()
+            #expect(MeetingSignalLossPromptPolicy.resolution(for: .autoDismissed) == .keepRecording)
+
+            if let source = tracker.source {
+                #expect(MeetingAutoStopPolicy.matchKind(
+                    candidate: recovered,
+                    source: source
+                ) == .continuityIdentity)
+            } else {
+                Issue.record("Tracker unexpectedly lost its Teams source")
+            }
+            let recoveredFromLoss = promptState.markSourceRecovered()
+            let signalLostAfterRecovery = tracker.observe(
+                candidate: recovered,
+                now: startedAt.addingTimeInterval(gap),
+                gracePeriod: 20
+            )
+            #expect(recoveredFromLoss)
+            #expect(!signalLostAfterRecovery)
+            #expect(promptState.canPresentPrompt)
+
+            let secondSignalLoss = tracker.observe(
+                candidate: nil,
+                now: startedAt.addingTimeInterval(gap + 21),
+                gracePeriod: 20
+            )
+            let secondLossTransition = promptState.markSignalLossDetected()
+            #expect(secondSignalLoss)
+            #expect(secondLossTransition)
+        }
     }
 
     @Test("user dismissed signal loss prompt stays suppressed for recording")
@@ -423,7 +492,7 @@ struct MeetingAutoStopPolicyTests {
             sourceBundleID: "com.microsoft.teams2",
             sourcePID: 4321,
             suppressionID: "meeting-session:app:com.microsoft.teams2:\(sessionTimestamp)",
-            continuityIdentity: .dedicatedApplication(bundleID: "com.microsoft.teams2")
+            continuityIdentity: .dedicatedApplicationPresence(bundleID: "com.microsoft.teams2")
         )
     }
 }

@@ -1,16 +1,17 @@
 import Foundation
 
-/// Stable, non-ephemeral evidence that two detector observations can belong to
-/// the same ongoing meeting. This is deliberately separate from `id` and
-/// `suppressionID`, which identify one short-lived detector/media session.
+/// Non-ephemeral evidence that two detector observations may belong to the
+/// same ongoing meeting. This can recover a non-destructive warning, but is
+/// never sufficient authority to stop recording. It is deliberately separate
+/// from `id` and `suppressionID`, which identify one short-lived media session.
 enum MeetingContinuityIdentity: Equatable {
     case browserRoom(normalizedURL: String)
-    case dedicatedApplication(bundleID: String)
+    case dedicatedApplicationPresence(bundleID: String)
 
     var diagnosticKind: String {
         switch self {
         case .browserRoom: return "browser_room"
-        case .dedicatedApplication: return "dedicated_application"
+        case .dedicatedApplicationPresence: return "dedicated_application_presence"
         }
     }
 }

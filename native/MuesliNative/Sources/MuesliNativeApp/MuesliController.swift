@@ -9235,8 +9235,9 @@ final class MuesliController: NSObject {
         activeMeetingAutoStop.arm(source: source)
         activeMeetingSignalLossResponse = source == nil ? .none : response
         meetingSignalLossPromptState.resetForRecording()
+        let identityKind = source?.continuityIdentity?.diagnosticKind ?? "none"
         Self.meetingSignalLogger.info(
-            "meeting_signal_tracking_armed origin=\(origin.diagnosticName, privacy: .public) policy=\(self.activeMeetingSignalLossResponse.diagnosticName, privacy: .public) source_configured=\(source != nil, privacy: .public)"
+            "meeting_signal_tracking_armed origin=\(origin.diagnosticName, privacy: .public) policy=\(self.activeMeetingSignalLossResponse.diagnosticName, privacy: .public) source_configured=\(source != nil, privacy: .public) identity_kind=\(identityKind, privacy: .public)"
         )
         syncMeetingDetectionMonitor()
     }
@@ -9265,6 +9266,11 @@ final class MuesliController: NSObject {
     }
 
     private func disarmMeetingAutoStop() {
+        if activeMeetingAutoStop.isArmed {
+            Self.meetingSignalLogger.info(
+                "meeting_signal_tracking_disarmed meeting_id=\(self.activeMeetingID ?? -1, privacy: .public)"
+            )
+        }
         activeMeetingAutoStop.disarm()
         activeMeetingSignalLossResponse = .none
         meetingSignalLossPromptState.resetForRecording()
@@ -9304,27 +9310,35 @@ final class MuesliController: NSObject {
         }
 
         let now = Date()
-        let matchedSource = candidate.flatMap { candidate in
-            activeMeetingAutoStop.source.map { source in
-                MeetingAutoStopPolicy.matches(candidate: candidate, source: source)
+        let matchKind = candidate.flatMap { candidate in
+            activeMeetingAutoStop.source.flatMap { source in
+                MeetingAutoStopPolicy.matchKind(candidate: candidate, source: source)
             }
-        } ?? false
-        if matchedSource {
-            let recoveredVisiblePrompt = meetingNotification.isVisible
-                && meetingNotification.currentPromptID == meetingSignalLossPromptID(for: activeMeetingID)
-            meetingSignalLossPromptState.markSourceRecovered()
+        }
+        if let matchKind {
+            let recoveredFromSignalLoss = meetingSignalLossPromptState.markSourceRecovered()
             dismissMeetingSignalLossPromptIfVisible(for: activeMeetingID)
-            if recoveredVisiblePrompt {
+            if recoveredFromSignalLoss {
                 Self.meetingSignalLogger.info(
-                    "meeting_signal_recovered meeting_id=\(self.activeMeetingID ?? -1, privacy: .public)"
+                    "meeting_signal_recovered meeting_id=\(self.activeMeetingID ?? -1, privacy: .public) match_kind=\(matchKind.diagnosticName, privacy: .public)"
                 )
             }
         }
-        if activeMeetingAutoStop.observe(
+        let signalLossDetected = activeMeetingAutoStop.observe(
             candidate: candidate,
             now: now,
             gracePeriod: meetingAutoStopGracePeriod
-        ) {
+        )
+        if signalLossDetected {
+            if meetingSignalLossPromptState.markSignalLossDetected() {
+                let signalGapMilliseconds = activeMeetingAutoStop.lastSeenAt.map {
+                    max(0, Int(now.timeIntervalSince($0) * 1_000))
+                } ?? -1
+                let identityKind = activeMeetingAutoStop.source?.continuityIdentity?.diagnosticKind ?? "none"
+                Self.meetingSignalLogger.notice(
+                    "meeting_signal_lost meeting_id=\(self.activeMeetingID ?? -1, privacy: .public) missing_for_ms=\(signalGapMilliseconds, privacy: .public) identity_kind=\(identityKind, privacy: .public)"
+                )
+            }
             presentMeetingSignalLossPromptIfNeeded()
         }
     }
@@ -9372,8 +9386,12 @@ final class MuesliController: NSObject {
         )
 
         if didShow {
+            let signalGapMilliseconds = activeMeetingAutoStop.lastSeenAt.map {
+                max(0, Int(Date().timeIntervalSince($0) * 1_000))
+            } ?? -1
+            let identityKind = activeMeetingAutoStop.source?.continuityIdentity?.diagnosticKind ?? "none"
             Self.meetingSignalLogger.notice(
-                "meeting_signal_warning_shown meeting_id=\(meetingID ?? -1, privacy: .public)"
+                "meeting_signal_warning_shown meeting_id=\(meetingID ?? -1, privacy: .public) missing_for_ms=\(signalGapMilliseconds, privacy: .public) identity_kind=\(identityKind, privacy: .public)"
             )
         } else {
             handleMeetingSignalLossPromptEvent(.presentationUnavailable, meetingID: meetingID)

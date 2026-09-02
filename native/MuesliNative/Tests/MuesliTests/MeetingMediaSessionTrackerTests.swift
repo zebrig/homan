@@ -158,7 +158,7 @@ struct MeetingMediaSessionTrackerTests {
         )
 
         #expect(first?.id != later?.id)
-        #expect(first?.continuityIdentity == .dedicatedApplication(bundleID: "com.microsoft.teams2"))
+        #expect(first?.continuityIdentity == .dedicatedApplicationPresence(bundleID: "com.microsoft.teams2"))
         #expect(later?.continuityIdentity == first?.continuityIdentity)
     }
 

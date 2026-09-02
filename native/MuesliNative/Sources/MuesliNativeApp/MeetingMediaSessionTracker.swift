@@ -123,7 +123,7 @@ actor MeetingMediaSessionTracker {
             }
             return SessionIdentity(
                 key: "app:\(sourceBundleID)",
-                continuityIdentity: .dedicatedApplication(bundleID: sourceBundleID)
+                continuityIdentity: .dedicatedApplicationPresence(bundleID: sourceBundleID)
             )
         }
 
