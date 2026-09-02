@@ -324,6 +324,7 @@ final class MuesliController: NSObject {
     private static let maxDictionarySuggestions = 50
     private static let maxDictionarySuggestionPromptQueue = 10
     private static let dictionarySuggestionLogger = Logger(subsystem: "com.muesli.native", category: "DictionarySuggestion")
+    private static let meetingSignalLogger = Logger(subsystem: "com.muesli.native", category: "MeetingSignal")
     private static let pendingDictionaryCorrectionAccessibilityEnableKey = "dictionaryCorrectionPrompts.pendingAccessibilityEnable"
     private static let pendingDictionaryCorrectionAccessibilityRequestedAtKey = "dictionaryCorrectionPrompts.pendingAccessibilityRequestedAt"
     private static let pendingDictionaryCorrectionAccessibilityRequestProcessIDKey = "dictionaryCorrectionPrompts.pendingAccessibilityRequestProcessID"
@@ -6544,7 +6545,8 @@ final class MuesliController: NSObject {
                 explicitSource: autoStopSource,
                 recentSource: recentMeetingAutoStopSource()
             ),
-            response: startOrigin.signalLossResponse
+            response: startOrigin.signalLossResponse,
+            origin: startOrigin
         )
         isStartingMeetingRecording = true
         // Keep this after backend normalization and live-meeting creation so
@@ -6699,7 +6701,8 @@ final class MuesliController: NSObject {
                 explicitSource: nil,
                 recentSource: recentMeetingAutoStopSource()
             ),
-            response: MeetingRecordingStartOrigin.manual.signalLossResponse
+            response: MeetingRecordingStartOrigin.manual.signalLossResponse,
+            origin: .manual
         )
         isStartingMeetingRecording = true
         cancelDictationAudioSessionForMeetingRecordingIfNeeded()
@@ -9226,11 +9229,15 @@ final class MuesliController: NSObject {
 
     private func armMeetingAutoStop(
         source: MeetingAutoStopSource?,
-        response: MeetingSignalLossResponse = .autoStopAfterWarning
+        response: MeetingSignalLossResponse,
+        origin: MeetingRecordingStartOrigin
     ) {
         activeMeetingAutoStop.arm(source: source)
         activeMeetingSignalLossResponse = source == nil ? .none : response
         meetingSignalLossPromptState.resetForRecording()
+        Self.meetingSignalLogger.info(
+            "meeting_signal_tracking_armed origin=\(origin.diagnosticName, privacy: .public) policy=\(self.activeMeetingSignalLossResponse.diagnosticName, privacy: .public) source_configured=\(source != nil, privacy: .public)"
+        )
         syncMeetingDetectionMonitor()
     }
 
@@ -9303,8 +9310,15 @@ final class MuesliController: NSObject {
             }
         } ?? false
         if matchedSource {
+            let recoveredVisiblePrompt = meetingNotification.isVisible
+                && meetingNotification.currentPromptID == meetingSignalLossPromptID(for: activeMeetingID)
             meetingSignalLossPromptState.markSourceRecovered()
             dismissMeetingSignalLossPromptIfVisible(for: activeMeetingID)
+            if recoveredVisiblePrompt {
+                Self.meetingSignalLogger.info(
+                    "meeting_signal_recovered meeting_id=\(self.activeMeetingID ?? -1, privacy: .public)"
+                )
+            }
         }
         if activeMeetingAutoStop.observe(
             candidate: candidate,
@@ -9338,35 +9352,54 @@ final class MuesliController: NSObject {
         guard meetingNotification.currentPromptID != promptID || !meetingNotification.isVisible else { return }
 
         meetingSignalLossPromptState.markPromptPresented()
-        let response = activeMeetingSignalLossResponse
         let didShow = meetingNotification.show(
             promptID: promptID,
             title: "Meeting signal lost",
-            subtitle: "Still recording. Stop if the meeting ended.",
+            subtitle: "Recording continues. Stop it if the meeting ended.",
             actionLabel: "Stop Recording",
             dismissAfter: 30,
             // MeetingNotificationController uses onStartRecording as its generic
             // primary-action slot; here the primary action is stopping recording.
             onStartRecording: { [weak self] in
-                guard let self, self.activeMeetingID == meetingID else { return }
-                self.stopMeetingRecording()
+                self?.handleMeetingSignalLossPromptEvent(.stopRequested, meetingID: meetingID)
             },
             onDismiss: { [weak self] in
-                guard let self, self.activeMeetingID == meetingID else { return }
-                self.meetingSignalLossPromptState.markDismissedByUser()
+                self?.handleMeetingSignalLossPromptEvent(.dismissedByUser, meetingID: meetingID)
             },
             onAutoDismiss: { [weak self] in
-                guard let self else { return }
-                guard self.activeMeetingID == meetingID else { return }
-                self.meetingSignalLossPromptState.markAutoDismissed()
-                guard response == .autoStopAfterWarning else { return }
-                fputs("[meeting] auto-stopping recording after meeting source disappeared and warning timed out\n", stderr)
-                self.stopMeetingRecording()
+                self?.handleMeetingSignalLossPromptEvent(.autoDismissed, meetingID: meetingID)
             }
         )
 
-        if !didShow, response == .autoStopAfterWarning {
-            fputs("[meeting] auto-stopping recording after meeting source disappeared; warning unavailable\n", stderr)
+        if didShow {
+            Self.meetingSignalLogger.notice(
+                "meeting_signal_warning_shown meeting_id=\(meetingID ?? -1, privacy: .public)"
+            )
+        } else {
+            handleMeetingSignalLossPromptEvent(.presentationUnavailable, meetingID: meetingID)
+        }
+    }
+
+    private func handleMeetingSignalLossPromptEvent(
+        _ event: MeetingSignalLossPromptEvent,
+        meetingID: Int64?
+    ) {
+        guard activeMeetingID == meetingID else { return }
+
+        switch event {
+        case .dismissedByUser:
+            meetingSignalLossPromptState.markDismissedByUser()
+        case .autoDismissed, .presentationUnavailable:
+            meetingSignalLossPromptState.markAutoDismissed()
+        case .stopRequested:
+            break
+        }
+
+        let resolution = MeetingSignalLossPromptPolicy.resolution(for: event)
+        Self.meetingSignalLogger.notice(
+            "meeting_signal_prompt_event meeting_id=\(meetingID ?? -1, privacy: .public) event=\(event.diagnosticName, privacy: .public) recording_continues=\(resolution == .keepRecording, privacy: .public)"
+        )
+        if resolution == .stopRecording {
             stopMeetingRecording()
         }
     }

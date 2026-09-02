@@ -148,7 +148,7 @@ struct MeetingAutoStopPolicyTests {
             recentSource: recentSource
         )
 
-        #expect(!MeetingRecordingStartOrigin.manual.enablesMeetingAutoStop)
+        #expect(!MeetingRecordingStartOrigin.manual.tracksMeetingSignalLoss)
         #expect(MeetingRecordingStartOrigin.manual.signalLossResponse == .none)
         #expect(resolvedSource == nil)
         #expect(MeetingRecordingStartOrigin.manual.signalLossSource(
@@ -157,8 +157,8 @@ struct MeetingAutoStopPolicyTests {
         ) == nil)
     }
 
-    @Test("source-backed start origins can auto-stop after warning")
-    func sourceBackedStartOriginsCanAutoStopAfterWarning() {
+    @Test("source-backed start origins warn without granting stop authority")
+    func sourceBackedStartOriginsWarnOnly() {
         let explicitSource = MeetingAutoStopSource(candidate: googleMeetCandidate())
         let recentSource = MeetingAutoStopSource(candidate: teamsCandidate())
         let origins: [MeetingRecordingStartOrigin] = [
@@ -169,11 +169,19 @@ struct MeetingAutoStopPolicyTests {
         ]
 
         for origin in origins {
-            #expect(origin.enablesMeetingAutoStop)
-            #expect(origin.signalLossResponse == .autoStopAfterWarning)
+            #expect(origin.tracksMeetingSignalLoss)
+            #expect(origin.signalLossResponse == .warnOnly)
             #expect(origin.signalLossSource(explicitSource: explicitSource, recentSource: recentSource) == explicitSource)
             #expect(origin.signalLossSource(explicitSource: nil, recentSource: recentSource) == recentSource)
         }
+    }
+
+    @Test("only the explicit stop action may end recording from signal-loss prompt")
+    func signalLossPromptFailsSafe() {
+        #expect(MeetingSignalLossPromptPolicy.resolution(for: .stopRequested) == .stopRecording)
+        #expect(MeetingSignalLossPromptPolicy.resolution(for: .dismissedByUser) == .keepRecording)
+        #expect(MeetingSignalLossPromptPolicy.resolution(for: .autoDismissed) == .keepRecording)
+        #expect(MeetingSignalLossPromptPolicy.resolution(for: .presentationUnavailable) == .keepRecording)
     }
 
     @Test("signal loss prompt can reappear after source recovery when not dismissed")

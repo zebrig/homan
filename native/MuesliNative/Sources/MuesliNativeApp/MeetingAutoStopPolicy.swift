@@ -7,7 +7,11 @@ enum MeetingRecordingStartOrigin: Equatable {
     case scheduledMeetingPrompt
     case joinAndRecord
 
-    var enablesMeetingAutoStop: Bool {
+    /// A missing detector signal is useful diagnostic evidence, but it is not
+    /// proof that a recording should end. User-initiated and unattended starts
+    /// can therefore opt into signal-loss warnings without granting the
+    /// detector authority to stop capture.
+    var tracksMeetingSignalLoss: Bool {
         switch self {
         case .manual:
             return false
@@ -17,7 +21,17 @@ enum MeetingRecordingStartOrigin: Equatable {
     }
 
     var signalLossResponse: MeetingSignalLossResponse {
-        enablesMeetingAutoStop ? .autoStopAfterWarning : .none
+        tracksMeetingSignalLoss ? .warnOnly : .none
+    }
+
+    var diagnosticName: String {
+        switch self {
+        case .manual: return "manual"
+        case .detectedPrompt: return "detected_prompt"
+        case .calendarAutoRecord: return "calendar_auto_record"
+        case .scheduledMeetingPrompt: return "scheduled_meeting_prompt"
+        case .joinAndRecord: return "join_and_record"
+        }
     }
 
     func signalLossSource(
@@ -36,7 +50,49 @@ enum MeetingRecordingStartOrigin: Equatable {
 enum MeetingSignalLossResponse: Equatable {
     case none
     case warnOnly
-    case autoStopAfterWarning
+
+    var diagnosticName: String {
+        switch self {
+        case .none: return "none"
+        case .warnOnly: return "warn_only"
+        }
+    }
+}
+
+enum MeetingSignalLossPromptEvent: Equatable {
+    case stopRequested
+    case dismissedByUser
+    case autoDismissed
+    case presentationUnavailable
+
+    var diagnosticName: String {
+        switch self {
+        case .stopRequested: return "stop_requested"
+        case .dismissedByUser: return "dismissed_by_user"
+        case .autoDismissed: return "auto_dismissed"
+        case .presentationUnavailable: return "presentation_unavailable"
+        }
+    }
+}
+
+enum MeetingSignalLossPromptResolution: Equatable {
+    case keepRecording
+    case stopRecording
+}
+
+/// Central safety boundary for the signal-loss prompt. Only an explicit click
+/// on Stop Recording may end capture; timer expiry and UI failures fail safe.
+enum MeetingSignalLossPromptPolicy {
+    static func resolution(
+        for event: MeetingSignalLossPromptEvent
+    ) -> MeetingSignalLossPromptResolution {
+        switch event {
+        case .stopRequested:
+            return .stopRecording
+        case .dismissedByUser, .autoDismissed, .presentationUnavailable:
+            return .keepRecording
+        }
+    }
 }
 
 struct MeetingSignalLossPromptState: Equatable {
